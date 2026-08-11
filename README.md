@@ -22,6 +22,8 @@
 
 ## 运行与构建
 
+可在 [Releases](https://github.com/idkwhatimdoing62/markdown-editor/releases) 下载 Windows 安装版、免安装 EXE 或便携 ZIP。
+
 ```powershell
 cargo run --release
 ```
@@ -32,6 +34,12 @@ cargo build --release
 ```
 
 构建产物位于 `target/release/markdown-editor.exe`。
+
+生成安装版需要 Inno Setup 6：
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\markdown-editor.iss
+```
 
 ## 快捷键
 
