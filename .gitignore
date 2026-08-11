@@ -1,0 +1,9 @@
+/target/
+/target-*/
+/artifacts/
+/dist/
+/.idea/
+/.vscode/
+*.pdb
+*.log
+*.tmp

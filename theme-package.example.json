@@ -1,0 +1,44 @@
+{
+  "name": "My Theme",
+  "author": "Your Name",
+  "light": {
+    "canvas": "#FAFAF9",
+    "editor_canvas": "#F7F7F5",
+    "panel": "#F7F7F5",
+    "text": "#202123",
+    "muted": "#707276",
+    "heading": "#202123",
+    "accent": "#2674B5",
+    "border": "#E4E4E0",
+    "code_bg": "#F3F4F6",
+    "quote_bg": "#F7F7F5",
+    "table_alt": "#EEF2F6"
+  },
+  "dark": {
+    "canvas": "#1C1D1F",
+    "editor_canvas": "#18191B",
+    "panel": "#18191B",
+    "text": "#E8E9EB",
+    "muted": "#96989D",
+    "heading": "#F3F4F6",
+    "accent": "#63A4E6",
+    "border": "#2F3034",
+    "code_bg": "#151618",
+    "quote_bg": "#232427",
+    "table_alt": "#262A2E"
+  },
+  "layout": {
+    "heading_style": "plain",
+    "body_font_size": 15.5,
+    "content_width": 820,
+    "preview_padding": 40,
+    "block_spacing": 10,
+    "line_height": 1.55,
+    "list_item_spacing": 6,
+    "code_radius": 8,
+    "code_padding_x": 16,
+    "code_padding_y": 13,
+    "table_spacing_x": 22,
+    "table_spacing_y": 10
+  }
+}
