@@ -1,5 +1,5 @@
 #define MyAppName "Markdown 编辑器与预览器"
-#define MyAppVersion "0.1.6"
+#define MyAppVersion "0.1.7"
 #define MyAppPublisher "idkwhatimdoing62"
 #define MyAppURL "https://github.com/idkwhatimdoing62/markdown-editor"
 #define MyAppExeName "markdown-editor.exe"
@@ -48,6 +48,7 @@ Source: "{#BuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\fonts\JetBrainsMono-OFL.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\fonts\LXGWWenKaiLite-OFL.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\assets\Mermaid-MIT.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

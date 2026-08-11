@@ -5,7 +5,7 @@
 ## 主要功能
 
 - 多文件标签页，以及写作、阅读、分栏与专注模式
-- CommonMark、表格、脚注、任务列表和围栏代码块
+- CommonMark、表格、脚注、任务列表、围栏代码块和 Mermaid 图表
 - WebView2 实时预览，忠实执行导入的 CSS 主题
 - 支持导入 `.css`、`.zip` 和 JSON 主题包
 - 内置少数派经典主题，可设置正文字号
@@ -62,5 +62,6 @@ cargo build --release
 
 - JetBrains Mono：SIL Open Font License 1.1，授权文本见 `fonts/JetBrainsMono-OFL.txt`
 - 霞鹜文楷轻便版：SIL Open Font License 1.1，授权文本见 `fonts/LXGWWenKaiLite-OFL.txt`
+- Mermaid 11.16.0：MIT License，授权文本见 `assets/Mermaid-MIT.txt`
 
-字体随应用内置，运行时不依赖网络或系统安装字体。项目代码目前未声明额外的开源许可证。
+字体和 Mermaid 运行库随应用内置，运行时不依赖网络。项目代码目前未声明额外的开源许可证。

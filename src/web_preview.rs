@@ -47,14 +47,13 @@ impl BrowserPreview {
             let webview = WebViewBuilder::new()
                 .with_https_scheme(true)
                 .with_custom_protocol("mdfont".into(), |_webview_id, request| {
-                    font_response(request)
+                    preview_asset_response(request)
                 })
                 .with_html(document.to_owned())
                 .with_bounds(to_wry_rect(bounds))
                 .with_visible(true)
                 .with_focused(false)
                 .with_clipboard(true)
-                .with_javascript_disabled()
                 .with_browser_accelerator_keys(false)
                 .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
                 .build_as_child(window)
@@ -127,7 +126,7 @@ pub fn document(
     let editor_font = editor_font_css();
 
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style></head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src https://mdfont.localhost; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style><script defer src=\"https://mdfont.localhost/mermaid.min.js\"></script><script defer src=\"https://mdfont.localhost/mermaid-init.js\"></script></head><body>{body}</body></html>"
     )
 }
 
@@ -139,26 +138,91 @@ fn editor_font_css() -> &'static str {
      body,pre,code,blockquote::before,blockquote::after{font-family:'Markdown Editor Mono','LXGW WenKai Lite','SimHei','DengXian','SimSun','Microsoft YaHei',monospace!important;}"
 }
 
-fn font_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
-    let bytes = match request.uri().path() {
-        "/jetbrains-regular.ttf" => crate::export::jetbrains_mono_regular_bytes(),
-        "/jetbrains-bold.ttf" => crate::export::jetbrains_mono_bold_bytes(),
-        "/lxgw-regular.ttf" => crate::export::lxgw_wenkai_regular_bytes(),
-        "/lxgw-medium.ttf" => crate::export::lxgw_wenkai_medium_bytes(),
-        _ => {
-            return Response::builder()
-                .status(404)
-                .body(Cow::Borrowed(&[] as &[u8]))
-                .expect("有效的字体 404 响应");
-        }
-    };
+fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
+    let (bytes, content_type, cache_control): (&'static [u8], &str, &str) =
+        match request.uri().path() {
+            "/jetbrains-regular.ttf" => (
+                crate::export::jetbrains_mono_regular_bytes(),
+                "font/ttf",
+                "public, max-age=31536000, immutable",
+            ),
+            "/jetbrains-bold.ttf" => (
+                crate::export::jetbrains_mono_bold_bytes(),
+                "font/ttf",
+                "public, max-age=31536000, immutable",
+            ),
+            "/lxgw-regular.ttf" => (
+                crate::export::lxgw_wenkai_regular_bytes(),
+                "font/ttf",
+                "public, max-age=31536000, immutable",
+            ),
+            "/lxgw-medium.ttf" => (
+                crate::export::lxgw_wenkai_medium_bytes(),
+                "font/ttf",
+                "public, max-age=31536000, immutable",
+            ),
+            "/mermaid.min.js" => (
+                include_bytes!("../assets/mermaid-11.16.0.min.js"),
+                "text/javascript; charset=utf-8",
+                "public, max-age=31536000, immutable",
+            ),
+            "/mermaid-init.js" => (
+                MERMAID_BOOTSTRAP.as_bytes(),
+                "text/javascript; charset=utf-8",
+                "no-cache",
+            ),
+            _ => {
+                return Response::builder()
+                    .status(404)
+                    .body(Cow::Borrowed(&[] as &[u8]))
+                    .expect("有效的预览资源 404 响应");
+            }
+        };
     Response::builder()
-        .header(CONTENT_TYPE, "font/ttf")
+        .header(CONTENT_TYPE, content_type)
+        .header("X-Content-Type-Options", "nosniff")
         .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .header(CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(CACHE_CONTROL, cache_control)
         .body(Cow::Borrowed(bytes))
-        .expect("有效的字体响应")
+        .expect("有效的预览资源响应")
 }
+
+const MERMAID_BOOTSTRAP: &str = r#"
+(async () => {
+    const blocks = Array.from(document.querySelectorAll('pre > code.language-mermaid'));
+    if (blocks.length === 0) return;
+
+    mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        suppressErrorRendering: true,
+        fontFamily: "'Markdown Editor Mono', 'LXGW WenKai Lite', monospace"
+    });
+
+    for (const [index, code] of blocks.entries()) {
+        const source = code.textContent || '';
+        const pre = code.parentElement;
+        const diagram = document.createElement('div');
+        diagram.className = 'mermaid-diagram';
+        diagram.setAttribute('role', 'img');
+        diagram.setAttribute('aria-label', 'Mermaid diagram');
+
+        try {
+            const rendered = await mermaid.render(`markdown-editor-mermaid-${index}`, source);
+            diagram.innerHTML = rendered.svg;
+            pre.replaceWith(diagram);
+            if (rendered.bindFunctions) rendered.bindFunctions(diagram);
+        } catch (error) {
+            pre.classList.add('mermaid-error');
+            pre.setAttribute('data-language', 'Mermaid error');
+            const message = document.createElement('div');
+            message.className = 'mermaid-error-message';
+            message.textContent = `Mermaid 图表语法错误：${error?.message || String(error)}`;
+            pre.after(message);
+        }
+    }
+})();
+"#;
 
 /// 只为浏览器默认没有可用排版的 Markdown 结构提供底线样式。
 /// 放在主题 CSS 之前，所以主题只要声明同一属性就会自然覆盖这里。
@@ -187,6 +251,21 @@ pre[data-language]::before {
     letter-spacing: .08em;
     text-transform: uppercase;
     pointer-events: none;
+}
+.mermaid-diagram {
+    display: flex;
+    justify-content: center;
+    width: 100%;
+    margin: 1.5em 0;
+    overflow-x: auto;
+}
+.mermaid-diagram svg { display: block; max-width: 100%; height: auto; }
+pre.mermaid-error { border-color: rgba(220, 70, 70, .45); }
+.mermaid-error-message {
+    margin: -.75em 0 1.5em;
+    color: #b42318;
+    font-size: .85em;
+    white-space: pre-wrap;
 }
 ol:not(#footnotes), ul {
     padding-inline-start: clamp(1.5em, 3vw, 2.25em) !important;
@@ -299,7 +378,7 @@ fn normalize_footnote_dom(body: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{document, font_response};
+    use super::{document, preview_asset_response};
     use wry::http::Request;
 
     #[test]
@@ -370,7 +449,7 @@ mod tests {
             .uri("mdfont://localhost/lxgw-regular.ttf")
             .body(Vec::new())
             .unwrap();
-        let response = font_response(request);
+        let response = preview_asset_response(request);
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["content-type"], "font/ttf");
         assert_eq!(
@@ -385,6 +464,38 @@ mod tests {
         assert!(html.contains("<pre data-language=\"rust\"><code class=\"language-rust\">"));
         assert!(html.contains("content: attr(data-language)"));
         assert!(html.contains("text-transform: uppercase"));
+    }
+
+    #[test]
+    fn mermaid_代码块加载内置渲染器() {
+        let html = document(
+            "```mermaid\nstateDiagram-v2\n    [*] --> Standby\n```",
+            "",
+            None,
+            None,
+        );
+        assert!(html.contains("<pre data-language=\"mermaid\"><code class=\"language-mermaid\">"));
+        assert!(html.contains("https://mdfont.localhost/mermaid.min.js"));
+        assert!(html.contains("https://mdfont.localhost/mermaid-init.js"));
+        assert!(html.contains("script-src https://mdfont.localhost"));
+        assert!(!html.contains("script-src 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn 本地协议提供_mermaid_运行库和启动脚本() {
+        for path in ["mermaid.min.js", "mermaid-init.js"] {
+            let request = Request::builder()
+                .uri(format!("mdfont://localhost/{path}"))
+                .body(Vec::new())
+                .unwrap();
+            let response = preview_asset_response(request);
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/javascript; charset=utf-8"
+            );
+            assert!(!response.body().is_empty());
+        }
     }
 
     #[test]
