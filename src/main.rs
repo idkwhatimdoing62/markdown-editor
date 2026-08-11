@@ -155,6 +155,10 @@ fn shortened_tab_title(title: &str) -> String {
     format!("{head}…{tail}")
 }
 
+const CHROME_FONT_SIZE: f32 = 13.0;
+const CHROME_CONTROL_HEIGHT: f32 = 30.0;
+const CHROME_BAR_HEIGHT: f32 = 36.0;
+
 fn document_tab_button(
     ui: &mut egui::Ui,
     id: u64,
@@ -163,7 +167,7 @@ fn document_tab_button(
     selected: bool,
 ) -> (bool, bool) {
     let title = shortened_tab_title(title);
-    let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+    let font = egui::FontId::new(CHROME_FONT_SIZE, egui::FontFamily::Proportional);
     let text_color = if selected {
         ui.visuals().strong_text_color()
     } else {
@@ -171,7 +175,10 @@ fn document_tab_button(
     };
     let galley = ui.painter().layout_no_wrap(title, font.clone(), text_color);
     let width = (galley.size().x + 58.0).clamp(96.0, 220.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 32.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, CHROME_CONTROL_HEIGHT),
+        egui::Sense::hover(),
+    );
     let tab_response = ui.interact(
         rect,
         ui.id().with(("document-tab", id)),
@@ -226,7 +233,7 @@ fn document_tab_button(
             close_rect.center(),
             egui::Align2::CENTER_CENTER,
             "×",
-            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+            egui::FontId::new(CHROME_FONT_SIZE, egui::FontFamily::Proportional),
             close_color,
         );
     }
@@ -239,7 +246,10 @@ fn document_tab_button(
 }
 
 fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(46.0, 30.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(46.0, CHROME_CONTROL_HEIGHT),
+        egui::Sense::click(),
+    );
     if response.hovered() {
         ui.painter().rect_filled(
             rect,
@@ -256,7 +266,7 @@ fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Re
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        egui::FontId::new(CHROME_FONT_SIZE, egui::FontFamily::Proportional),
         color,
     );
     if selected {
@@ -272,7 +282,10 @@ fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Re
 }
 
 fn chrome_icon_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 30.0), egui::Sense::click());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(28.0, CHROME_CONTROL_HEIGHT),
+        egui::Sense::click(),
+    );
     if response.hovered() {
         ui.painter().rect_filled(
             rect,
@@ -284,7 +297,7 @@ fn chrome_icon_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::new(17.0, egui::FontFamily::Proportional),
+        egui::FontId::new(CHROME_FONT_SIZE, egui::FontFamily::Proportional),
         ui.visuals().widgets.inactive.fg_stroke.color,
     );
     response
@@ -918,181 +931,189 @@ impl MdEditorApp {
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            ui.spacing_mut().button_padding = egui::vec2(7.0, 4.0);
-            ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
-            ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-            ui.menu_button("文件", |ui| {
-                if ui.button("新建标签   Ctrl+N").clicked() {
-                    ui.close();
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), CHROME_BAR_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().button_padding = egui::vec2(7.0, 4.0);
+                ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+                ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                ui.menu_button(egui::RichText::new("文件").size(CHROME_FONT_SIZE), |ui| {
+                    if ui.button("新建标签   Ctrl+N").clicked() {
+                        ui.close();
+                        self.new_tab();
+                    }
+                    if ui.button("打开…     Ctrl+O").clicked() {
+                        ui.close();
+                        self.open_file();
+                    }
+                    if ui.button("保存       Ctrl+S").clicked() {
+                        ui.close();
+                        self.save();
+                    }
+                    if ui.button("另存为…   Ctrl+Shift+S").clicked() {
+                        ui.close();
+                        self.save_as();
+                    }
+                    if ui.button("关闭标签   Ctrl+W").clicked() {
+                        ui.close();
+                        self.request_close_tab(self.active_tab);
+                    }
+                    ui.separator();
+                    if ui.button("导出 HTML…").clicked() {
+                        ui.close();
+                        self.export_html();
+                    }
+                    if ui.button("导出 PDF…").clicked() {
+                        ui.close();
+                        self.export_pdf();
+                    }
+                });
+                ui.menu_button(egui::RichText::new("编辑").size(CHROME_FONT_SIZE), |ui| {
+                    if ui.button("复制渲染内容").clicked() {
+                        ui.close();
+                        ui.ctx().copy_text(markdown::plain_text(&self.blocks));
+                    }
+                    if ui.button("复制 HTML").clicked() {
+                        ui.close();
+                        ui.ctx().copy_text(export::render_html(&self.text));
+                    }
+                });
+                ui.menu_button(egui::RichText::new("视图").size(CHROME_FONT_SIZE), |ui| {
+                    ui.set_min_width(230.0);
+                    ui.label(egui::RichText::new("文档主题").weak().size(12.0));
+                    if let Some(package) = &self.theme_package {
+                        let author = if package.author.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", package.author)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!("{}{}", package.name, author))
+                                .strong()
+                                .size(13.0),
+                        );
+                    } else {
+                        ui.label(egui::RichText::new("少数派经典 · 内置").strong().size(13.0));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("导入主题包…").clicked() {
+                            self.import_theme(ui.ctx());
+                        }
+                        if self.theme_package.is_some() && ui.small_button("移除").clicked() {
+                            self.remove_theme(ui.ctx());
+                        }
+                    });
+                    ui.separator();
+                    ui.label(egui::RichText::new("编辑与正文字号").weak().size(12.0));
+                    ui.horizontal(|ui| {
+                        if ui.small_button("−").clicked() {
+                            self.body_font_size = (self.body_font_size - 0.5).max(12.0);
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut self.body_font_size, 12.0..=22.0)
+                                .step_by(0.5)
+                                .show_value(false),
+                        );
+                        if ui.small_button("+").clicked() {
+                            self.body_font_size = (self.body_font_size + 0.5).min(22.0);
+                        }
+                        ui.label(format!("{:.1}", self.body_font_size));
+                    });
+                    if ui.small_button("恢复默认字号").clicked() {
+                        self.body_font_size = 15.5;
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.show_status, "显示状态栏");
+                    let theme = if self.dark {
+                        "浅色外观"
+                    } else {
+                        "深色外观"
+                    };
+                    if ui.button(theme).clicked() {
+                        self.dark = !self.dark;
+                        self.apply_current_theme(ui.ctx());
+                        ui.close();
+                    }
+                });
+                ui.separator();
+                let mut switch_to = None;
+                let mut close_tab = None;
+                let mut create_tab = false;
+                let tabs_width = (ui.available_width() - 235.0).max(150.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(tabs_width, CHROME_CONTROL_HEIGHT),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("document_tabs")
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .show(ui, |ui| {
+                                ui.horizontal_centered(|ui| {
+                                    for index in 0..self.tabs.len() {
+                                        let id = self.tabs[index].id;
+                                        let title = self.tab_title(index);
+                                        let dirty = self.is_tab_dirty(index);
+                                        ui.push_id(id, |ui| {
+                                            let (select_clicked, close_clicked) =
+                                                document_tab_button(
+                                                    ui,
+                                                    id,
+                                                    &title,
+                                                    dirty,
+                                                    index == self.active_tab,
+                                                );
+                                            if select_clicked {
+                                                switch_to = Some(index);
+                                            }
+                                            if close_clicked {
+                                                close_tab = Some(index);
+                                            }
+                                        });
+                                    }
+                                    if chrome_icon_button(ui, "+")
+                                        .on_hover_text("新建标签 · Ctrl+N")
+                                        .clicked()
+                                    {
+                                        create_tab = true;
+                                    }
+                                });
+                            });
+                    },
+                );
+                if let Some(index) = close_tab {
+                    self.request_close_tab(index);
+                } else if let Some(index) = switch_to {
+                    self.switch_tab(index);
+                } else if create_tab {
                     self.new_tab();
                 }
-                if ui.button("打开…     Ctrl+O").clicked() {
-                    ui.close();
-                    self.open_file();
-                }
-                if ui.button("保存       Ctrl+S").clicked() {
-                    ui.close();
-                    self.save();
-                }
-                if ui.button("另存为…   Ctrl+Shift+S").clicked() {
-                    ui.close();
-                    self.save_as();
-                }
-                if ui.button("关闭标签   Ctrl+W").clicked() {
-                    ui.close();
-                    self.request_close_tab(self.active_tab);
-                }
-                ui.separator();
-                if ui.button("导出 HTML…").clicked() {
-                    ui.close();
-                    self.export_html();
-                }
-                if ui.button("导出 PDF…").clicked() {
-                    ui.close();
-                    self.export_pdf();
-                }
-            });
-            ui.menu_button("编辑", |ui| {
-                if ui.button("复制渲染内容").clicked() {
-                    ui.close();
-                    ui.ctx().copy_text(markdown::plain_text(&self.blocks));
-                }
-                if ui.button("复制 HTML").clicked() {
-                    ui.close();
-                    ui.ctx().copy_text(export::render_html(&self.text));
-                }
-            });
-            ui.menu_button("视图", |ui| {
-                ui.set_min_width(230.0);
-                ui.label(egui::RichText::new("文档主题").weak().size(12.0));
-                if let Some(package) = &self.theme_package {
-                    let author = if package.author.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · {}", package.author)
-                    };
-                    ui.label(
-                        egui::RichText::new(format!("{}{}", package.name, author))
-                            .strong()
-                            .size(13.0),
-                    );
-                } else {
-                    ui.label(egui::RichText::new("少数派经典 · 内置").strong().size(13.0));
-                }
-                ui.horizontal(|ui| {
-                    if ui.button("导入主题包…").clicked() {
-                        self.import_theme(ui.ctx());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if chrome_nav_button(ui, "专注", self.focus_mode)
+                        .on_hover_text("专注模式 · F8")
+                        .clicked()
+                    {
+                        self.focus_mode = !self.focus_mode;
                     }
-                    if self.theme_package.is_some() && ui.small_button("移除").clicked() {
-                        self.remove_theme(ui.ctx());
+                    ui.add_space(4.0);
+                    if chrome_nav_button(ui, "分栏", self.view_mode == ViewMode::Split).clicked()
+                    {
+                        self.view_mode = ViewMode::Split;
+                    }
+                    if chrome_nav_button(ui, "阅读", self.view_mode == ViewMode::Preview).clicked()
+                    {
+                        self.view_mode = ViewMode::Preview;
+                    }
+                    if chrome_nav_button(ui, "写作", self.view_mode == ViewMode::Write).clicked()
+                    {
+                        self.view_mode = ViewMode::Write;
                     }
                 });
-                ui.separator();
-                ui.label(egui::RichText::new("编辑与正文字号").weak().size(12.0));
-                ui.horizontal(|ui| {
-                    if ui.small_button("−").clicked() {
-                        self.body_font_size = (self.body_font_size - 0.5).max(12.0);
-                    }
-                    ui.add(
-                        egui::Slider::new(&mut self.body_font_size, 12.0..=22.0)
-                            .step_by(0.5)
-                            .show_value(false),
-                    );
-                    if ui.small_button("+").clicked() {
-                        self.body_font_size = (self.body_font_size + 0.5).min(22.0);
-                    }
-                    ui.label(format!("{:.1}", self.body_font_size));
-                });
-                if ui.small_button("恢复默认字号").clicked() {
-                    self.body_font_size = 15.5;
-                }
-                ui.separator();
-                ui.checkbox(&mut self.show_status, "显示状态栏");
-                let theme = if self.dark {
-                    "浅色外观"
-                } else {
-                    "深色外观"
-                };
-                if ui.button(theme).clicked() {
-                    self.dark = !self.dark;
-                    self.apply_current_theme(ui.ctx());
-                    ui.close();
-                }
-            });
-            ui.separator();
-            let mut switch_to = None;
-            let mut close_tab = None;
-            let mut create_tab = false;
-            let tabs_width = (ui.available_width() - 235.0).max(150.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(tabs_width, 26.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    egui::ScrollArea::horizontal()
-                        .id_salt("document_tabs")
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for index in 0..self.tabs.len() {
-                                    let id = self.tabs[index].id;
-                                    let title = self.tab_title(index);
-                                    let dirty = self.is_tab_dirty(index);
-                                    ui.push_id(id, |ui| {
-                                        let (select_clicked, close_clicked) = document_tab_button(
-                                            ui,
-                                            id,
-                                            &title,
-                                            dirty,
-                                            index == self.active_tab,
-                                        );
-                                        if select_clicked {
-                                            switch_to = Some(index);
-                                        }
-                                        if close_clicked {
-                                            close_tab = Some(index);
-                                        }
-                                    });
-                                }
-                                if chrome_icon_button(ui, "+")
-                                    .on_hover_text("新建标签 · Ctrl+N")
-                                    .clicked()
-                                {
-                                    create_tab = true;
-                                }
-                            });
-                        });
-                },
-            );
-            if let Some(index) = close_tab {
-                self.request_close_tab(index);
-            } else if let Some(index) = switch_to {
-                self.switch_tab(index);
-            } else if create_tab {
-                self.new_tab();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if chrome_nav_button(ui, "专注", self.focus_mode)
-                    .on_hover_text("专注模式 · F8")
-                    .clicked()
-                {
-                    self.focus_mode = !self.focus_mode;
-                }
-                ui.add_space(4.0);
-                if chrome_nav_button(ui, "分栏", self.view_mode == ViewMode::Split).clicked() {
-                    self.view_mode = ViewMode::Split;
-                }
-                if chrome_nav_button(ui, "阅读", self.view_mode == ViewMode::Preview).clicked() {
-                    self.view_mode = ViewMode::Preview;
-                }
-                if chrome_nav_button(ui, "写作", self.view_mode == ViewMode::Write).clicked() {
-                    self.view_mode = ViewMode::Write;
-                }
-            });
-        });
-        ui.add_space(5.0);
+            },
+        );
     }
 
     fn status_bar(&self, ui: &mut egui::Ui) {
