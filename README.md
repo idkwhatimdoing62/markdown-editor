@@ -22,7 +22,7 @@
 
 ## 运行与构建
 
-可在 [Releases](https://github.com/idkwhatimdoing62/markdown-editor/releases) 下载 Windows 安装版、免安装 EXE 或便携 ZIP。
+可在 [Releases](https://github.com/idkwhatimdoing62/markdown-editor/releases) 下载 Windows 安装版 Setup 或免安装 ZIP。
 
 ```powershell
 cargo run --release
