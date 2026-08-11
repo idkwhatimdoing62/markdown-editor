@@ -1,8 +1,12 @@
 #define MyAppName "Markdown 编辑器与预览器"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #define MyAppPublisher "idkwhatimdoing62"
 #define MyAppURL "https://github.com/idkwhatimdoing62/markdown-editor"
 #define MyAppExeName "markdown-editor.exe"
+
+#ifndef BuildDir
+  #define BuildDir "..\target\release"
+#endif
 
 [Setup]
 AppId={{9C823C09-02D2-4C96-B75A-B7E01197CD8A}
@@ -40,7 +44,7 @@ Name: "chinesesimplified"; MessagesFile: "languages\ChineseSimplified.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
 
 [Files]
-Source: "..\target-editor-focus\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\fonts\JetBrainsMono-OFL.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\fonts\LXGWWenKaiLite-OFL.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion

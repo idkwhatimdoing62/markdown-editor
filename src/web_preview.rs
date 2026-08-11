@@ -188,6 +188,12 @@ pre[data-language]::before {
     text-transform: uppercase;
     pointer-events: none;
 }
+ol:not(#footnotes), ul {
+    padding-inline-start: clamp(1.5em, 3vw, 2.25em) !important;
+}
+ol:not(#footnotes) > li::marker {
+    font-variant-numeric: tabular-nums;
+}
 html { scrollbar-width: none; }
 ::-webkit-scrollbar { width: 0; height: 0; }
 @media (max-width: 700px) {
@@ -325,6 +331,20 @@ mod tests {
         assert!(html.contains("@media (max-width: 700px)"));
         assert!(html.contains("body > h1:first-child { margin-top: 0; margin-bottom: 10px; }"));
         assert!(html.contains("li { margin-top: .45em; margin-bottom: .45em; }"));
+    }
+
+    #[test]
+    fn 普通列表使用稳定缩进且不影响脚注() {
+        let html = document(
+            "1. 第一项\n2. 第二项",
+            crate::theme::BUILT_IN_SSPAI_CSS,
+            None,
+            None,
+        );
+        assert!(html.contains(
+            "ol:not(#footnotes), ul {\n    padding-inline-start: clamp(1.5em, 3vw, 2.25em) !important;"
+        ));
+        assert!(html.contains("font-variant-numeric: tabular-nums"));
     }
 
     #[test]

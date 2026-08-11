@@ -41,6 +41,8 @@ cargo build --release
 & "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\markdown-editor.iss
 ```
 
+如使用自定义 Cargo 构建目录，可通过 `/DBuildDir=路径` 传给 Inno Setup 编译器。
+
 ## 快捷键
 
 - `Ctrl+O`：打开
