@@ -138,6 +138,158 @@ fn document_label(id: u64, path: Option<&PathBuf>, dirty: bool) -> String {
     }
 }
 
+fn shortened_tab_title(title: &str) -> String {
+    const LIMIT: usize = 22;
+    if title.chars().count() <= LIMIT {
+        return title.to_string();
+    }
+    let head = title.chars().take(12).collect::<String>();
+    let tail = title
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}…{tail}")
+}
+
+fn document_tab_button(
+    ui: &mut egui::Ui,
+    id: u64,
+    title: &str,
+    dirty: bool,
+    selected: bool,
+) -> (bool, bool) {
+    let title = shortened_tab_title(title);
+    let font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
+    let text_color = if selected {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().widgets.inactive.fg_stroke.color
+    };
+    let galley = ui.painter().layout_no_wrap(title, font.clone(), text_color);
+    let width = (galley.size().x + 58.0).clamp(96.0, 220.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 32.0), egui::Sense::hover());
+    let tab_response = ui.interact(
+        rect,
+        ui.id().with(("document-tab", id)),
+        egui::Sense::click(),
+    );
+    let close_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 15.0, rect.center().y),
+        egui::vec2(22.0, 22.0),
+    );
+    let close_response = ui.interact(
+        close_rect,
+        ui.id().with(("document-tab-close", id)),
+        egui::Sense::click(),
+    );
+    let hovered = tab_response.hovered() || close_response.hovered();
+
+    if selected {
+        ui.painter()
+            .rect_filled(rect, egui::CornerRadius::same(4), ui.visuals().window_fill);
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left() + 8.0, rect.bottom() - 1.0),
+                egui::pos2(rect.right() - 8.0, rect.bottom() - 1.0),
+            ],
+            egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+        );
+    } else if hovered {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+
+    let text_pos = egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(text_pos, galley, text_color);
+
+    if dirty {
+        ui.painter().circle_filled(
+            egui::pos2(close_rect.left() - 5.0, rect.center().y),
+            2.5,
+            ui.visuals().warn_fg_color,
+        );
+    }
+    if selected || hovered {
+        let close_color = if close_response.hovered() {
+            ui.visuals().strong_text_color()
+        } else {
+            ui.visuals().widgets.inactive.fg_stroke.color
+        };
+        ui.painter().text(
+            close_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "×",
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+            close_color,
+        );
+    }
+
+    let close_clicked = close_response.clicked();
+    if close_response.hovered() {
+        close_response.on_hover_text("关闭标签");
+    }
+    (tab_response.clicked() && !close_clicked, close_clicked)
+}
+
+fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(46.0, 30.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    let color = if selected {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().widgets.inactive.fg_stroke.color
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        color,
+    );
+    if selected {
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left() + 12.0, rect.bottom() - 1.0),
+                egui::pos2(rect.right() - 12.0, rect.bottom() - 1.0),
+            ],
+            egui::Stroke::new(1.5, ui.visuals().strong_text_color()),
+        );
+    }
+    response
+}
+
+fn chrome_icon_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 30.0), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(4),
+            ui.visuals().widgets.hovered.weak_bg_fill,
+        );
+    }
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::new(17.0, egui::FontFamily::Proportional),
+        ui.visuals().widgets.inactive.fg_stroke.color,
+    );
+    response
+}
+
 struct MdEditorApp {
     tabs: Vec<DocumentTab>,
     active_tab: usize,
@@ -310,14 +462,14 @@ impl MdEditorApp {
         )
     }
 
-    fn tab_label(&self, index: usize) -> String {
-        let (id, path, dirty) = if index == self.active_tab {
-            (self.tabs[index].id, &self.path, self.is_active_dirty())
+    fn tab_title(&self, index: usize) -> String {
+        let (id, path) = if index == self.active_tab {
+            (self.tabs[index].id, &self.path)
         } else {
             let tab = &self.tabs[index];
-            (tab.id, &tab.path, self.is_tab_dirty(index))
+            (tab.id, &tab.path)
         };
-        document_label(id, path.as_ref(), dirty)
+        document_label(id, path.as_ref(), false)
     }
 
     fn request_close_tab(&mut self, index: usize) {
@@ -768,7 +920,10 @@ impl MdEditorApp {
     fn title_bar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(5.0);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().button_padding = egui::vec2(7.0, 4.0);
+            ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+            ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
             ui.menu_button("文件", |ui| {
                 if ui.button("新建标签   Ctrl+N").clicked() {
                     ui.close();
@@ -883,24 +1038,25 @@ impl MdEditorApp {
                             ui.horizontal(|ui| {
                                 for index in 0..self.tabs.len() {
                                     let id = self.tabs[index].id;
-                                    let label = self.tab_label(index);
+                                    let title = self.tab_title(index);
+                                    let dirty = self.is_tab_dirty(index);
                                     ui.push_id(id, |ui| {
-                                        ui.spacing_mut().item_spacing.x = 3.0;
-                                        if ui
-                                            .selectable_label(index == self.active_tab, label)
-                                            .clicked()
-                                        {
+                                        let (select_clicked, close_clicked) = document_tab_button(
+                                            ui,
+                                            id,
+                                            &title,
+                                            dirty,
+                                            index == self.active_tab,
+                                        );
+                                        if select_clicked {
                                             switch_to = Some(index);
                                         }
-                                        if ui.small_button("×").on_hover_text("关闭标签").clicked()
-                                        {
+                                        if close_clicked {
                                             close_tab = Some(index);
                                         }
-                                        ui.separator();
                                     });
                                 }
-                                if ui
-                                    .small_button("+")
+                                if chrome_icon_button(ui, "+")
                                     .on_hover_text("新建标签 · Ctrl+N")
                                     .clicked()
                                 {
@@ -918,17 +1074,22 @@ impl MdEditorApp {
                 self.new_tab();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("专注")
+                if chrome_nav_button(ui, "专注", self.focus_mode)
                     .on_hover_text("专注模式 · F8")
                     .clicked()
                 {
                     self.focus_mode = !self.focus_mode;
                 }
-                ui.add_space(8.0);
-                ui.selectable_value(&mut self.view_mode, ViewMode::Split, "分栏");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Preview, "阅读");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Write, "写作");
+                ui.add_space(4.0);
+                if chrome_nav_button(ui, "分栏", self.view_mode == ViewMode::Split).clicked() {
+                    self.view_mode = ViewMode::Split;
+                }
+                if chrome_nav_button(ui, "阅读", self.view_mode == ViewMode::Preview).clicked() {
+                    self.view_mode = ViewMode::Preview;
+                }
+                if chrome_nav_button(ui, "写作", self.view_mode == ViewMode::Write).clicked() {
+                    self.view_mode = ViewMode::Write;
+                }
             });
         });
         ui.add_space(5.0);
@@ -1106,7 +1267,7 @@ impl MdEditorApp {
         if self.conflict.is_some() || index != self.active_tab {
             return;
         }
-        let title = document_label(self.tabs[index].id, self.path.as_ref(), false);
+        let title = self.tab_title(index);
         egui::Window::new("关闭标签")
             .collapsible(false)
             .resizable(false)
@@ -1518,5 +1679,14 @@ mod app_tests {
             "相同内容".as_bytes(),
             &DocStatus::Conflict,
         ));
+    }
+
+    #[test]
+    fn 长标签保留开头结尾并省略中间() {
+        assert_eq!(shortened_tab_title("short.md"), "short.md");
+        let shortened = shortened_tab_title("这是一个非常非常长的Markdown设计文档.md");
+        assert!(shortened.contains('…'));
+        assert!(shortened.ends_with("设计文档.md"));
+        assert!(shortened.chars().count() <= 21);
     }
 }
