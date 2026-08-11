@@ -155,9 +155,9 @@ fn shortened_tab_title(title: &str) -> String {
     format!("{head}…{tail}")
 }
 
-const CHROME_FONT_SIZE: f32 = 13.0;
-const CHROME_CONTROL_HEIGHT: f32 = 30.0;
-const CHROME_BAR_HEIGHT: f32 = 36.0;
+const CHROME_FONT_SIZE: f32 = 16.0;
+const CHROME_CONTROL_HEIGHT: f32 = 34.0;
+const CHROME_BAR_HEIGHT: f32 = 40.0;
 
 fn document_tab_button(
     ui: &mut egui::Ui,
