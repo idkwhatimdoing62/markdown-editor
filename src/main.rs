@@ -53,7 +53,96 @@ enum ViewMode {
     Split,
 }
 
+#[derive(Clone)]
+struct DocumentTab {
+    id: u64,
+    text: String,
+    path: Option<PathBuf>,
+    disk_snapshot: Vec<u8>,
+    status: DocStatus,
+    blocks: Vec<Block>,
+    last_parsed: String,
+    status_note: String,
+    conflict: Option<PathBuf>,
+    draft_last_write: f64,
+    last_edit_time: f64,
+    prev_editor_ratio: f32,
+    prev_preview_ratio: f32,
+    last_caret_line: usize,
+}
+
+impl DocumentTab {
+    fn blank(id: u64) -> Self {
+        Self {
+            id,
+            text: String::new(),
+            path: None,
+            disk_snapshot: Vec::new(),
+            status: DocStatus::Unsaved,
+            blocks: Vec::new(),
+            last_parsed: String::new(),
+            status_note: String::new(),
+            conflict: None,
+            draft_last_write: 0.0,
+            last_edit_time: f64::INFINITY,
+            prev_editor_ratio: 0.0,
+            prev_preview_ratio: 0.0,
+            last_caret_line: 0,
+        }
+    }
+
+    fn from_file(id: u64, path: PathBuf, text: String, snapshot: Vec<u8>) -> Self {
+        let blocks = markdown::parse(&text);
+        Self {
+            id,
+            last_parsed: text.clone(),
+            text,
+            path: Some(path),
+            disk_snapshot: snapshot,
+            status: DocStatus::Saved,
+            blocks,
+            status_note: String::new(),
+            conflict: None,
+            draft_last_write: 0.0,
+            last_edit_time: f64::INFINITY,
+            prev_editor_ratio: 0.0,
+            prev_preview_ratio: 0.0,
+            last_caret_line: 0,
+        }
+    }
+}
+
+fn document_is_dirty(
+    path: Option<&PathBuf>,
+    text: &str,
+    snapshot: &[u8],
+    status: &DocStatus,
+) -> bool {
+    matches!(status, DocStatus::Conflict)
+        || match path {
+            Some(_) => snapshot != text.as_bytes(),
+            None => !text.is_empty(),
+        }
+}
+
+fn document_label(id: u64, path: Option<&PathBuf>, dirty: bool) -> String {
+    let title = path
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("未命名 {id}"));
+    if dirty {
+        format!("{title}  •")
+    } else {
+        title
+    }
+}
+
 struct MdEditorApp {
+    tabs: Vec<DocumentTab>,
+    active_tab: usize,
+    next_tab_id: u64,
+    pending_close: Option<usize>,
     text: String,
     path: Option<PathBuf>,
     disk_snapshot: Vec<u8>,
@@ -97,6 +186,10 @@ impl MdEditorApp {
         let recovery = io::load_draft();
         let sample = "# Markdown 编辑器与预览器\n\n左栏编辑，右栏实时预览。\n\n- 支持标题、列表、表格、代码块\n- Ctrl+S 保存，Ctrl+O 打开\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n## 功能\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n| 预览 | 可用 |\n";
         let mut app = Self {
+            tabs: Vec::new(),
+            active_tab: 0,
+            next_tab_id: 2,
+            pending_close: None,
             text: sample.to_string(),
             path: None,
             disk_snapshot: Vec::new(),
@@ -123,7 +216,160 @@ impl MdEditorApp {
         };
         app.blocks = markdown::parse(&app.text);
         app.last_parsed = app.text.clone();
+        app.tabs.push(app.capture_active_tab(1));
         app
+    }
+
+    fn capture_active_tab(&self, id: u64) -> DocumentTab {
+        DocumentTab {
+            id,
+            text: self.text.clone(),
+            path: self.path.clone(),
+            disk_snapshot: self.disk_snapshot.clone(),
+            status: self.status.clone(),
+            blocks: self.blocks.clone(),
+            last_parsed: self.last_parsed.clone(),
+            status_note: self.status_note.clone(),
+            conflict: self.conflict.clone(),
+            draft_last_write: self.draft_last_write,
+            last_edit_time: self.last_edit_time,
+            prev_editor_ratio: self.prev_editor_ratio,
+            prev_preview_ratio: self.prev_preview_ratio,
+            last_caret_line: self.last_caret_line,
+        }
+    }
+
+    fn persist_active_tab(&mut self) {
+        let Some(tab) = self.tabs.get(self.active_tab) else {
+            return;
+        };
+        let state = self.capture_active_tab(tab.id);
+        self.tabs[self.active_tab] = state;
+    }
+
+    fn load_tab_state(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index).cloned() else {
+            return;
+        };
+        self.active_tab = index;
+        self.text = tab.text;
+        self.path = tab.path;
+        self.disk_snapshot = tab.disk_snapshot;
+        self.status = tab.status;
+        self.blocks = tab.blocks;
+        self.last_parsed = tab.last_parsed;
+        self.status_note = tab.status_note;
+        self.conflict = tab.conflict;
+        self.draft_last_write = tab.draft_last_write;
+        self.last_edit_time = tab.last_edit_time;
+        self.prev_editor_ratio = tab.prev_editor_ratio;
+        self.prev_preview_ratio = tab.prev_preview_ratio;
+        self.last_caret_line = tab.last_caret_line;
+        self.editor_focused = false;
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if self.pending_close.is_some() || index == self.active_tab || index >= self.tabs.len() {
+            return;
+        }
+        self.persist_active_tab();
+        self.load_tab_state(index);
+    }
+
+    fn push_tab(&mut self, tab: DocumentTab) {
+        self.persist_active_tab();
+        self.tabs.push(tab);
+        self.load_tab_state(self.tabs.len() - 1);
+    }
+
+    fn new_tab(&mut self) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.push_tab(DocumentTab::blank(id));
+    }
+
+    fn is_active_dirty(&self) -> bool {
+        document_is_dirty(
+            self.path.as_ref(),
+            &self.text,
+            &self.disk_snapshot,
+            &self.status,
+        )
+    }
+
+    fn is_tab_dirty(&self, index: usize) -> bool {
+        if index == self.active_tab {
+            return self.is_active_dirty();
+        }
+        let tab = &self.tabs[index];
+        document_is_dirty(
+            tab.path.as_ref(),
+            &tab.text,
+            &tab.disk_snapshot,
+            &tab.status,
+        )
+    }
+
+    fn tab_label(&self, index: usize) -> String {
+        let (id, path, dirty) = if index == self.active_tab {
+            (self.tabs[index].id, &self.path, self.is_active_dirty())
+        } else {
+            let tab = &self.tabs[index];
+            (tab.id, &tab.path, self.is_tab_dirty(index))
+        };
+        document_label(id, path.as_ref(), dirty)
+    }
+
+    fn request_close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if index != self.active_tab && !self.is_tab_dirty(index) {
+            self.close_tab_now(index);
+            return;
+        }
+        if index != self.active_tab {
+            self.switch_tab(index);
+        }
+        if self.is_active_dirty() {
+            self.pending_close = Some(self.active_tab);
+        } else {
+            self.close_tab_now(self.active_tab);
+        }
+    }
+
+    fn close_tab_now(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.persist_active_tab();
+        let old_active = self.active_tab;
+        self.tabs.remove(index);
+        self.pending_close = None;
+        if self.tabs.is_empty() {
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            self.tabs.push(DocumentTab::blank(id));
+            self.load_tab_state(0);
+        } else {
+            let new_active = if index < old_active {
+                old_active - 1
+            } else if index == old_active {
+                index.min(self.tabs.len() - 1)
+            } else {
+                old_active
+            };
+            self.load_tab_state(new_active);
+        }
+    }
+
+    fn finish_pending_close_if_saved(&mut self) {
+        if matches!(self.status, DocStatus::Saved)
+            && let Some(index) = self.pending_close
+            && index == self.active_tab
+        {
+            self.close_tab_now(index);
+        }
     }
 
     fn theme_spec(&self) -> ThemeSpec {
@@ -210,12 +456,17 @@ impl MdEditorApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let new_tab = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
         let save = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
         let save_as = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
             egui::Key::S,
         );
+        let close_tab = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
+        if ctx.input_mut(|i| i.consume_shortcut(&new_tab)) {
+            self.new_tab();
+        }
         if ctx.input_mut(|i| i.consume_shortcut(&open)) {
             self.open_file();
         }
@@ -224,6 +475,23 @@ impl MdEditorApp {
         }
         if ctx.input_mut(|i| i.consume_shortcut(&save_as)) {
             self.save_as();
+        }
+        if ctx.input_mut(|i| i.consume_shortcut(&close_tab)) {
+            self.request_close_tab(self.active_tab);
+        }
+        if ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Tab,
+            )
+        }) && self.tabs.len() > 1
+        {
+            let previous = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+            self.switch_tab(previous);
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Tab))
+            && self.tabs.len() > 1
+        {
+            self.switch_tab((self.active_tab + 1) % self.tabs.len());
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash)) {
             self.view_mode = if self.view_mode == ViewMode::Preview {
@@ -247,23 +515,34 @@ impl MdEditorApp {
     }
 
     fn open_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(paths) = rfd::FileDialog::new()
             .add_filter("Markdown", &["md", "markdown", "txt"])
-            .pick_file()
+            .pick_files()
         else {
             return;
         };
-        self.open_path(&path);
+        for path in paths {
+            self.open_path(&path);
+        }
     }
 
     fn open_path(&mut self, path: &PathBuf) {
+        self.persist_active_tab();
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.path.as_ref() == Some(path))
+        {
+            self.load_tab_state(index);
+            self.status_note = format!("已切换到 {}", path.display());
+            return;
+        }
         match io::read_markdown(path) {
             Ok(text) => {
-                self.text = text;
-                self.path = Some(path.clone());
-                self.disk_snapshot = io::read_snapshot(path).unwrap_or_default();
-                self.last_parsed.clear();
-                self.status = DocStatus::Saved;
+                let snapshot = io::read_snapshot(path).unwrap_or_default();
+                let id = self.next_tab_id;
+                self.next_tab_id += 1;
+                self.push_tab(DocumentTab::from_file(id, path.clone(), text, snapshot));
                 self.status_note = format!("已打开 {}", path.display());
                 io::clear_draft();
             }
@@ -275,9 +554,11 @@ impl MdEditorApp {
     }
 
     fn save(&mut self) {
-        let Some(path) = self.current_or_pick_save_path() else {
+        if self.path.is_none() {
+            self.save_as();
             return;
-        };
+        }
+        let path = self.path.clone().expect("已检查文档路径");
         match io::save_with_conflict_check(&path, &self.text, &self.disk_snapshot) {
             Ok(bytes) => {
                 self.disk_snapshot = bytes;
@@ -296,9 +577,9 @@ impl MdEditorApp {
         }
     }
 
-    fn save_as(&mut self) {
+    fn save_as(&mut self) -> bool {
         let Some(path) = pick_save_path() else {
-            return;
+            return false;
         };
         match io::save_overwrite(&path, &self.text) {
             Ok(bytes) => {
@@ -307,16 +588,13 @@ impl MdEditorApp {
                 self.status = DocStatus::Saved;
                 self.status_note = format!("已保存 {}", clock_time());
                 io::clear_draft();
+                true
             }
-            Err(e) => self.status = DocStatus::SaveFailed(format!("保存失败：{}", e)),
+            Err(e) => {
+                self.status = DocStatus::SaveFailed(format!("保存失败：{}", e));
+                false
+            }
         }
-    }
-
-    fn current_or_pick_save_path(&mut self) -> Option<PathBuf> {
-        if let Some(p) = &self.path {
-            return Some(p.clone());
-        }
-        pick_save_path()
     }
 
     fn resolve_overwrite(&mut self) {
@@ -327,6 +605,8 @@ impl MdEditorApp {
                     self.path = Some(path);
                     self.status = DocStatus::Saved;
                     self.status_note = "已覆盖保存".to_string();
+                    io::clear_draft();
+                    self.finish_pending_close_if_saved();
                 }
                 Err(e) => self.status = DocStatus::SaveFailed(format!("保存失败：{}", e)),
             }
@@ -334,8 +614,10 @@ impl MdEditorApp {
     }
 
     fn resolve_save_as(&mut self) {
-        self.conflict = None;
-        self.save_as();
+        if self.save_as() {
+            self.conflict = None;
+            self.finish_pending_close_if_saved();
+        }
     }
 
     fn resolve_reload(&mut self) {
@@ -348,6 +630,8 @@ impl MdEditorApp {
                     self.last_parsed.clear();
                     self.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
+                    io::clear_draft();
+                    self.finish_pending_close_if_saved();
                 }
                 Err(e) => {
                     self.status =
@@ -486,6 +770,10 @@ impl MdEditorApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.menu_button("文件", |ui| {
+                if ui.button("新建标签   Ctrl+N").clicked() {
+                    ui.close();
+                    self.new_tab();
+                }
                 if ui.button("打开…     Ctrl+O").clicked() {
                     ui.close();
                     self.open_file();
@@ -497,6 +785,10 @@ impl MdEditorApp {
                 if ui.button("另存为…   Ctrl+Shift+S").clicked() {
                     ui.close();
                     self.save_as();
+                }
+                if ui.button("关闭标签   Ctrl+W").clicked() {
+                    ui.close();
+                    self.request_close_tab(self.active_tab);
                 }
                 ui.separator();
                 if ui.button("导出 HTML…").clicked() {
@@ -575,22 +867,56 @@ impl MdEditorApp {
                     ui.close();
                 }
             });
-            let title = self
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("未命名.md");
-            let dirty = if matches!(self.status, DocStatus::Saved) {
-                ""
-            } else {
-                "  •"
-            };
-            ui.label(
-                egui::RichText::new(format!("{title}{dirty}"))
-                    .weak()
-                    .size(12.0),
+            ui.separator();
+            let mut switch_to = None;
+            let mut close_tab = None;
+            let mut create_tab = false;
+            let tabs_width = (ui.available_width() - 235.0).max(150.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(tabs_width, 26.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("document_tabs")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for index in 0..self.tabs.len() {
+                                    let id = self.tabs[index].id;
+                                    let label = self.tab_label(index);
+                                    ui.push_id(id, |ui| {
+                                        ui.spacing_mut().item_spacing.x = 3.0;
+                                        if ui
+                                            .selectable_label(index == self.active_tab, label)
+                                            .clicked()
+                                        {
+                                            switch_to = Some(index);
+                                        }
+                                        if ui.small_button("×").on_hover_text("关闭标签").clicked()
+                                        {
+                                            close_tab = Some(index);
+                                        }
+                                        ui.separator();
+                                    });
+                                }
+                                if ui
+                                    .small_button("+")
+                                    .on_hover_text("新建标签 · Ctrl+N")
+                                    .clicked()
+                                {
+                                    create_tab = true;
+                                }
+                            });
+                        });
+                },
             );
+            if let Some(index) = close_tab {
+                self.request_close_tab(index);
+            } else if let Some(index) = switch_to {
+                self.switch_tab(index);
+            } else if create_tab {
+                self.new_tab();
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("专注")
@@ -772,6 +1098,39 @@ impl MdEditorApp {
                 });
             });
     }
+
+    fn close_tab_window(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.pending_close else {
+            return;
+        };
+        if self.conflict.is_some() || index != self.active_tab {
+            return;
+        }
+        let title = document_label(self.tabs[index].id, self.path.as_ref(), false);
+        egui::Window::new("关闭标签")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("“{title}”包含未保存的修改。"));
+                ui.label("关闭前要保存这些修改吗？");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("保存并关闭").clicked() {
+                        self.save();
+                        if matches!(self.status, DocStatus::Saved) {
+                            self.close_tab_now(index);
+                        }
+                    }
+                    if ui.button("放弃修改").clicked() {
+                        self.close_tab_now(index);
+                    }
+                    if ui.button("取消").clicked() {
+                        self.pending_close = None;
+                    }
+                });
+            });
+    }
 }
 
 impl eframe::App for MdEditorApp {
@@ -905,7 +1264,8 @@ impl eframe::App for MdEditorApp {
 
         #[cfg(target_os = "windows")]
         {
-            let modal_open = self.conflict.is_some() || self.recovery.is_some();
+            let modal_open =
+                self.conflict.is_some() || self.recovery.is_some() || self.pending_close.is_some();
             let popup_open = ctx.any_popup_open();
             if modal_open || popup_open || browser_rect.is_none() {
                 self.browser_preview.hide();
@@ -924,6 +1284,7 @@ impl eframe::App for MdEditorApp {
         }
         self.conflict_window(&ctx);
         self.recovery_window(&ctx);
+        self.close_tab_window(&ctx);
     }
 }
 
@@ -1105,4 +1466,57 @@ fn clock_time() -> String {
         .as_secs();
     let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
     format!("{:02}:{:02}:{:02}", h, m, s)
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn 空白标签不显示修改标记() {
+        let tab = DocumentTab::blank(7);
+        assert!(!document_is_dirty(
+            tab.path.as_ref(),
+            &tab.text,
+            &tab.disk_snapshot,
+            &tab.status,
+        ));
+        assert_eq!(document_label(tab.id, tab.path.as_ref(), false), "未命名 7");
+    }
+
+    #[test]
+    fn 每个文件标签独立判断修改状态() {
+        let path = PathBuf::from("notes.md");
+        let mut tab = DocumentTab::from_file(
+            3,
+            path.clone(),
+            "原文".to_string(),
+            "原文".as_bytes().to_vec(),
+        );
+        assert!(!document_is_dirty(
+            tab.path.as_ref(),
+            &tab.text,
+            &tab.disk_snapshot,
+            &tab.status,
+        ));
+        tab.text.push_str("修改");
+        assert!(document_is_dirty(
+            tab.path.as_ref(),
+            &tab.text,
+            &tab.disk_snapshot,
+            &tab.status,
+        ));
+        assert_eq!(document_label(tab.id, Some(&path), true), "notes.md  •");
+    }
+
+    #[test]
+    fn 冲突标签始终需要关闭确认() {
+        let path = PathBuf::from("conflict.md");
+        assert!(document_is_dirty(
+            Some(&path),
+            "相同内容",
+            "相同内容".as_bytes(),
+            &DocStatus::Conflict,
+        ));
+    }
 }

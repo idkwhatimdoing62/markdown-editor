@@ -4,7 +4,7 @@
 
 ## 主要功能
 
-- 写作、阅读、分栏与专注模式
+- 多文件标签页，以及写作、阅读、分栏与专注模式
 - CommonMark、表格、脚注、任务列表和围栏代码块
 - WebView2 实时预览，忠实执行导入的 CSS 主题
 - 支持导入 `.css`、`.zip` 和 JSON 主题包
@@ -46,8 +46,12 @@ cargo build --release
 ## 快捷键
 
 - `Ctrl+O`：打开
+- `Ctrl+N`：新建标签
 - `Ctrl+S`：保存
 - `Ctrl+Shift+S`：另存为
+- `Ctrl+W`：关闭当前标签
+- `Ctrl+Tab`：切换到下一个标签
+- `Ctrl+Shift+Tab`：切换到上一个标签
 - `Ctrl+1`：写作
 - `Ctrl+2`：阅读
 - `Ctrl+3`：分栏

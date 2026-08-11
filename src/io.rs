@@ -150,6 +150,19 @@ mod tests {
     }
 
     #[test]
+    fn 新文档可以直接创建并写入() {
+        let dir = temp_dir();
+        let p = dir.join("new.md");
+        assert!(!p.exists());
+        assert_eq!(
+            save_overwrite(&p, "新文档"),
+            Ok("新文档".as_bytes().to_vec())
+        );
+        assert_eq!(fs::read_to_string(&p).unwrap(), "新文档");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 草稿保存和恢复() {
         let p = draft_path();
         let _ = fs::remove_file(&p);
