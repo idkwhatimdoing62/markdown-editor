@@ -2375,16 +2375,18 @@ checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
 
 [[package]]
 name = "markdown-editor"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "eframe",
  "egui",
  "printpdf",
  "pulldown-cmark",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",
  "url",
+ "windows-sys 0.61.2",
  "wry",
  "zip",
 ]

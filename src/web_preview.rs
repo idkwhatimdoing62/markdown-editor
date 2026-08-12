@@ -6,6 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use pulldown_cmark::{Parser, html};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE};
 use wry::http::{Request, Response};
@@ -16,6 +17,7 @@ pub struct BrowserPreview {
     document_hash: u64,
     bounds: Option<[i32; 4]>,
     visible: bool,
+    frozen_frame: Option<egui::TextureHandle>,
 }
 
 impl Default for BrowserPreview {
@@ -25,6 +27,7 @@ impl Default for BrowserPreview {
             document_hash: 0,
             bounds: None,
             visible: false,
+            frozen_frame: None,
         }
     }
 }
@@ -97,10 +100,154 @@ impl BrowserPreview {
         }
     }
 
+    /// Native child WebViews always sit above egui's render surface on Windows.
+    /// Freeze the current pixels before hiding the child so popup menus can be
+    /// painted on top without turning the whole reading area blank.
+    pub fn freeze_for_overlay(
+        &mut self,
+        frame: &eframe::Frame,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        pixels_per_point: f32,
+    ) {
+        if self.frozen_frame.is_none()
+            && self.visible
+            && let Some(image) = capture_preview(frame, rect, pixels_per_point)
+        {
+            self.frozen_frame = Some(ctx.load_texture(
+                "browser-preview-frozen-frame",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        self.hide();
+        if let Some(texture) = &self.frozen_frame {
+            ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("browser-preview-frozen-layer"),
+            ))
+            .image(
+                texture.id(),
+                rect,
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    pub fn discard_frozen_frame(&mut self) {
+        self.frozen_frame = None;
+    }
+
     pub fn focus_parent(&self) {
         if let Some(webview) = &self.webview {
             let _ = webview.focus_parent();
         }
+    }
+}
+
+fn capture_preview(
+    frame: &eframe::Frame,
+    rect: egui::Rect,
+    pixels_per_point: f32,
+) -> Option<egui::ColorImage> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, ClientToScreen,
+        CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, HGDIOBJ, ReleaseDC, SRCCOPY, SelectObject,
+    };
+
+    let window = frame.winit_window()?;
+    let raw = window.window_handle().ok()?.as_raw();
+    let RawWindowHandle::Win32(handle) = raw else {
+        return None;
+    };
+    let hwnd = handle.hwnd.get() as *mut core::ffi::c_void;
+    let bounds = physical_bounds(rect, pixels_per_point);
+    let width = bounds[2];
+    let height = bounds[3];
+    let mut origin = POINT {
+        x: bounds[0],
+        y: bounds[1],
+    };
+
+    // SAFETY: every GDI handle is checked and released before returning. The
+    // destination buffer is sized to width * height * 4 and BITMAPINFO asks for
+    // exactly a 32-bit top-down image.
+    unsafe {
+        if ClientToScreen(hwnd, &mut origin) == 0 {
+            return None;
+        }
+        let screen_dc = GetDC(std::ptr::null_mut());
+        if screen_dc.is_null() {
+            return None;
+        }
+        let memory_dc = CreateCompatibleDC(screen_dc);
+        if memory_dc.is_null() {
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+        if bitmap.is_null() {
+            DeleteDC(memory_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return None;
+        }
+        let previous = SelectObject(memory_dc, bitmap as HGDIOBJ);
+        let copied = BitBlt(
+            memory_dc,
+            0,
+            0,
+            width,
+            height,
+            screen_dc,
+            origin.x,
+            origin.y,
+            SRCCOPY | CAPTUREBLT,
+        );
+
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..std::mem::zeroed()
+        };
+        let mut bgra = vec![0_u8; width as usize * height as usize * 4];
+        let rows = if copied != 0 {
+            GetDIBits(
+                memory_dc,
+                bitmap,
+                0,
+                height as u32,
+                bgra.as_mut_ptr().cast(),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
+        } else {
+            0
+        };
+
+        SelectObject(memory_dc, previous);
+        DeleteObject(bitmap as HGDIOBJ);
+        DeleteDC(memory_dc);
+        ReleaseDC(std::ptr::null_mut(), screen_dc);
+        if rows == 0 {
+            return None;
+        }
+
+        for pixel in bgra.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+            pixel[3] = 255;
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            &bgra,
+        ))
     }
 }
 

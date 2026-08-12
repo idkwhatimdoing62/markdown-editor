@@ -1449,9 +1449,18 @@ impl eframe::App for MdEditorApp {
             let modal_open =
                 self.conflict.is_some() || self.recovery.is_some() || self.pending_close.is_some();
             let popup_open = ctx.any_popup_open();
-            if modal_open || popup_open || browser_rect.is_none() {
+            if (modal_open || popup_open) && browser_rect.is_some() {
+                self.browser_preview.freeze_for_overlay(
+                    frame,
+                    &ctx,
+                    browser_rect.expect("已检查预览区域"),
+                    ctx.pixels_per_point(),
+                );
+            } else if browser_rect.is_none() {
                 self.browser_preview.hide();
+                self.browser_preview.discard_frozen_frame();
             } else if let Some(rect) = browser_rect {
+                self.browser_preview.discard_frozen_frame();
                 let document = self.browser_document();
                 if let Err(error) =
                     self.browser_preview
