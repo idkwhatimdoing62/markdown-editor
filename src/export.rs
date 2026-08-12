@@ -28,21 +28,23 @@ blockquote{{border-left:3px solid #ccc;margin-left:0;padding-left:12px;color:#55
 }
 
 pub fn export_pdf(path: &Path, markdown: &str) -> Result<(), String> {
-    let font_bytes =
-        cjk_font_bytes().ok_or_else(|| "未找到可用的中文字体（如 simhei.ttf）".to_string())?;
+    let font_bytes = lxgw_wenkai_regular_bytes().to_vec();
     let body = render_html(markdown);
     let html_doc = format!(
         "<html><head><style>\
-body{{font-family:'SimHei',sans-serif;font-size:12px;line-height:1.6;margin:0}}\
-pre{{background:#f4f4f4;padding:8px;font-family:'SimHei',monospace;white-space:pre-wrap}}\
-code{{font-family:'SimHei',monospace}}\
+body{{font-family:'LXGW WenKai Lite',sans-serif;font-size:12px;line-height:1.6;margin:0}}\
+pre{{background:#f4f4f4;padding:8px;font-family:'LXGW WenKai Lite',monospace;white-space:pre-wrap}}\
+code{{font-family:'LXGW WenKai Lite',monospace}}\
 table{{border-collapse:collapse}}td,th{{border:1px solid #999;padding:4px 8px}}\
 blockquote{{border-left:3px solid #999;margin-left:0;padding-left:10px;color:#444}}\
 </style></head><body>{body}</body></html>"
     );
 
     let mut fonts = BTreeMap::new();
-    fonts.insert("SimHei".to_string(), printpdf::Base64OrRaw::Raw(font_bytes));
+    fonts.insert(
+        "LXGW WenKai Lite".to_string(),
+        printpdf::Base64OrRaw::Raw(font_bytes),
+    );
     let options = printpdf::GeneratePdfOptions {
         page_width: Some(210.0),
         page_height: Some(297.0),
@@ -63,21 +65,6 @@ blockquote{{border-left:3px solid #999;margin-left:0;padding-left:10px;color:#44
     .map_err(|e| e)?;
     let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
     std::fs::write(path, bytes).map_err(|e| e.to_string())
-}
-
-pub fn cjk_font_bytes() -> Option<Vec<u8>> {
-    const CANDIDATES: &[&str] = &[
-        "C:/Windows/Fonts/simhei.ttf",
-        "C:/Windows/Fonts/Deng.ttf",
-        "C:/Windows/Fonts/simsun.ttc",
-        "C:/Windows/Fonts/msyh.ttc",
-    ];
-    for candidate in CANDIDATES {
-        if let Ok(bytes) = std::fs::read(candidate) {
-            return Some(bytes);
-        }
-    }
-    None
 }
 
 pub fn bold_latin_font_bytes() -> Option<Vec<u8>> {
