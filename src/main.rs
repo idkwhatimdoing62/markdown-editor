@@ -178,8 +178,10 @@ fn document_tab_button(
     } else {
         ui.visuals().widgets.inactive.fg_stroke.color
     };
-    let galley = ui.painter().layout_no_wrap(title, font.clone(), text_color);
-    let width = (galley.size().x + 58.0).clamp(96.0, 220.0);
+    let natural_galley = ui
+        .painter()
+        .layout_no_wrap(title.clone(), font.clone(), text_color);
+    let width = (natural_galley.size().x + 58.0).clamp(96.0, 220.0);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(width, CHROME_CONTROL_HEIGHT),
         egui::Sense::hover(),
@@ -218,8 +220,26 @@ fn document_tab_button(
         );
     }
 
-    let text_pos = egui::pos2(rect.left() + 12.0, rect.center().y - galley.size().y / 2.0);
-    ui.painter().galley(text_pos, galley, text_color);
+    // Long CJK filenames can be much wider than their character count suggests.
+    // Keep the title inside its own lane so it can never cover the dirty marker
+    // or the close button.
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 12.0, rect.top()),
+        egui::pos2(
+            close_rect.left() - if dirty { 12.0 } else { 4.0 },
+            rect.bottom(),
+        ),
+    );
+    let mut title_job = egui::text::LayoutJob::simple(title, font, text_color, text_rect.width());
+    title_job.wrap = egui::text::TextWrapping::truncate_at_width(text_rect.width());
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(title_job));
+    let text_pos = egui::pos2(
+        text_rect.left(),
+        text_rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter()
+        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
+        .galley(text_pos, galley, text_color);
 
     if dirty {
         ui.painter().circle_filled(
@@ -228,20 +248,35 @@ fn document_tab_button(
             ui.visuals().warn_fg_color,
         );
     }
-    if selected || hovered {
-        let close_color = if close_response.hovered() {
-            ui.visuals().strong_text_color()
-        } else {
-            ui.visuals().widgets.inactive.fg_stroke.color
-        };
-        ui.painter().text(
-            close_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "×",
-            egui::FontId::new(CHROME_FONT_SIZE, egui::FontFamily::Proportional),
-            close_color,
-        );
-    }
+    // Draw the close icon as geometry instead of a font glyph. Some CJK font
+    // fallbacks do not contain U+00D7, which used to make the button invisible.
+    let close_color = if close_response.hovered() {
+        ui.visuals().strong_text_color()
+    } else if selected {
+        ui.visuals().widgets.inactive.fg_stroke.color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let close_center = close_rect.center();
+    let close_half = if close_response.hovered() { 4.5 } else { 4.0 };
+    let close_stroke = egui::Stroke::new(
+        if close_response.hovered() { 1.8 } else { 1.45 },
+        close_color,
+    );
+    ui.painter().line_segment(
+        [
+            close_center + egui::vec2(-close_half, -close_half),
+            close_center + egui::vec2(close_half, close_half),
+        ],
+        close_stroke,
+    );
+    ui.painter().line_segment(
+        [
+            close_center + egui::vec2(-close_half, close_half),
+            close_center + egui::vec2(close_half, -close_half),
+        ],
+        close_stroke,
+    );
 
     let close_clicked = close_response.clicked();
     if close_response.hovered() {
