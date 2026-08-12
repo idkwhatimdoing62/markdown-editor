@@ -5,7 +5,7 @@ mod io;
 mod markdown;
 mod preview;
 mod theme;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod web_preview;
 
 use std::path::PathBuf;
@@ -14,6 +14,11 @@ use eframe::egui;
 use egui::containers::scroll_area::ScrollAreaOutput;
 use markdown::Block;
 use theme::{ThemePackage, ThemeSpec};
+
+#[cfg(target_os = "macos")]
+const PRIMARY_SHORTCUT: &str = "⌘";
+#[cfg(not(target_os = "macos"))]
+const PRIMARY_SHORTCUT: &str = "Ctrl";
 
 fn main() -> eframe::Result {
     let open_path = std::env::args().nth(1).map(PathBuf::from);
@@ -329,7 +334,7 @@ struct MdEditorApp {
     show_status: bool,
     body_font_size: f32,
     theme_package: Option<ThemePackage>,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_preview: web_preview::BrowserPreview,
 }
 
@@ -349,7 +354,8 @@ impl MdEditorApp {
             .unwrap_or_else(|| ThemeSpec::fallback(false));
         apply_visuals(&cc.egui_ctx, false, &initial_theme);
         let recovery = io::load_draft();
-        let sample = "# Markdown 编辑器与预览器\n\n左栏编辑，右栏实时预览。\n\n- 支持标题、列表、表格、代码块\n- Ctrl+S 保存，Ctrl+O 打开\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n## 功能\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n| 预览 | 可用 |\n";
+        let sample = "# Markdown 编辑器与预览器\n\n左栏编辑，右栏实时预览。\n\n- 支持标题、列表、表格、代码块\n- Ctrl+S 保存，Ctrl+O 打开\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n## 功能\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n| 预览 | 可用 |\n"
+            .replace("Ctrl", PRIMARY_SHORTCUT);
         let mut app = Self {
             tabs: Vec::new(),
             active_tab: 0,
@@ -376,7 +382,7 @@ impl MdEditorApp {
             show_status: true,
             body_font_size: initial_body_font_size,
             theme_package,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
         };
         app.blocks = markdown::parse(&app.text);
@@ -549,7 +555,7 @@ impl MdEditorApp {
         apply_visuals(ctx, self.dark, &self.theme_spec());
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn browser_document(&self) -> String {
         let built_in = ThemePackage::built_in_sspai();
         let package = self.theme_package.as_ref().unwrap_or(&built_in);
@@ -838,15 +844,21 @@ impl MdEditorApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("文件", |ui| {
-                if ui.button("打开…    Ctrl+O").clicked() {
+                if ui
+                    .button(format!("打开…    {PRIMARY_SHORTCUT}+O"))
+                    .clicked()
+                {
                     ui.close();
                     self.open_file();
                 }
-                if ui.button("保存    Ctrl+S").clicked() {
+                if ui.button(format!("保存    {PRIMARY_SHORTCUT}+S")).clicked() {
                     ui.close();
                     self.save();
                 }
-                if ui.button("另存为…    Ctrl+Shift+S").clicked() {
+                if ui
+                    .button(format!("另存为…    {PRIMARY_SHORTCUT}+Shift+S"))
+                    .clicked()
+                {
                     ui.close();
                     self.save_as();
                 }
@@ -878,13 +890,21 @@ impl MdEditorApp {
                 }
             });
             ui.menu_button("视图", |ui| {
-                ui.selectable_value(&mut self.view_mode, ViewMode::Write, "写作模式     Ctrl+1");
+                ui.selectable_value(
+                    &mut self.view_mode,
+                    ViewMode::Write,
+                    format!("写作模式     {PRIMARY_SHORTCUT}+1"),
+                );
                 ui.selectable_value(
                     &mut self.view_mode,
                     ViewMode::Preview,
-                    "阅读模式     Ctrl+2",
+                    format!("阅读模式     {PRIMARY_SHORTCUT}+2"),
                 );
-                ui.selectable_value(&mut self.view_mode, ViewMode::Split, "分栏模式     Ctrl+3");
+                ui.selectable_value(
+                    &mut self.view_mode,
+                    ViewMode::Split,
+                    format!("分栏模式     {PRIMARY_SHORTCUT}+3"),
+                );
                 ui.separator();
                 ui.label(egui::RichText::new("编辑与正文字号").weak().size(12.0));
                 ui.add(
@@ -909,9 +929,21 @@ impl MdEditorApp {
                 }
             });
             ui.menu_button("视图", |ui| {
-                ui.selectable_value(&mut self.view_mode, ViewMode::Write, "写作模式    Ctrl+1");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Preview, "阅读模式    Ctrl+2");
-                ui.selectable_value(&mut self.view_mode, ViewMode::Split, "分栏模式    Ctrl+3");
+                ui.selectable_value(
+                    &mut self.view_mode,
+                    ViewMode::Write,
+                    format!("写作模式    {PRIMARY_SHORTCUT}+1"),
+                );
+                ui.selectable_value(
+                    &mut self.view_mode,
+                    ViewMode::Preview,
+                    format!("阅读模式    {PRIMARY_SHORTCUT}+2"),
+                );
+                ui.selectable_value(
+                    &mut self.view_mode,
+                    ViewMode::Split,
+                    format!("分栏模式    {PRIMARY_SHORTCUT}+3"),
+                );
                 ui.separator();
                 ui.checkbox(&mut self.focus_mode, "专注模式    F8");
                 ui.checkbox(&mut self.show_status, "显示状态栏");
@@ -940,23 +972,38 @@ impl MdEditorApp {
                 ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
                 ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                 ui.menu_button(egui::RichText::new("文件").size(CHROME_FONT_SIZE), |ui| {
-                    if ui.button("新建标签   Ctrl+N").clicked() {
+                    if ui
+                        .button(format!("新建标签   {PRIMARY_SHORTCUT}+N"))
+                        .clicked()
+                    {
                         ui.close();
                         self.new_tab();
                     }
-                    if ui.button("打开…     Ctrl+O").clicked() {
+                    if ui
+                        .button(format!("打开…     {PRIMARY_SHORTCUT}+O"))
+                        .clicked()
+                    {
                         ui.close();
                         self.open_file();
                     }
-                    if ui.button("保存       Ctrl+S").clicked() {
+                    if ui
+                        .button(format!("保存       {PRIMARY_SHORTCUT}+S"))
+                        .clicked()
+                    {
                         ui.close();
                         self.save();
                     }
-                    if ui.button("另存为…   Ctrl+Shift+S").clicked() {
+                    if ui
+                        .button(format!("另存为…   {PRIMARY_SHORTCUT}+Shift+S"))
+                        .clicked()
+                    {
                         ui.close();
                         self.save_as();
                     }
-                    if ui.button("关闭标签   Ctrl+W").clicked() {
+                    if ui
+                        .button(format!("关闭标签   {PRIMARY_SHORTCUT}+W"))
+                        .clicked()
+                    {
                         ui.close();
                         self.request_close_tab(self.active_tab);
                     }
@@ -1075,7 +1122,7 @@ impl MdEditorApp {
                                         });
                                     }
                                     if chrome_icon_button(ui, "+")
-                                        .on_hover_text("新建标签 · Ctrl+N")
+                                        .on_hover_text(format!("新建标签 · {PRIMARY_SHORTCUT}+N"))
                                         .clicked()
                                     {
                                         create_tab = true;
@@ -1319,7 +1366,7 @@ impl eframe::App for MdEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut browser_rect = None;
 
         if self.text != self.last_parsed {
@@ -1356,6 +1403,20 @@ impl eframe::App for MdEditorApp {
 
         let doc_theme = self.theme_spec();
         let editor_fill = doc_theme.editor_canvas;
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let browser_can_show = {
+            #[cfg(target_os = "windows")]
+            {
+                true
+            }
+            #[cfg(target_os = "macos")]
+            {
+                !(self.conflict.is_some()
+                    || self.recovery.is_some()
+                    || self.pending_close.is_some()
+                    || ctx.any_popup_open())
+            }
+        };
 
         match self.view_mode {
             ViewMode::Write => {
@@ -1379,13 +1440,22 @@ impl eframe::App for MdEditorApp {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(ui.visuals().window_fill))
                     .show(ui, |ui| {
-                        #[cfg(target_os = "windows")]
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
                         {
-                            let rect = ui.available_rect_before_wrap();
-                            ui.allocate_rect(rect, egui::Sense::hover());
-                            browser_rect = Some(rect);
+                            if browser_can_show {
+                                let rect = ui.available_rect_before_wrap();
+                                ui.allocate_rect(rect, egui::Sense::hover());
+                                browser_rect = Some(rect);
+                            } else {
+                                show_centered_preview(
+                                    ui,
+                                    &self.blocks,
+                                    self.body_font_size,
+                                    &doc_theme,
+                                );
+                            }
                         }
-                        #[cfg(not(target_os = "windows"))]
+                        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                         show_centered_preview(ui, &self.blocks, self.body_font_size, &doc_theme);
                     });
             }
@@ -1412,15 +1482,24 @@ impl eframe::App for MdEditorApp {
                             self.body_font_size,
                         )
                     });
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(ui.visuals().window_fill))
                     .show(ui, |ui| {
-                        let rect = ui.available_rect_before_wrap();
-                        ui.allocate_rect(rect, egui::Sense::hover());
-                        browser_rect = Some(rect);
+                        if browser_can_show {
+                            let rect = ui.available_rect_before_wrap();
+                            ui.allocate_rect(rect, egui::Sense::hover());
+                            browser_rect = Some(rect);
+                        } else {
+                            let _ = show_preview_scroll(
+                                ui,
+                                &self.blocks,
+                                self.body_font_size,
+                                &doc_theme,
+                            );
+                        }
                     });
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                 {
                     let preview_out = egui::CentralPanel::default()
                         .frame(
@@ -1439,12 +1518,12 @@ impl eframe::App for MdEditorApp {
                     self.sync_scrolls(&ctx, &editor_out.inner, &preview_out.inner);
                     self.sync_caret(&ctx, &editor_out.inner, &preview_out.inner);
                 }
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "macos"))]
                 let _ = editor_out;
             }
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let modal_open =
                 self.conflict.is_some() || self.recovery.is_some() || self.pending_close.is_some();

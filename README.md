@@ -1,12 +1,12 @@
 # Markdown 编辑器与预览器
 
-一个使用 Rust、egui 和 WebView2 构建的 Windows Markdown 编辑器。左侧专注写作，右侧使用浏览器引擎实时执行 Markdown 主题 CSS。
+一个使用 Rust、egui 和系统 WebView 构建的 Windows/macOS Markdown 编辑器。左侧专注写作，右侧使用浏览器引擎实时执行 Markdown 主题 CSS。
 
 ## 主要功能
 
 - 多文件标签页，以及写作、阅读、分栏与专注模式
 - CommonMark、表格、脚注、任务列表、围栏代码块和 Mermaid 图表
-- WebView2 实时预览，忠实执行导入的 CSS 主题
+- WebView2（Windows）或 WKWebView（macOS）实时预览，忠实执行导入的 CSS 主题
 - 支持导入 `.css`、`.zip` 和 JSON 主题包
 - 内置少数派经典主题，可设置正文字号
 - 围栏代码块右上角显示语言
@@ -16,13 +16,13 @@
 
 ## 环境要求
 
-- Windows 10/11
-- [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
+- Windows 10/11，运行时需要 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
+- macOS 11 或更高版本，支持 Apple Silicon 与 Intel
 - 从源码构建需要稳定版 Rust 工具链
 
 ## 运行与构建
 
-可在 [Releases](https://github.com/idkwhatimdoing62/markdown-editor/releases) 下载 Windows 安装版 Setup 或免安装 ZIP。
+可在 [Releases](https://github.com/idkwhatimdoing62/markdown-editor/releases) 下载 Windows 安装版 Setup、Windows 免安装 ZIP 或 macOS 通用版 App ZIP。
 
 ```powershell
 cargo run --release
@@ -43,6 +43,14 @@ cargo build --release
 
 如使用自定义 Cargo 构建目录，可通过 `/DBuildDir=路径` 传给 Inno Setup 编译器。
 
+在 macOS 上生成同时支持 Apple Silicon 与 Intel 的通用 App：
+
+```bash
+bash scripts/build-macos.sh
+```
+
+macOS 包采用本地临时签名，首次运行若被 Gatekeeper 拦截，可在 Finder 中右键应用并选择“打开”，或在“系统设置 → 隐私与安全性”中允许启动。
+
 ## 快捷键
 
 - `Ctrl+O`：打开
@@ -57,6 +65,8 @@ cargo build --release
 - `Ctrl+3`：分栏
 - `Ctrl+/`：切换写作/阅读
 - `F8`：专注模式
+
+macOS 使用 `⌘` 代替上述快捷键中的 `Ctrl`。
 
 ## 字体与授权
 

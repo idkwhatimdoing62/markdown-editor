@@ -6,11 +6,14 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Parser, Tag, html};
+#[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE};
 use wry::http::{Request, Response};
-use wry::{Rect, ScrollBarStyle, WebView, WebViewBuilder, WebViewBuilderExtWindows};
+use wry::{Rect, WebView, WebViewBuilder};
+#[cfg(target_os = "windows")]
+use wry::{ScrollBarStyle, WebViewBuilderExtWindows};
 
 pub struct BrowserPreview {
     webview: Option<WebView>,
@@ -47,8 +50,13 @@ impl BrowserPreview {
             let window = frame
                 .winit_window()
                 .ok_or_else(|| "当前窗口后端不支持浏览器预览".to_string())?;
-            let webview = WebViewBuilder::new()
+            let builder = WebViewBuilder::new();
+            #[cfg(target_os = "windows")]
+            let builder = builder
                 .with_https_scheme(true)
+                .with_browser_accelerator_keys(false)
+                .with_scroll_bar_style(ScrollBarStyle::FluentOverlay);
+            let webview = builder
                 .with_custom_protocol("mdfont".into(), |_webview_id, request| {
                     preview_asset_response(request)
                 })
@@ -60,10 +68,8 @@ impl BrowserPreview {
                 .with_visible(true)
                 .with_focused(false)
                 .with_clipboard(true)
-                .with_browser_accelerator_keys(false)
-                .with_scroll_bar_style(ScrollBarStyle::FluentOverlay)
                 .build_as_child(window)
-                .map_err(|error| format!("无法创建 WebView2 预览：{error}"))?;
+                .map_err(|error| format!("无法创建浏览器预览：{error}"))?;
             self.webview = Some(webview);
             self.document_hash = document_hash;
             self.bounds = Some(bounds);
@@ -123,17 +129,23 @@ impl BrowserPreview {
         rect: egui::Rect,
         pixels_per_point: f32,
     ) {
-        if self.frozen_frame.is_none()
-            && self.visible
-            && let Some(image) = capture_preview(frame, rect, pixels_per_point)
+        #[cfg(target_os = "windows")]
         {
-            self.frozen_frame = Some(ctx.load_texture(
-                "browser-preview-frozen-frame",
-                image,
-                egui::TextureOptions::LINEAR,
-            ));
+            if self.frozen_frame.is_none()
+                && self.visible
+                && let Some(image) = capture_preview(frame, rect, pixels_per_point)
+            {
+                self.frozen_frame = Some(ctx.load_texture(
+                    "browser-preview-frozen-frame",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
         }
+        #[cfg(target_os = "macos")]
+        let _ = (frame, ctx, rect, pixels_per_point);
         self.hide();
+        #[cfg(target_os = "windows")]
         if let Some(texture) = &self.frozen_frame {
             ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Middle,
@@ -159,6 +171,7 @@ impl BrowserPreview {
     }
 }
 
+#[cfg(target_os = "windows")]
 fn capture_preview(
     frame: &eframe::Frame,
     rect: egui::Rect,
@@ -287,15 +300,43 @@ pub fn document(
         .map(|size| format!("body {{ font-size: {size:.2}px !important; }}"))
         .unwrap_or_default();
     let editor_font = editor_font_css();
+    let asset_origin = custom_protocol_script_source("mdfont");
     let mermaid_scripts = if has_mermaid {
-        "<script defer src=\"https://mdfont.localhost/mermaid.min.js\"></script><script defer src=\"https://mdfont.localhost/mermaid-init.js\"></script>"
+        format!(
+            "<script defer src=\"{}\"></script><script defer src=\"{}\"></script>",
+            custom_protocol_url("mdfont", "mermaid.min.js"),
+            custom_protocol_url("mdfont", "mermaid-init.js")
+        )
     } else {
-        ""
+        String::new()
     };
 
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src https://mdfont.localhost; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style>{mermaid_scripts}</head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src {asset_origin}; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style>{mermaid_scripts}</head><body>{body}</body></html>"
     )
+}
+
+fn custom_protocol_url(scheme: &str, path: &str) -> String {
+    let path = path.trim_start_matches('/');
+    #[cfg(target_os = "windows")]
+    {
+        format!("https://{scheme}.localhost/{path}")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!("{scheme}://localhost/{path}")
+    }
+}
+
+fn custom_protocol_script_source(scheme: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!("https://{scheme}.localhost")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        format!("{scheme}:")
+    }
 }
 
 fn rewrite_local_image_event<'a>(event: Event<'a>, base_directory: Option<&Path>) -> Event<'a> {
@@ -335,7 +376,7 @@ fn local_image_url(destination: &str, base_directory: Option<&Path>) -> Option<S
         base_directory?.join(path)
     };
     let file_url = url::Url::from_file_path(absolute).ok()?;
-    Some(format!("https://mdfile.localhost{}", file_url.path()))
+    Some(custom_protocol_url("mdfile", file_url.path()))
 }
 
 fn contains_mermaid_code_block(markdown: &str) -> bool {
@@ -348,13 +389,19 @@ fn contains_mermaid_code_block(markdown: &str) -> bool {
     })
 }
 
-fn editor_font_css() -> &'static str {
-    "@font-face{font-family:'Markdown Editor Mono';src:url('https://mdfont.localhost/jetbrains-regular.ttf') format('truetype');font-style:normal;font-weight:400;font-display:block;}\
-     @font-face{font-family:'Markdown Editor Mono';src:url('https://mdfont.localhost/jetbrains-bold.ttf') format('truetype');font-style:normal;font-weight:700;font-display:block;}\
-     @font-face{font-family:'LXGW WenKai Lite';src:url('https://mdfont.localhost/lxgw-regular.ttf') format('truetype');font-style:normal;font-weight:400;font-display:block;}\
-     @font-face{font-family:'LXGW WenKai Lite';src:url('https://mdfont.localhost/lxgw-medium.ttf') format('truetype');font-style:normal;font-weight:500;font-display:block;}\
-     body,pre,code,blockquote::before,blockquote::after{font-family:'Markdown Editor Mono','LXGW WenKai Lite','SimHei','DengXian','SimSun','Microsoft YaHei',monospace!important;font-synthesis:weight;}\
-     strong,b{font-weight:800!important;}"
+fn editor_font_css() -> String {
+    format!(
+        "@font-face{{font-family:'Markdown Editor Mono';src:url('{}') format('truetype');font-style:normal;font-weight:400;font-display:block;}}\
+         @font-face{{font-family:'Markdown Editor Mono';src:url('{}') format('truetype');font-style:normal;font-weight:700;font-display:block;}}\
+         @font-face{{font-family:'LXGW WenKai Lite';src:url('{}') format('truetype');font-style:normal;font-weight:400;font-display:block;}}\
+         @font-face{{font-family:'LXGW WenKai Lite';src:url('{}') format('truetype');font-style:normal;font-weight:500;font-display:block;}}\
+         body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono','LXGW WenKai Lite','SimHei','DengXian','SimSun','Microsoft YaHei',monospace!important;font-synthesis:weight;}}\
+         strong,b{{font-weight:800!important;}}",
+        custom_protocol_url("mdfont", "jetbrains-regular.ttf"),
+        custom_protocol_url("mdfont", "jetbrains-bold.ttf"),
+        custom_protocol_url("mdfont", "lxgw-regular.ttf"),
+        custom_protocol_url("mdfont", "lxgw-medium.ttf")
+    )
 }
 
 fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
@@ -646,7 +693,10 @@ fn normalize_footnote_dom(body: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{document, local_image_response, local_image_url, preview_asset_response};
+    use super::{
+        custom_protocol_script_source, custom_protocol_url, document, local_image_response,
+        local_image_url, preview_asset_response,
+    };
     use wry::http::Request;
 
     #[test]
@@ -686,7 +736,7 @@ mod tests {
         std::fs::write(&image_path, bytes).unwrap();
 
         let url = local_image_url("纹样讲稿图片/01-莲花纹.jpg", Some(&base)).unwrap();
-        assert!(url.starts_with("https://mdfile.localhost/C:/"));
+        assert!(url.starts_with(&custom_protocol_url("mdfile", "")));
         assert!(url.contains("%E7%BA%B9%E6%A0%B7"));
 
         let html = document(
@@ -768,7 +818,7 @@ mod tests {
         );
         assert!(html.contains("@font-face{font-family:'Markdown Editor Mono'"));
         assert!(html.contains("font-family:'LXGW WenKai Lite'"));
-        assert!(html.contains("https://mdfont.localhost/lxgw-regular.ttf"));
+        assert!(html.contains(&custom_protocol_url("mdfont", "lxgw-regular.ttf")));
         assert!(html.contains(
             "body,pre,code,blockquote::before,blockquote::after{font-family:'Markdown Editor Mono','LXGW WenKai Lite'"
         ));
@@ -807,9 +857,12 @@ mod tests {
             None,
         );
         assert!(html.contains("<pre data-language=\"mermaid\"><code class=\"language-mermaid\">"));
-        assert!(html.contains("https://mdfont.localhost/mermaid.min.js"));
-        assert!(html.contains("https://mdfont.localhost/mermaid-init.js"));
-        assert!(html.contains("script-src https://mdfont.localhost"));
+        assert!(html.contains(&custom_protocol_url("mdfont", "mermaid.min.js")));
+        assert!(html.contains(&custom_protocol_url("mdfont", "mermaid-init.js")));
+        assert!(html.contains(&format!(
+            "script-src {}",
+            custom_protocol_script_source("mdfont")
+        )));
         assert!(!html.contains("script-src 'unsafe-inline'"));
     }
 

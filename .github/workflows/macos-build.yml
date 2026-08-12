@@ -1,0 +1,33 @@
+name: Build macOS universal app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build universal app bundle
+        run: bash scripts/build-macos.sh
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: markdown-editor-macos-universal
+          path: dist/markdown-editor-v*-macos-universal.app.zip
+          if-no-files-found: error
