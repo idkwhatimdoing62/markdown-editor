@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+const STRONG_BOUNDARY: &str = "<!--md-strong-boundary-->";
 
 pub fn parse_options() -> Options {
     Options::ENABLE_TABLES
@@ -82,10 +83,7 @@ fn fence_marker(line: &str) -> Option<(u8, usize)> {
 
 fn normalize_strong_whitespace_in_line(line: &str) -> Cow<'_, str> {
     let bytes = line.as_bytes();
-    if !bytes
-        .windows(3)
-        .any(|window| matches!(window[0], b' ' | b'\t') && &window[1..] == b"**")
-    {
+    if !bytes.windows(2).any(|window| window == b"**") {
         return Cow::Borrowed(line);
     }
     let mut output = String::with_capacity(line.len());
@@ -126,6 +124,19 @@ fn normalize_strong_whitespace_in_line(line: &str) -> Cow<'_, str> {
                     index += 2;
                     continue;
                 }
+                output.push_str("**");
+                index += 2;
+                if index < bytes.len()
+                    && !line[index..]
+                        .chars()
+                        .next()
+                        .expect("valid UTF-8 boundary")
+                        .is_whitespace()
+                {
+                    output.push_str(STRONG_BOUNDARY);
+                    changed = true;
+                }
+                continue;
             } else {
                 strong_content_start = Some(output.len() + 2);
             }
@@ -326,6 +337,7 @@ impl Builder {
             Event::TaskListMarker(checked) => {
                 self.text(if checked { "[x] " } else { "[ ] " }.to_string())
             }
+            Event::Html(h) if h.as_ref() == STRONG_BOUNDARY => {}
             Event::Html(h) => match self.stack.last_mut() {
                 Some(Frame::Raw { text }) | Some(Frame::Code { text, .. }) => text.push_str(&h),
                 _ => self.text(h.to_string()),
@@ -712,6 +724,17 @@ mod tests {
             normalize_compat_markdown(source),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn inserts_an_invisible_boundary_for_adjacent_chinese_text() {
+        let source = "- **识别与生成：**区分植物";
+        assert_eq!(
+            normalize_compat_markdown(source),
+            "- **识别与生成：**<!--md-strong-boundary-->区分植物"
+        );
+        let blocks = parse(source);
+        assert_eq!(plain_text(&blocks), "识别与生成：区分植物");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, html};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Parser, Tag, html};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE};
@@ -51,6 +51,9 @@ impl BrowserPreview {
                 .with_https_scheme(true)
                 .with_custom_protocol("mdfont".into(), |_webview_id, request| {
                     preview_asset_response(request)
+                })
+                .with_custom_protocol("mdfile".into(), |_webview_id, request| {
+                    local_image_response(request)
                 })
                 .with_html(document.to_owned())
                 .with_bounds(to_wry_rect(bounds))
@@ -269,7 +272,8 @@ pub fn document(
 ) -> String {
     let markdown = crate::markdown::normalize_compat_markdown(markdown);
     let has_mermaid = contains_mermaid_code_block(&markdown);
-    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options());
+    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options())
+        .map(|event| rewrite_local_image_event(event, base_directory));
     let mut body = String::new();
     html::push_html(&mut body, parser);
     annotate_code_languages(&mut body);
@@ -294,6 +298,46 @@ pub fn document(
     )
 }
 
+fn rewrite_local_image_event<'a>(event: Event<'a>, base_directory: Option<&Path>) -> Event<'a> {
+    match event {
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => {
+            let dest_url = local_image_url(dest_url.as_ref(), base_directory)
+                .map(CowStr::from)
+                .unwrap_or(dest_url);
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                title,
+                id,
+            })
+        }
+        event => event,
+    }
+}
+
+fn local_image_url(destination: &str, base_directory: Option<&Path>) -> Option<String> {
+    if destination.is_empty() || destination.starts_with('#') {
+        return None;
+    }
+
+    let path = Path::new(destination);
+    if !path.is_absolute() && url::Url::parse(destination).is_ok() {
+        return None;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_directory?.join(path)
+    };
+    let file_url = url::Url::from_file_path(absolute).ok()?;
+    Some(format!("https://mdfile.localhost{}", file_url.path()))
+}
+
 fn contains_mermaid_code_block(markdown: &str) -> bool {
     Parser::new_ext(markdown, crate::markdown::parse_options()).any(|event| {
         matches!(
@@ -308,8 +352,9 @@ fn editor_font_css() -> &'static str {
     "@font-face{font-family:'Markdown Editor Mono';src:url('https://mdfont.localhost/jetbrains-regular.ttf') format('truetype');font-style:normal;font-weight:400;font-display:block;}\
      @font-face{font-family:'Markdown Editor Mono';src:url('https://mdfont.localhost/jetbrains-bold.ttf') format('truetype');font-style:normal;font-weight:700;font-display:block;}\
      @font-face{font-family:'LXGW WenKai Lite';src:url('https://mdfont.localhost/lxgw-regular.ttf') format('truetype');font-style:normal;font-weight:400;font-display:block;}\
-     @font-face{font-family:'LXGW WenKai Lite';src:url('https://mdfont.localhost/lxgw-medium.ttf') format('truetype');font-style:normal;font-weight:500 900;font-display:block;}\
-     body,pre,code,blockquote::before,blockquote::after{font-family:'Markdown Editor Mono','LXGW WenKai Lite','SimHei','DengXian','SimSun','Microsoft YaHei',monospace!important;}"
+     @font-face{font-family:'LXGW WenKai Lite';src:url('https://mdfont.localhost/lxgw-medium.ttf') format('truetype');font-style:normal;font-weight:500;font-display:block;}\
+     body,pre,code,blockquote::before,blockquote::after{font-family:'Markdown Editor Mono','LXGW WenKai Lite','SimHei','DengXian','SimSun','Microsoft YaHei',monospace!important;font-synthesis:weight;}\
+     strong,b{font-weight:800!important;}"
 }
 
 fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
@@ -359,6 +404,55 @@ fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u
         .header(CACHE_CONTROL, cache_control)
         .body(Cow::Borrowed(bytes))
         .expect("有效的预览资源响应")
+}
+
+fn local_image_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
+    let result = request
+        .uri()
+        .path()
+        .strip_prefix('/')
+        .and_then(|path| url::Url::parse(&format!("file:///{path}")).ok())
+        .and_then(|url| url.to_file_path().ok())
+        .filter(|path| supported_image_path(path))
+        .and_then(|path| {
+            let content_type = image_content_type(&path)?;
+            let bytes = std::fs::read(path).ok()?;
+            Some((bytes, content_type))
+        });
+
+    match result {
+        Some((bytes, content_type)) => Response::builder()
+            .header(CONTENT_TYPE, content_type)
+            .header("X-Content-Type-Options", "nosniff")
+            .header(CACHE_CONTROL, "no-cache")
+            .body(Cow::Owned(bytes))
+            .expect("valid local image response"),
+        None => Response::builder()
+            .status(404)
+            .body(Cow::Borrowed(&[] as &[u8]))
+            .expect("valid local image 404 response"),
+    }
+}
+
+fn supported_image_path(path: &Path) -> bool {
+    image_content_type(path).is_some()
+}
+
+fn image_content_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()?
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
 }
 
 const MERMAID_BOOTSTRAP: &str = r#"
@@ -552,15 +646,64 @@ fn normalize_footnote_dom(body: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{document, preview_asset_response};
+    use super::{document, local_image_response, local_image_url, preview_asset_response};
     use wry::http::Request;
 
     #[test]
     fn compatible_strong_markup_uses_the_bold_font_face() {
         let html = document("1. **结构层： **训练一个统一的纹样 LoRA。", "", None, None);
         assert!(html.contains("<strong>结构层：</strong> 训练一个统一的纹样 LoRA。"));
-        assert!(html.contains("font-weight:700"));
+        assert!(html.contains("font-weight:500;font-display:block"));
+        assert!(html.contains("strong,b{font-weight:800!important;}"));
         assert!(!html.contains("**结构层"));
+    }
+
+    #[test]
+    fn standard_strong_markup_next_to_chinese_text_is_rendered() {
+        let html = document(
+            "- **识别与生成：**区分植物、动物、几何和复合纹样；",
+            "",
+            None,
+            None,
+        );
+        assert!(
+            html.contains("<strong>识别与生成：</strong><!--md-strong-boundary-->区分植物"),
+            "generated HTML: {html}"
+        );
+        assert!(!html.contains("**识别与生成"));
+    }
+
+    #[test]
+    fn relative_chinese_image_path_uses_local_resource_protocol() {
+        let base = std::env::temp_dir().join(format!(
+            "markdown-editor-local-image-test-{}",
+            std::process::id()
+        ));
+        let image_dir = base.join("纹样讲稿图片");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        let image_path = image_dir.join("01-莲花纹.jpg");
+        let bytes = b"test-jpeg-payload";
+        std::fs::write(&image_path, bytes).unwrap();
+
+        let url = local_image_url("纹样讲稿图片/01-莲花纹.jpg", Some(&base)).unwrap();
+        assert!(url.starts_with("https://mdfile.localhost/C:/"));
+        assert!(url.contains("%E7%BA%B9%E6%A0%B7"));
+
+        let html = document(
+            "![莲花纹](纹样讲稿图片/01-莲花纹.jpg)",
+            "",
+            Some(&base),
+            None,
+        );
+        assert!(html.contains(&format!("src=\"{url}\"")));
+
+        let request = Request::builder().uri(&url).body(Vec::new()).unwrap();
+        let response = local_image_response(request);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "image/jpeg");
+        assert_eq!(response.body().as_ref(), bytes);
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
