@@ -5,7 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
-use pulldown_cmark::{Parser, html};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, html};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE};
@@ -98,6 +98,16 @@ impl BrowserPreview {
             }
             self.visible = false;
         }
+    }
+
+    /// Release the browser process group when preview is no longer part of the layout.
+    /// `hide` remains separate because popup menus only need a temporary visual hide.
+    pub fn close(&mut self) {
+        self.hide();
+        self.webview = None;
+        self.document_hash = 0;
+        self.bounds = None;
+        self.frozen_frame = None;
     }
 
     /// Native child WebViews always sit above egui's render surface on Windows.
@@ -257,7 +267,9 @@ pub fn document(
     base_directory: Option<&Path>,
     font_size_override: Option<f32>,
 ) -> String {
-    let parser = Parser::new_ext(markdown, crate::markdown::parse_options());
+    let markdown = crate::markdown::normalize_compat_markdown(markdown);
+    let has_mermaid = contains_mermaid_code_block(&markdown);
+    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options());
     let mut body = String::new();
     html::push_html(&mut body, parser);
     annotate_code_languages(&mut body);
@@ -271,10 +283,25 @@ pub fn document(
         .map(|size| format!("body {{ font-size: {size:.2}px !important; }}"))
         .unwrap_or_default();
     let editor_font = editor_font_css();
+    let mermaid_scripts = if has_mermaid {
+        "<script defer src=\"https://mdfont.localhost/mermaid.min.js\"></script><script defer src=\"https://mdfont.localhost/mermaid-init.js\"></script>"
+    } else {
+        ""
+    };
 
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src https://mdfont.localhost; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style><script defer src=\"https://mdfont.localhost/mermaid.min.js\"></script><script defer src=\"https://mdfont.localhost/mermaid-init.js\"></script></head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src https://mdfont.localhost; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style>{mermaid_scripts}</head><body>{body}</body></html>"
     )
+}
+
+fn contains_mermaid_code_block(markdown: &str) -> bool {
+    Parser::new_ext(markdown, crate::markdown::parse_options()).any(|event| {
+        matches!(
+            event,
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                if info.split_whitespace().next().is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+        )
+    })
 }
 
 fn editor_font_css() -> &'static str {
@@ -527,6 +554,21 @@ fn normalize_footnote_dom(body: &mut String) {
 mod tests {
     use super::{document, preview_asset_response};
     use wry::http::Request;
+
+    #[test]
+    fn compatible_strong_markup_uses_the_bold_font_face() {
+        let html = document("1. **结构层： **训练一个统一的纹样 LoRA。", "", None, None);
+        assert!(html.contains("<strong>结构层：</strong> 训练一个统一的纹样 LoRA。"));
+        assert!(html.contains("font-weight:700"));
+        assert!(!html.contains("**结构层"));
+    }
+
+    #[test]
+    fn ordinary_documents_do_not_load_mermaid_runtime() {
+        let html = document("# 标题\n\n普通正文", "", None, None);
+        assert!(!html.contains("mermaid.min.js"));
+        assert!(!html.contains("mermaid-init.js"));
+    }
 
     #[test]
     fn markdown与css原样进入浏览器文档() {

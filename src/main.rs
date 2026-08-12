@@ -1457,8 +1457,7 @@ impl eframe::App for MdEditorApp {
                     ctx.pixels_per_point(),
                 );
             } else if browser_rect.is_none() {
-                self.browser_preview.hide();
-                self.browser_preview.discard_frozen_frame();
+                self.browser_preview.close();
             } else if let Some(rect) = browser_rect {
                 self.browser_preview.discard_frozen_frame();
                 let document = self.browser_document();

@@ -1,5 +1,7 @@
 //! 把 Markdown 解析为可渲染的块模型。
 
+use std::borrow::Cow;
+
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
@@ -9,6 +11,139 @@ pub fn parse_options() -> Options {
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
+}
+
+/// Make a frequent authoring typo render as intended without changing the source text.
+///
+/// CommonMark does not treat `**text **` as strong emphasis because whitespace appears
+/// immediately before the closing delimiter. Move that whitespace behind the delimiter,
+/// while leaving fenced and inline code untouched.
+pub fn normalize_compat_markdown(markdown: &str) -> Cow<'_, str> {
+    let mut output: Option<String> = None;
+    let mut source_offset = 0;
+    let mut fence: Option<(u8, usize)> = None;
+
+    for line_with_ending in markdown.split_inclusive('\n') {
+        let (line, ending) = line_with_ending
+            .strip_suffix('\n')
+            .map_or((line_with_ending, ""), |line| (line, "\n"));
+        let marker = fence_marker(line);
+
+        if let Some((fence_char, fence_len)) = fence {
+            if let Some(output) = &mut output {
+                output.push_str(line);
+                output.push_str(ending);
+            }
+            if marker.is_some_and(|(ch, len)| ch == fence_char && len >= fence_len) {
+                fence = None;
+            }
+            source_offset += line_with_ending.len();
+            continue;
+        }
+
+        if let Some(opening) = marker {
+            fence = Some(opening);
+            if let Some(output) = &mut output {
+                output.push_str(line);
+                output.push_str(ending);
+            }
+            source_offset += line_with_ending.len();
+            continue;
+        }
+
+        let normalized = normalize_strong_whitespace_in_line(line);
+        if matches!(normalized, Cow::Owned(_)) && output.is_none() {
+            let mut initialized = String::with_capacity(markdown.len());
+            initialized.push_str(&markdown[..source_offset]);
+            output = Some(initialized);
+        }
+        if let Some(output) = &mut output {
+            output.push_str(&normalized);
+            output.push_str(ending);
+        }
+        source_offset += line_with_ending.len();
+    }
+
+    match output {
+        Some(output) => Cow::Owned(output),
+        None => Cow::Borrowed(markdown),
+    }
+}
+
+fn fence_marker(line: &str) -> Option<(u8, usize)> {
+    let trimmed = line.trim_start();
+    let marker = *trimmed.as_bytes().first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let count = trimmed.bytes().take_while(|byte| *byte == marker).count();
+    (count >= 3).then_some((marker, count))
+}
+
+fn normalize_strong_whitespace_in_line(line: &str) -> Cow<'_, str> {
+    let bytes = line.as_bytes();
+    if !bytes
+        .windows(3)
+        .any(|window| matches!(window[0], b' ' | b'\t') && &window[1..] == b"**")
+    {
+        return Cow::Borrowed(line);
+    }
+    let mut output = String::with_capacity(line.len());
+    let mut index = 0;
+    let mut inline_code_ticks: Option<usize> = None;
+    let mut strong_content_start: Option<usize> = None;
+    let mut changed = false;
+
+    while index < bytes.len() {
+        if bytes[index] == b'`' {
+            let count = bytes[index..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            match inline_code_ticks {
+                Some(opening) if opening == count => inline_code_ticks = None,
+                None => inline_code_ticks = Some(count),
+                _ => {}
+            }
+            output.push_str(&line[index..index + count]);
+            index += count;
+            continue;
+        }
+
+        if inline_code_ticks.is_none() && bytes[index..].starts_with(b"**") {
+            if let Some(content_start) = strong_content_start.take() {
+                let trailing_bytes = output[content_start..]
+                    .chars()
+                    .rev()
+                    .take_while(|ch| matches!(ch, ' ' | '\t'))
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+                if trailing_bytes > 0 && output.len() > content_start + trailing_bytes {
+                    let whitespace = output.split_off(output.len() - trailing_bytes);
+                    output.push_str("**");
+                    output.push_str(&whitespace);
+                    changed = true;
+                    index += 2;
+                    continue;
+                }
+            } else {
+                strong_content_start = Some(output.len() + 2);
+            }
+            output.push_str("**");
+            index += 2;
+            continue;
+        }
+
+        let ch = line[index..].chars().next().expect("valid UTF-8 boundary");
+        output.push(ch);
+        index += ch.len_utf8();
+    }
+
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(line)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,7 +192,8 @@ pub enum Block {
 }
 
 pub fn parse(markdown: &str) -> Vec<Block> {
-    let parser = Parser::new_ext(markdown, parse_options());
+    let markdown = normalize_compat_markdown(markdown);
+    let parser = Parser::new_ext(&markdown, parse_options());
     let mut builder = Builder::default();
     for event in parser {
         builder.push(event);
@@ -559,6 +695,24 @@ fn plain_of_inlines(inlines: &[Inline]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moves_whitespace_behind_strong_closing_delimiter() {
+        let source = "1. **结构层： **训练一个统一的纹样 LoRA。";
+        assert_eq!(
+            normalize_compat_markdown(source),
+            "1. **结构层：** 训练一个统一的纹样 LoRA。"
+        );
+    }
+
+    #[test]
+    fn leaves_strong_markers_inside_code_unchanged() {
+        let source = "`**inline **`\n\n```text\n**fenced **\n```\n";
+        assert!(matches!(
+            normalize_compat_markdown(source),
+            Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn 正常笔记解析出标题列表和链接() {

@@ -5,10 +5,11 @@ use std::path::Path;
 
 use pulldown_cmark::{Parser, html};
 
-use crate::markdown::parse_options;
+use crate::markdown::{normalize_compat_markdown, parse_options};
 
 pub fn render_html(markdown: &str) -> String {
-    let parser = Parser::new_ext(markdown, parse_options());
+    let markdown = normalize_compat_markdown(markdown);
+    let parser = Parser::new_ext(&markdown, parse_options());
     let mut out = String::new();
     html::push_html(&mut out, parser);
     out
@@ -141,19 +142,19 @@ fn app_font_definitions() -> egui::FontDefinitions {
 
     fonts.font_data.insert(
         "jb_mono".to_string(),
-        egui::FontData::from_owned(JB_MONO_REGULAR.to_vec()).into(),
+        egui::FontData::from_static(JB_MONO_REGULAR).into(),
     );
     fonts.font_data.insert(
         "jb_mono_bold".to_string(),
-        egui::FontData::from_owned(JB_MONO_BOLD.to_vec()).into(),
+        egui::FontData::from_static(JB_MONO_BOLD).into(),
     );
     fonts.font_data.insert(
         "lxgw_wenkai".to_string(),
-        egui::FontData::from_owned(LXGW_WENKAI_REGULAR.to_vec()).into(),
+        egui::FontData::from_static(LXGW_WENKAI_REGULAR).into(),
     );
     fonts.font_data.insert(
         "lxgw_wenkai_medium".to_string(),
-        egui::FontData::from_owned(LXGW_WENKAI_MEDIUM.to_vec()).into(),
+        egui::FontData::from_static(LXGW_WENKAI_MEDIUM).into(),
     );
 
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
@@ -162,35 +163,8 @@ fn app_font_definitions() -> egui::FontDefinitions {
         family_fonts.insert(0, "jb_mono".to_string());
     }
 
-    let mut bold_family = vec!["jb_mono_bold".to_string(), "lxgw_wenkai_medium".to_string()];
+    let bold_family = vec!["jb_mono_bold".to_string(), "lxgw_wenkai_medium".to_string()];
 
-    if let Some(bytes) = bold_latin_font_bytes() {
-        fonts.font_data.insert(
-            "bold_latin".to_string(),
-            egui::FontData::from_owned(bytes).into(),
-        );
-        bold_family.push("bold_latin".to_string());
-    }
-    if let Some(bytes) = bold_cjk_font_bytes() {
-        fonts.font_data.insert(
-            "cjk_bold".to_string(),
-            egui::FontData::from_owned(bytes).into(),
-        );
-        bold_family.push("cjk_bold".to_string());
-    }
-    if let Some(bytes) = cjk_font_bytes() {
-        fonts
-            .font_data
-            .insert("cjk".to_string(), egui::FontData::from_owned(bytes).into());
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .push("cjk".to_string());
-        }
-        bold_family.push("cjk".to_string());
-    }
     fonts
         .families
         .insert(egui::FontFamily::Name("bold".into()), bold_family);
@@ -205,6 +179,13 @@ pub fn install_app_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compatible_strong_markup_is_exported_as_strong_html() {
+        let html = render_html("1. **结构层： **训练一个统一的纹样 LoRA。");
+        assert!(html.contains("<strong>结构层：</strong> 训练一个统一的纹样 LoRA。"));
+        assert!(!html.contains("**结构层"));
+    }
 
     #[test]
     fn 英文优先jetbrains中文回退霞鹜文楷() {
