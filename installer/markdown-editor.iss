@@ -1,5 +1,5 @@
 #define MyAppName "Markdown 编辑器与预览器"
-#define MyAppVersion "0.1.14"
+#define MyAppVersion "0.1.15"
 #define MyAppPublisher "idkwhatimdoing62"
 #define MyAppURL "https://github.com/idkwhatimdoing62/markdown-editor"
 #define MyAppExeName "markdown-editor.exe"
@@ -51,6 +51,19 @@ Source: "..\fonts\JetBrainsMono-OFL.txt"; DestDir: "{app}\licenses"; Flags: igno
 Source: "..\fonts\LXGWWenKaiLite-OFL.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\assets\Mermaid-MIT.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\assets\app-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\MarkdownEditor.Markdown"; ValueType: string; ValueName: ""; ValueData: "Markdown 文档"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\MarkdownEditor.Markdown\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"
+Root: HKCU; Subkey: "Software\Classes\MarkdownEditor.Markdown\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#MyAppExeName}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\.md\OpenWithProgids"; ValueType: none; ValueName: "MarkdownEditor.Markdown"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.markdown\OpenWithProgids"; ValueType: none; ValueName: "MarkdownEditor.Markdown"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\MarkdownEditor\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "Markdown Editor"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\MarkdownEditor\Capabilities"; ValueType: string; ValueName: "ApplicationDescription"; ValueData: "Markdown 编辑器与预览器"
+Root: HKCU; Subkey: "Software\MarkdownEditor\Capabilities"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: "{app}\{#MyAppExeName},0"
+Root: HKCU; Subkey: "Software\MarkdownEditor\Capabilities\FileAssociations"; ValueType: string; ValueName: ".md"; ValueData: "MarkdownEditor.Markdown"
+Root: HKCU; Subkey: "Software\MarkdownEditor\Capabilities\FileAssociations"; ValueType: string; ValueName: ".markdown"; ValueData: "MarkdownEditor.Markdown"
+Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "Markdown Editor"; ValueData: "Software\MarkdownEditor\Capabilities"; Flags: uninsdeletevalue
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"

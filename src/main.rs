@@ -1,6 +1,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod export;
+#[cfg(target_os = "windows")]
+mod file_association;
 mod io;
 mod markdown;
 mod preview;
@@ -1355,6 +1357,23 @@ impl MdEditorApp {
                     if ui.button("导出 PDF…").clicked() {
                         ui.close();
                         self.export_pdf();
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        ui.separator();
+                        if ui.button("设为 Markdown 默认应用…").clicked() {
+                            ui.close();
+                            match file_association::register_and_open_default_apps() {
+                                Ok(()) => {
+                                    self.status_note =
+                                        "已打开系统设置，请确认 .md 与 .markdown 的默认应用"
+                                            .to_string();
+                                }
+                                Err(error) => {
+                                    self.status_note = format!("无法打开默认应用设置：{error}");
+                                }
+                            }
+                        }
                     }
                 });
                 ui.menu_button(egui::RichText::new("编辑").size(CHROME_FONT_SIZE), |ui| {
