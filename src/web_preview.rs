@@ -4,8 +4,9 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Parser, Tag, html};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd, html};
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
@@ -18,19 +19,154 @@ use wry::{ScrollBarStyle, WebViewBuilderExtWindows};
 pub struct BrowserPreview {
     webview: Option<WebView>,
     document_hash: u64,
+    document_changed: bool,
     bounds: Option<[i32; 4]>,
     visible: bool,
     frozen_frame: Option<egui::TextureHandle>,
+    scroll_bridge: Arc<Mutex<ScrollBridge>>,
 }
+
+#[derive(Default)]
+struct ScrollBridge {
+    source_position: Option<f32>,
+    user_source_position: Option<f32>,
+}
+
+const SCROLL_SYNC_SCRIPT: &str = r#"
+(() => {
+  let suppressUntil = performance.now() + 300;
+  let scheduled = false;
+  let animationFrame = 0;
+  let targetSource = 0;
+  let anchorCache = null;
+
+  const anchors = () => {
+    if (anchorCache) return anchorCache;
+    anchorCache = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
+    while (walker.nextNode()) {
+      const match = /^md-source:([0-9.]+)$/.exec(walker.currentNode.nodeValue || '');
+      if (match) anchorCache.push({ source: Number(match[1]), node: walker.currentNode });
+    }
+    return anchorCache;
+  };
+
+  const maxScroll = () => Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+
+  const anchorY = (anchor) => {
+    let sibling = anchor.node.nextSibling;
+    while (sibling && sibling.nodeType !== Node.ELEMENT_NODE) sibling = sibling.nextSibling;
+    if (!sibling) return maxScroll();
+    return Math.min(maxScroll(), Math.max(0, sibling.getBoundingClientRect().top + window.scrollY));
+  };
+
+  const interpolate = (value, aValue, bValue, aResult, bResult) => {
+    if (bValue <= aValue) return aResult;
+    const t = Math.min(1, Math.max(0, (value - aValue) / (bValue - aValue)));
+    return aResult + (bResult - aResult) * t;
+  };
+
+  const yForSource = (source) => {
+    const list = anchors();
+    if (!list.length) return 0;
+    let low = 0;
+    let high = list.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (list[mid].source <= source) low = mid + 1;
+      else high = mid;
+    }
+    const a = list[Math.max(0, low - 1)];
+    const b = list[Math.min(list.length - 1, low)];
+    return interpolate(source, a.source, b.source, anchorY(a), anchorY(b));
+  };
+
+  const sourceForY = (y) => {
+    const list = anchors();
+    if (!list.length) return 0;
+    let low = 0;
+    let high = list.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (anchorY(list[mid]) <= y) low = mid + 1;
+      else high = mid;
+    }
+    const a = list[Math.max(0, low - 1)];
+    const b = list[Math.min(list.length - 1, low)];
+    return interpolate(y, anchorY(a), anchorY(b), a.source, b.source);
+  };
+
+  const report = () => {
+    scheduled = false;
+    const sourcePosition = sourceForY(window.scrollY);
+    window.name = `md-source:${sourcePosition}`;
+    const source = performance.now() > suppressUntil ? 'user' : 'program';
+    window.ipc.postMessage(`md-source:${source}:${sourcePosition}`);
+  };
+
+  window.__mdEditorSuppressScroll = (milliseconds) => {
+    suppressUntil = Math.max(suppressUntil, performance.now() + milliseconds);
+  };
+
+  const animateToTarget = () => {
+    const target = yForSource(targetSource);
+    const distance = target - window.scrollY;
+    if (Math.abs(distance) < 0.75) {
+      window.scrollTo(0, target);
+      animationFrame = 0;
+      return;
+    }
+    window.scrollTo(0, window.scrollY + distance * 0.38);
+    animationFrame = window.requestAnimationFrame(animateToTarget);
+  };
+
+  window.__mdEditorSetSourcePosition = (value, smooth = true) => {
+    const sourcePosition = Math.max(0, Number(value) || 0);
+    targetSource = sourcePosition;
+    suppressUntil = performance.now() + (smooth ? 600 : 180);
+    window.name = `md-source:${sourcePosition}`;
+    if (!smooth) {
+      if (animationFrame) {
+        window.cancelAnimationFrame(animationFrame);
+        animationFrame = 0;
+      }
+      window.scrollTo(0, yForSource(sourcePosition));
+    } else if (!animationFrame) {
+      animationFrame = window.requestAnimationFrame(animateToTarget);
+    }
+  };
+
+  window.addEventListener('scroll', () => {
+    if (!scheduled) {
+      scheduled = true;
+      window.requestAnimationFrame(report);
+    }
+  }, { passive: true });
+
+  window.addEventListener('load', () => {
+    suppressUntil = performance.now() + 300;
+    const match = /^md-source:([0-9.]+)$/.exec(window.name);
+    const saved = match ? Number(match[1]) : 0;
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        window.__mdEditorSetSourcePosition(saved, false);
+        report();
+      });
+    });
+  });
+})();
+"#;
 
 impl Default for BrowserPreview {
     fn default() -> Self {
         Self {
             webview: None,
             document_hash: 0,
+            document_changed: false,
             bounds: None,
             visible: false,
             frozen_frame: None,
+            scroll_bridge: Arc::new(Mutex::new(ScrollBridge::default())),
         }
     }
 }
@@ -39,6 +175,7 @@ impl BrowserPreview {
     pub fn show(
         &mut self,
         frame: &eframe::Frame,
+        ctx: &egui::Context,
         rect: egui::Rect,
         pixels_per_point: f32,
         document: &str,
@@ -56,12 +193,28 @@ impl BrowserPreview {
                 .with_https_scheme(true)
                 .with_browser_accelerator_keys(false)
                 .with_scroll_bar_style(ScrollBarStyle::FluentOverlay);
+            let scroll_bridge = Arc::clone(&self.scroll_bridge);
+            let repaint_ctx = ctx.clone();
             let webview = builder
                 .with_custom_protocol("mdfont".into(), |_webview_id, request| {
                     preview_asset_response(request)
                 })
                 .with_custom_protocol("mdfile".into(), |_webview_id, request| {
                     local_image_response(request)
+                })
+                .with_initialization_script(SCROLL_SYNC_SCRIPT)
+                .with_ipc_handler(move |request| {
+                    if let Some((source_position, user_initiated)) =
+                        parse_source_message(request.body())
+                    {
+                        if let Ok(mut bridge) = scroll_bridge.lock() {
+                            bridge.source_position = Some(source_position);
+                            if user_initiated {
+                                bridge.user_source_position = Some(source_position);
+                            }
+                        }
+                        repaint_ctx.request_repaint();
+                    }
                 })
                 .with_html(document.to_owned())
                 .with_bounds(to_wry_rect(bounds))
@@ -72,6 +225,7 @@ impl BrowserPreview {
                 .map_err(|error| format!("无法创建浏览器预览：{error}"))?;
             self.webview = Some(webview);
             self.document_hash = document_hash;
+            self.document_changed = true;
             self.bounds = Some(bounds);
             self.visible = true;
             return Ok(());
@@ -89,6 +243,7 @@ impl BrowserPreview {
                 .load_html(document)
                 .map_err(|error| format!("无法刷新浏览器预览：{error}"))?;
             self.document_hash = document_hash;
+            self.document_changed = true;
         }
         if !self.visible {
             webview
@@ -115,8 +270,12 @@ impl BrowserPreview {
         self.hide();
         self.webview = None;
         self.document_hash = 0;
+        self.document_changed = false;
         self.bounds = None;
         self.frozen_frame = None;
+        if let Ok(mut bridge) = self.scroll_bridge.lock() {
+            *bridge = ScrollBridge::default();
+        }
     }
 
     /// Native child WebViews always sit above egui's render surface on Windows.
@@ -170,15 +329,67 @@ impl BrowserPreview {
         }
     }
 
+    pub fn take_document_changed(&mut self) -> bool {
+        std::mem::take(&mut self.document_changed)
+    }
+
+    pub fn take_user_source_position(&mut self) -> Option<f32> {
+        self.scroll_bridge
+            .lock()
+            .ok()
+            .and_then(|mut bridge| bridge.user_source_position.take())
+    }
+
+    pub fn source_position(&self) -> Option<f32> {
+        self.scroll_bridge
+            .lock()
+            .ok()
+            .and_then(|bridge| bridge.source_position)
+    }
+
+    pub fn scroll_to_source_position(
+        &self,
+        source_position: f32,
+        smooth: bool,
+    ) -> Result<(), String> {
+        let Some(webview) = &self.webview else {
+            return Err("浏览器预览尚未就绪".to_string());
+        };
+        webview
+            .evaluate_script(&format!(
+                "window.__mdEditorSetSourcePosition?.({:.8}, {});",
+                source_position.max(0.0),
+                if smooth { "true" } else { "false" }
+            ))
+            .map_err(|error| format!("无法同步预览滚动位置：{error}"))
+    }
+
     pub fn scroll_to_heading(&self, index: usize) -> Result<(), String> {
         let Some(webview) = &self.webview else {
             return Err("阅读预览尚未就绪".to_string());
         };
         webview
             .evaluate_script(&format!(
-                "document.getElementById('md-heading-{index}')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }});"
+                "window.__mdEditorSuppressScroll?.(700); document.getElementById('md-heading-{index}')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }});"
             ))
             .map_err(|error| format!("无法定位章节：{error}"))
+    }
+}
+
+fn parse_source_message(message: &str) -> Option<(f32, bool)> {
+    let mut parts = message.split(':');
+    if parts.next()? != "md-source" {
+        return None;
+    }
+    let source = parts.next()?;
+    let source_position = parts.next()?.parse::<f32>().ok()?.max(0.0);
+    if parts.next().is_some() {
+        return None;
+    }
+    match source {
+        "user" => Some((source_position, true)),
+        "program" => Some((source_position, false)),
+        _ => None,
     }
 }
 
@@ -297,15 +508,37 @@ pub fn document(
     let markdown = crate::markdown::normalize_compat_markdown(markdown);
     let has_mermaid = contains_mermaid_code_block(&markdown);
     let mut heading_index = 0usize;
-    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options()).map(|mut event| {
+    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options()).into_offset_iter();
+    let mut block_depth = 0usize;
+    let mut events = vec![Event::Html(source_anchor(0.0).into())];
+    for (mut event, range) in parser {
         if let Event::Start(Tag::Heading { id, .. }) = &mut event {
             *id = Some(format!("md-heading-{heading_index}").into());
             heading_index += 1;
         }
-        rewrite_local_image_event(event, base_directory)
-    });
+        let starts_block = matches!(&event, Event::Start(tag) if is_block_tag(tag));
+        if starts_block {
+            if block_depth == 0 {
+                events.push(Event::Html(
+                    source_anchor(source_line_at_byte(&markdown, range.start)).into(),
+                ));
+            }
+            block_depth += 1;
+        } else if block_depth == 0 && matches!(event, Event::Rule) {
+            events.push(Event::Html(
+                source_anchor(source_line_at_byte(&markdown, range.start)).into(),
+            ));
+        }
+        let ends_block = matches!(&event, Event::End(tag) if is_block_tag_end(*tag));
+        events.push(rewrite_local_image_event(event, base_directory));
+        if ends_block {
+            block_depth = block_depth.saturating_sub(1);
+        }
+    }
+    let source_end = markdown.bytes().filter(|byte| *byte == b'\n').count() as f32 + 1.0;
+    events.push(Event::Html(source_anchor(source_end).into()));
     let mut body = String::new();
-    html::push_html(&mut body, parser);
+    html::push_html(&mut body, events.into_iter());
     annotate_code_languages(&mut body);
     normalize_footnote_dom(&mut body);
 
@@ -330,6 +563,49 @@ pub fn document(
 
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src {asset_origin}; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style>{mermaid_scripts}</head><body>{body}</body></html>"
+    )
+}
+
+fn source_anchor(source_line: f32) -> String {
+    format!("<!--md-source:{source_line}-->")
+}
+
+fn source_line_at_byte(markdown: &str, byte_offset: usize) -> f32 {
+    markdown.as_bytes()[..byte_offset.min(markdown.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count() as f32
+}
+
+fn is_block_tag(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::DefinitionList
+            | Tag::Table(_)
+            | Tag::MetadataBlock(_)
+    )
+}
+
+fn is_block_tag_end(tag: TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::Table
+            | TagEnd::MetadataBlock(_)
     )
 }
 
@@ -711,10 +987,28 @@ fn normalize_footnote_dom(body: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        custom_protocol_script_source, custom_protocol_url, document, local_image_response,
-        local_image_url, preview_asset_response,
+        SCROLL_SYNC_SCRIPT, custom_protocol_script_source, custom_protocol_url, document,
+        local_image_response, local_image_url, parse_source_message, preview_asset_response,
     };
     use wry::http::Request;
+
+    #[test]
+    fn browser_scroll_messages_distinguish_user_and_programmatic_updates() {
+        assert_eq!(
+            parse_source_message("md-source:user:625.5"),
+            Some((625.5, true))
+        );
+        assert_eq!(
+            parse_source_message("md-source:program:14.25"),
+            Some((14.25, false))
+        );
+        assert_eq!(parse_source_message("other:user:0.5"), None);
+        assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorSetSourcePosition"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("sourceForY"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("distance * 0.38"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("cancelAnimationFrame"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("requestAnimationFrame(report)"));
+    }
 
     #[test]
     fn compatible_strong_markup_uses_the_bold_font_face() {
@@ -935,5 +1229,21 @@ mod tests {
         assert!(html.contains("<h1 id=\"md-heading-0\">相同标题</h1>"));
         assert!(html.contains("<h2 id=\"md-heading-1\">相同标题</h2>"));
         assert!(html.contains("<h3 id=\"md-heading-2\">末章</h3>"));
+    }
+
+    #[test]
+    fn 每个顶层markdown块生成源码行锚点() {
+        let html = document(
+            "# 标题\n\n第一段\n\n- 项目一\n- 项目二\n\n## 结尾",
+            "",
+            None,
+            None,
+        );
+        for source_line in [0, 2, 4, 7] {
+            assert!(
+                html.contains(&format!("<!--md-source:{source_line}-->")),
+                "missing source line {source_line}: {html}"
+            );
+        }
     }
 }

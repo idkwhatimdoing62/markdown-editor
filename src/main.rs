@@ -1340,10 +1340,11 @@ impl MdEditorApp {
         });
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     fn sync_scrolls(
         &mut self,
         ctx: &egui::Context,
-        editor: &ScrollAreaOutput<egui::Id>,
+        editor: &ScrollAreaOutput<EditorWidgetOutput>,
         preview: &ScrollAreaOutput<()>,
     ) {
         let max_e = (editor.content_size.y - editor.inner_rect.height()).max(0.0);
@@ -1358,8 +1359,8 @@ impl MdEditorApp {
         } else {
             0.0
         };
-        let e_changed = (ratio_e - self.prev_editor_ratio).abs() > 0.002;
-        let p_changed = (ratio_p - self.prev_preview_ratio).abs() > 0.002;
+        let e_changed = scroll_position_changed(self.prev_editor_ratio, ratio_e, max_e);
+        let p_changed = scroll_position_changed(self.prev_preview_ratio, ratio_p, max_p);
 
         if e_changed && !p_changed {
             let mut st = preview.state;
@@ -1374,16 +1375,17 @@ impl MdEditorApp {
         self.prev_preview_ratio = ratio_p;
     }
 
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     fn sync_caret(
         &mut self,
         ctx: &egui::Context,
-        editor: &ScrollAreaOutput<egui::Id>,
+        editor: &ScrollAreaOutput<EditorWidgetOutput>,
         preview: &ScrollAreaOutput<()>,
     ) {
         if !self.editor_focused {
             return;
         }
-        let te_id = editor.inner;
+        let te_id = editor.inner.id;
         if let Some(state) = egui::TextEdit::load_state(ctx, te_id) {
             if let Some(cursor) = state.cursor.char_range() {
                 let char_idx = cursor.primary.index.0;
@@ -1404,6 +1406,52 @@ impl MdEditorApp {
                 }
             }
         }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn sync_browser_scrolls(
+        &mut self,
+        ctx: &egui::Context,
+        editor: &ScrollAreaOutput<EditorWidgetOutput>,
+        force_preview: bool,
+    ) -> Result<(), String> {
+        let max_editor = (editor.content_size.y - editor.inner_rect.height()).max(0.0);
+        let editor_ratio = if max_editor > 0.0 {
+            (editor.state.offset.y / max_editor).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        // Only a user-originated WebView scroll is allowed to drive the editor.
+        // Page reloads and scrollTo calls also emit browser scroll events; treating
+        // those as input would make both panes repeatedly pull each other around.
+        if let Some(source_position) = self.browser_preview.take_user_source_position() {
+            let mut state = editor.state;
+            state.offset.y = editor_offset_for_source_position(editor, &self.text, source_position);
+            state.store(ctx, editor.id);
+            self.prev_editor_ratio = if max_editor > 0.0 {
+                state.offset.y / max_editor
+            } else {
+                0.0
+            };
+            self.prev_preview_ratio = self.prev_editor_ratio;
+            return Ok(());
+        }
+
+        let source_position = editor_source_position(editor, &self.text);
+        let editor_changed =
+            scroll_position_changed(self.prev_editor_ratio, editor_ratio, max_editor);
+        let preview_out_of_sync = self
+            .browser_preview
+            .source_position()
+            .is_none_or(|preview_position| (preview_position - source_position).abs() > 0.1);
+        if force_preview || editor_changed || preview_out_of_sync {
+            self.browser_preview
+                .scroll_to_source_position(source_position, !force_preview)?;
+        }
+        self.prev_editor_ratio = editor_ratio;
+        self.prev_preview_ratio = editor_ratio;
+        Ok(())
     }
 
     fn conflict_window(&mut self, ctx: &egui::Context) {
@@ -1500,6 +1548,8 @@ impl eframe::App for MdEditorApp {
         let now = ctx.input(|i| i.time);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut browser_rect = None;
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let mut split_editor_scroll = None;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut preview_heading_target = None;
 
@@ -1675,7 +1725,9 @@ impl eframe::App for MdEditorApp {
                     self.sync_caret(&ctx, &editor_out.inner, &preview_out.inner);
                 }
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
-                let _ = editor_out;
+                {
+                    split_editor_scroll = Some(editor_out.inner);
+                }
             }
         }
 
@@ -1696,13 +1748,22 @@ impl eframe::App for MdEditorApp {
                 let document = self.browser_document();
                 if let Err(error) =
                     self.browser_preview
-                        .show(frame, rect, ctx.pixels_per_point(), &document)
+                        .show(frame, &ctx, rect, ctx.pixels_per_point(), &document)
                 {
                     self.status_note = error;
-                } else if let Some(index) = preview_heading_target.take()
-                    && let Err(error) = self.browser_preview.scroll_to_heading(index)
-                {
-                    self.status_note = error;
+                } else {
+                    let document_changed = self.browser_preview.take_document_changed();
+                    if let Some(editor) = split_editor_scroll.as_ref()
+                        && let Err(error) =
+                            self.sync_browser_scrolls(&ctx, editor, document_changed)
+                    {
+                        self.status_note = error;
+                    }
+                    if let Some(index) = preview_heading_target.take()
+                        && let Err(error) = self.browser_preview.scroll_to_heading(index)
+                    {
+                        self.status_note = error;
+                    }
                 }
                 if self.editor_focused {
                     self.browser_preview.focus_parent();
@@ -1715,24 +1776,35 @@ impl eframe::App for MdEditorApp {
     }
 }
 
+struct EditorWidgetOutput {
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    id: egui::Id,
+    galley: Arc<egui::Galley>,
+    galley_pos: egui::Pos2,
+}
+
 fn editor_widget(
     ui: &mut egui::Ui,
     text: &mut String,
     focused: &mut bool,
     font_size: f32,
-) -> egui::Id {
+) -> EditorWidgetOutput {
     let id = ui.id().with("md_text");
-    let response = ui.add(
-        egui::TextEdit::multiline(text)
-            .id(id)
-            .font(egui::FontId::new(font_size, egui::FontFamily::Monospace))
-            .frame(egui::Frame::NONE)
-            .margin(egui::Margin::same(0))
-            .desired_width(f32::INFINITY)
-            .desired_rows(40),
-    );
-    *focused = response.has_focus();
-    id
+    let output = egui::TextEdit::multiline(text)
+        .id(id)
+        .font(egui::FontId::new(font_size, egui::FontFamily::Monospace))
+        .frame(egui::Frame::NONE)
+        .margin(egui::Margin::same(0))
+        .desired_width(f32::INFINITY)
+        .desired_rows(40)
+        .show(ui);
+    *focused = output.response.has_focus();
+    EditorWidgetOutput {
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        id,
+        galley: output.galley,
+        galley_pos: output.galley_pos,
+    }
 }
 
 fn show_editor_scroll(
@@ -1740,7 +1812,7 @@ fn show_editor_scroll(
     text: &mut String,
     focused: &mut bool,
     font_size: f32,
-) -> ScrollAreaOutput<egui::Id> {
+) -> ScrollAreaOutput<EditorWidgetOutput> {
     egui::ScrollArea::vertical()
         .id_salt("editor_scroll")
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -1895,6 +1967,71 @@ fn clock_time() -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
+/// Compare scroll progress in physical content pixels instead of a fixed ratio.
+/// A ratio threshold makes long documents update in large visible chunks.
+fn scroll_position_changed(previous_ratio: f32, current_ratio: f32, max_scroll: f32) -> bool {
+    (current_ratio - previous_ratio).abs() * max_scroll > 0.5
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn editor_source_position(editor: &ScrollAreaOutput<EditorWidgetOutput>, text: &str) -> f32 {
+    let galley_y = (editor.inner_rect.top() - editor.inner.galley_pos.y).max(0.0);
+    let cursor = editor
+        .inner
+        .galley
+        .cursor_from_pos(egui::vec2(editor.inner.galley.rect.left(), galley_y));
+    source_position_from_char(text, cursor.index.0)
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn editor_offset_for_source_position(
+    editor: &ScrollAreaOutput<EditorWidgetOutput>,
+    text: &str,
+    source_position: f32,
+) -> f32 {
+    let char_index = char_index_from_source_position(text, source_position);
+    let cursor_rect = editor
+        .inner
+        .galley
+        .pos_from_cursor(egui::text::CCursor::new(char_index));
+    let cursor_screen_y = editor.inner.galley_pos.y + cursor_rect.top();
+    let max_scroll = (editor.content_size.y - editor.inner_rect.height()).max(0.0);
+    (editor.state.offset.y + cursor_screen_y - editor.inner_rect.top()).clamp(0.0, max_scroll)
+}
+
+fn source_position_from_char(text: &str, char_index: usize) -> f32 {
+    let mut line = 0usize;
+    let mut line_start = 0usize;
+    let bounded_index = char_index.min(text.chars().count());
+    for (index, ch) in text.chars().take(bounded_index).enumerate() {
+        if ch == '\n' {
+            line += 1;
+            line_start = index + 1;
+        }
+    }
+    let line_length = text
+        .chars()
+        .skip(line_start)
+        .take_while(|ch| *ch != '\n')
+        .count();
+    let column = bounded_index.saturating_sub(line_start).min(line_length);
+    line as f32 + column as f32 / line_length.max(1) as f32
+}
+
+fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
+    let target_line = source_position.max(0.0).floor() as usize;
+    let fraction = source_position.max(0.0).fract();
+    let mut char_index = 0usize;
+    for (line_index, line) in text.split('\n').enumerate() {
+        let line_length = line.chars().count();
+        if line_index == target_line {
+            return char_index + (fraction * line_length as f32).round() as usize;
+        }
+        char_index += line_length + 1;
+    }
+    text.chars().count()
+}
+
 #[cfg(test)]
 mod app_tests {
     use super::*;
@@ -1971,6 +2108,34 @@ mod app_tests {
         assert_eq!(
             reading_headings(&blocks),
             vec![(1, "总览 v1".to_string()), (3, "细节".to_string())]
+        );
+    }
+
+    #[test]
+    fn 长文档的小幅滚动也会立即触发同步() {
+        let max_scroll = 50_000.0;
+        let one_pixel = 1.0 / max_scroll;
+        assert!(scroll_position_changed(0.4, 0.4 + one_pixel, max_scroll));
+        assert!(!scroll_position_changed(
+            0.4,
+            0.4 + 0.25 / max_scroll,
+            max_scroll
+        ));
+    }
+
+    #[test]
+    fn 源码字符位置与行内进度可以双向转换() {
+        let text = "第一行\n第二行较长\n第三行";
+        let second_line_middle = "第一行\n第二".chars().count();
+        let position = source_position_from_char(text, second_line_middle);
+        assert!((position - 1.4).abs() < 0.001);
+        assert_eq!(
+            char_index_from_source_position(text, position),
+            second_line_middle
+        );
+        assert_eq!(
+            char_index_from_source_position(text, 99.0),
+            text.chars().count()
         );
     }
 }
