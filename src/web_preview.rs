@@ -169,6 +169,17 @@ impl BrowserPreview {
             let _ = webview.focus_parent();
         }
     }
+
+    pub fn scroll_to_heading(&self, index: usize) -> Result<(), String> {
+        let Some(webview) = &self.webview else {
+            return Err("阅读预览尚未就绪".to_string());
+        };
+        webview
+            .evaluate_script(&format!(
+                "document.getElementById('md-heading-{index}')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }});"
+            ))
+            .map_err(|error| format!("无法定位章节：{error}"))
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -285,8 +296,14 @@ pub fn document(
 ) -> String {
     let markdown = crate::markdown::normalize_compat_markdown(markdown);
     let has_mermaid = contains_mermaid_code_block(&markdown);
-    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options())
-        .map(|event| rewrite_local_image_event(event, base_directory));
+    let mut heading_index = 0usize;
+    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options()).map(|mut event| {
+        if let Event::Start(Tag::Heading { id, .. }) = &mut event {
+            *id = Some(format!("md-heading-{heading_index}").into());
+            heading_index += 1;
+        }
+        rewrite_local_image_event(event, base_directory)
+    });
     let mut body = String::new();
     html::push_html(&mut body, parser);
     annotate_code_languages(&mut body);
@@ -771,7 +788,7 @@ mod tests {
             None,
             None,
         );
-        assert!(html.contains("<h1>标题</h1>"));
+        assert!(html.contains("<h1 id=\"md-heading-0\">标题</h1>"));
         assert!(html.contains("<code>代码</code>"));
         assert!(html.contains("code::before { content: '>'; }"));
         assert!(html.contains("pre > code { color: inherit"));
@@ -893,7 +910,7 @@ mod tests {
     #[test]
     fn 少数派二级标题保留粉色边线() {
         let html = document("## 小结", crate::theme::BUILT_IN_SSPAI_CSS, None, None);
-        assert!(html.contains("<h2>小结</h2>"));
+        assert!(html.contains("<h2 id=\"md-heading-0\">小结</h2>"));
         assert!(html.contains("border-left: 6px solid #ff7e79"));
     }
 
@@ -901,8 +918,8 @@ mod tests {
     fn 审计markdown生成的主题选择器结构() {
         let markdown = "# 一级\n\n## 二级\n\n> 引用\n\n行内 `代码`。\n\n```rust\nfn main() {}\n```\n\n![图片](image.png)\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n\n脚注[^1]\n\n[^1]: 脚注内容\n";
         let html = document(markdown, crate::theme::BUILT_IN_SSPAI_CSS, None, None);
-        assert!(html.contains("<h1>一级</h1>"));
-        assert!(html.contains("<h2>二级</h2>"));
+        assert!(html.contains("<h1 id=\"md-heading-0\">一级</h1>"));
+        assert!(html.contains("<h2 id=\"md-heading-1\">二级</h2>"));
         assert!(html.contains("<blockquote>"));
         assert!(html.contains("<pre data-language=\"rust\"><code class=\"language-rust\">"));
         assert!(html.contains("<img src=\"image.png\" alt=\"图片\""));
@@ -910,5 +927,13 @@ mod tests {
         assert!(html.contains("<ol id=\"footnotes\">"));
         assert!(html.contains("<li id=\"1\"><p>脚注内容</p>"));
         assert!(!html.contains("class=\"footnote-definition\""));
+    }
+
+    #[test]
+    fn 每个章节生成稳定且唯一的定位锚点() {
+        let html = document("# 相同标题\n\n## 相同标题\n\n### 末章", "", None, None);
+        assert!(html.contains("<h1 id=\"md-heading-0\">相同标题</h1>"));
+        assert!(html.contains("<h2 id=\"md-heading-1\">相同标题</h2>"));
+        assert!(html.contains("<h3 id=\"md-heading-2\">末章</h3>"));
     }
 }

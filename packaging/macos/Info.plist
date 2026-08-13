@@ -10,6 +10,8 @@
     <string>markdown-editor</string>
     <key>CFBundleIdentifier</key>
     <string>io.github.idkwhatimdoing62.markdown-editor</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

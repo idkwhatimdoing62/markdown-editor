@@ -9,6 +9,7 @@ mod theme;
 mod web_preview;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eframe::egui;
 use egui::containers::scroll_area::ScrollAreaOutput;
@@ -26,6 +27,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([720.0, 480.0])
+            .with_icon(app_icon())
             .with_title("Markdown 编辑器与预览器"),
         ..Default::default()
     };
@@ -40,6 +42,18 @@ fn main() -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+fn app_icon() -> Arc<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../assets/app-icon-256.png"))
+        .expect("内置应用图标应为有效 PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Arc::new(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -319,6 +333,89 @@ fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Re
         );
     }
     response
+}
+
+fn heading_title(inlines: &[markdown::Inline]) -> String {
+    fn append(inlines: &[markdown::Inline], output: &mut String) {
+        for inline in inlines {
+            match inline {
+                markdown::Inline::Text(text) | markdown::Inline::Code(text) => {
+                    output.push_str(text)
+                }
+                markdown::Inline::Emphasis(children)
+                | markdown::Inline::Strong(children)
+                | markdown::Inline::Strikethrough(children)
+                | markdown::Inline::Link { children, .. } => append(children, output),
+                markdown::Inline::Image { alt, .. } => output.push_str(alt),
+                markdown::Inline::SoftBreak | markdown::Inline::HardBreak => output.push(' '),
+            }
+        }
+    }
+
+    let mut title = String::new();
+    append(inlines, &mut title);
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn reading_headings(blocks: &[Block]) -> Vec<(u8, String)> {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::Heading { level, inlines } => Some((*level, heading_title(inlines))),
+            _ => None,
+        })
+        .filter(|(_, title)| !title.is_empty())
+        .collect()
+}
+
+fn reading_toc(ui: &mut egui::Ui, blocks: &[Block]) -> Option<usize> {
+    let headings = reading_headings(blocks);
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new("章节目录")
+            .size(15.0)
+            .strong()
+            .color(ui.visuals().strong_text_color()),
+    );
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(5.0);
+
+    if headings.is_empty() {
+        ui.label(
+            egui::RichText::new("当前文档没有标题")
+                .size(13.0)
+                .color(ui.visuals().weak_text_color()),
+        );
+        return None;
+    }
+
+    let mut target = None;
+    egui::ScrollArea::vertical()
+        .id_salt("reading_toc_scroll")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(ui, |ui| {
+            for (index, (level, title)) in headings.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_space((level.saturating_sub(1) as f32) * 12.0);
+                    let response = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(title)
+                                    .size(13.5)
+                                    .color(ui.visuals().text_color()),
+                            )
+                            .frame(false)
+                            .truncate(),
+                        )
+                        .on_hover_text(title);
+                    if response.clicked() {
+                        target = Some(index);
+                    }
+                });
+            }
+        });
+    target
 }
 
 fn chrome_icon_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -1403,6 +1500,8 @@ impl eframe::App for MdEditorApp {
         let now = ctx.input(|i| i.time);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut browser_rect = None;
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let mut preview_heading_target = None;
 
         if self.text != self.last_parsed {
             self.blocks = markdown::parse(&self.text);
@@ -1439,17 +1538,24 @@ impl eframe::App for MdEditorApp {
         let doc_theme = self.theme_spec();
         let editor_fill = doc_theme.editor_canvas;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let modal_open =
+            self.conflict.is_some() || self.recovery.is_some() || self.pending_close.is_some();
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if modal_open {
+            // A native child WebView is always above egui's paint surface on Windows.
+            // Drop it before painting a modal instead of relying on an asynchronous
+            // visibility change, otherwise the preview can cover the dialog.
+            self.browser_preview.close();
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let browser_can_show = {
             #[cfg(target_os = "windows")]
             {
-                true
+                !modal_open
             }
             #[cfg(target_os = "macos")]
             {
-                !(self.conflict.is_some()
-                    || self.recovery.is_some()
-                    || self.pending_close.is_some()
-                    || ctx.any_popup_open())
+                !modal_open && !ctx.any_popup_open()
             }
         };
 
@@ -1472,6 +1578,21 @@ impl eframe::App for MdEditorApp {
                     });
             }
             ViewMode::Preview => {
+                egui::Panel::left("reading_toc_panel")
+                    .resizable(false)
+                    .exact_size(228.0)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(ui.visuals().panel_fill)
+                            .inner_margin(egui::Margin::symmetric(14, 0)),
+                    )
+                    .show(ui, |ui| {
+                        let target = reading_toc(ui, &self.blocks);
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
+                        if target.is_some() {
+                            preview_heading_target = target;
+                        }
+                    });
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(ui.visuals().window_fill))
                     .show(ui, |ui| {
@@ -1560,10 +1681,8 @@ impl eframe::App for MdEditorApp {
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
-            let modal_open =
-                self.conflict.is_some() || self.recovery.is_some() || self.pending_close.is_some();
             let popup_open = ctx.any_popup_open();
-            if (modal_open || popup_open) && browser_rect.is_some() {
+            if popup_open && browser_rect.is_some() {
                 self.browser_preview.freeze_for_overlay(
                     frame,
                     &ctx,
@@ -1578,6 +1697,10 @@ impl eframe::App for MdEditorApp {
                 if let Err(error) =
                     self.browser_preview
                         .show(frame, rect, ctx.pixels_per_point(), &document)
+                {
+                    self.status_note = error;
+                } else if let Some(index) = preview_heading_target.take()
+                    && let Err(error) = self.browser_preview.scroll_to_heading(index)
                 {
                     self.status_note = error;
                 }
@@ -1777,6 +1900,15 @@ mod app_tests {
     use super::*;
 
     #[test]
+    fn 内置应用图标尺寸与透明通道有效() {
+        let icon = app_icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
     fn 空白标签不显示修改标记() {
         let tab = DocumentTab::blank(7);
         assert!(!document_is_dirty(
@@ -1831,5 +1963,14 @@ mod app_tests {
         assert!(shortened.contains('…'));
         assert!(shortened.ends_with("设计文档.md"));
         assert!(shortened.chars().count() <= 21);
+    }
+
+    #[test]
+    fn 阅读目录保留标题层级并提取富文本标题() {
+        let blocks = markdown::parse("# **总览** `v1`\n\n### [细节](details.md)\n\n正文");
+        assert_eq!(
+            reading_headings(&blocks),
+            vec![(1, "总览 v1".to_string()), (3, "细节".to_string())]
+        );
     }
 }

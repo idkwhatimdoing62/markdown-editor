@@ -1,5 +1,5 @@
 #define MyAppName "Markdown 编辑器与预览器"
-#define MyAppVersion "0.1.12"
+#define MyAppVersion "0.1.13"
 #define MyAppPublisher "idkwhatimdoing62"
 #define MyAppURL "https://github.com/idkwhatimdoing62/markdown-editor"
 #define MyAppExeName "markdown-editor.exe"
@@ -27,7 +27,8 @@ SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=..\assets\app-icon.ico
+UninstallDisplayIcon={app}\app-icon.ico
 VersionInfoVersion={#MyAppVersion}.0
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppName} 安装程序
@@ -49,11 +50,12 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\fonts\JetBrainsMono-OFL.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\fonts\LXGWWenKaiLite-OFL.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
 Source: "..\assets\Mermaid-MIT.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\assets\app-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"
 Name: "{group}\卸载 {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\app-icon.ico"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
