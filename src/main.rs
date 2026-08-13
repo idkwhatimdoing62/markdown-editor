@@ -8,8 +8,10 @@ mod theme;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod web_preview;
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use eframe::egui;
 use egui::containers::scroll_area::ScrollAreaOutput;
@@ -20,6 +22,9 @@ use theme::{ThemePackage, ThemeSpec};
 const PRIMARY_SHORTCUT: &str = "⌘";
 #[cfg(not(target_os = "macos"))]
 const PRIMARY_SHORTCUT: &str = "Ctrl";
+
+const EXTERNAL_POLL_INTERVAL: f64 = 0.35;
+const EXTERNAL_STABLE_DELAY: f64 = 0.45;
 
 fn main() -> eframe::Result {
     let open_path = std::env::args().nth(1).map(PathBuf::from);
@@ -90,6 +95,26 @@ struct DocumentTab {
     last_caret_line: usize,
 }
 
+struct PendingExternalChange {
+    stamp: io::FileStamp,
+    bytes: Vec<u8>,
+    first_seen: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalChangeResult {
+    Unchanged,
+    Reloaded,
+    Reconciled,
+    Conflict,
+}
+
+enum ExternalProbe {
+    Waiting,
+    Stable(Vec<u8>),
+    Missing(String),
+}
+
 impl DocumentTab {
     fn blank(id: u64) -> Self {
         Self {
@@ -139,9 +164,48 @@ fn document_is_dirty(
 ) -> bool {
     matches!(status, DocStatus::Conflict)
         || match path {
-            Some(_) => snapshot != text.as_bytes(),
+            Some(_) => !snapshot_matches_text(snapshot, text),
             None => !text.is_empty(),
         }
+}
+
+fn snapshot_matches_text(snapshot: &[u8], text: &str) -> bool {
+    io::decode_markdown_bytes(snapshot).is_ok_and(|snapshot_text| snapshot_text == text)
+}
+
+fn apply_external_bytes(
+    tab: &mut DocumentTab,
+    bytes: Vec<u8>,
+) -> Result<ExternalChangeResult, io::ReadError> {
+    if bytes == tab.disk_snapshot {
+        return Ok(ExternalChangeResult::Unchanged);
+    }
+    let disk_text = io::decode_markdown_bytes(&bytes)?;
+    if disk_text == tab.text {
+        tab.disk_snapshot = bytes;
+        tab.status = DocStatus::Saved;
+        tab.conflict = None;
+        tab.status_note = "已同步外部保存".to_string();
+        return Ok(ExternalChangeResult::Reconciled);
+    }
+
+    let has_local_changes = !snapshot_matches_text(&tab.disk_snapshot, &tab.text)
+        || matches!(tab.status, DocStatus::Conflict);
+    if has_local_changes {
+        tab.status = DocStatus::Conflict;
+        tab.conflict = tab.path.clone();
+        tab.status_note = "检测到外部修改，本地未保存内容已保留".to_string();
+        return Ok(ExternalChangeResult::Conflict);
+    }
+
+    tab.text = disk_text;
+    tab.disk_snapshot = bytes;
+    tab.blocks = markdown::parse(&tab.text);
+    tab.last_parsed = tab.text.clone();
+    tab.status = DocStatus::Saved;
+    tab.conflict = None;
+    tab.status_note = format!("已自动加载外部修改 {}", clock_time());
+    Ok(ExternalChangeResult::Reloaded)
 }
 
 fn document_label(id: u64, path: Option<&PathBuf>, dirty: bool) -> String {
@@ -466,6 +530,10 @@ struct MdEditorApp {
     show_status: bool,
     body_font_size: f32,
     theme_package: Option<ThemePackage>,
+    auto_reload_external: bool,
+    last_external_poll: f64,
+    observed_file_stamps: HashMap<PathBuf, io::FileStamp>,
+    pending_external_changes: HashMap<PathBuf, PendingExternalChange>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_preview: web_preview::BrowserPreview,
 }
@@ -514,6 +582,10 @@ impl MdEditorApp {
             show_status: true,
             body_font_size: initial_body_font_size,
             theme_package,
+            auto_reload_external: true,
+            last_external_poll: f64::NEG_INFINITY,
+            observed_file_stamps: HashMap::new(),
+            pending_external_changes: HashMap::new(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
         };
@@ -749,6 +821,117 @@ impl MdEditorApp {
         };
     }
 
+    fn probe_external_change(&mut self, path: &Path, snapshot: &[u8], now: f64) -> ExternalProbe {
+        let stamp = match io::file_stamp(path) {
+            Ok(stamp) => stamp,
+            Err(error) => {
+                self.observed_file_stamps.remove(path);
+                self.pending_external_changes.remove(path);
+                return ExternalProbe::Missing(describe_read_error(&error));
+            }
+        };
+
+        let stamp_changed = self.observed_file_stamps.get(path) != Some(&stamp);
+        if stamp_changed {
+            self.observed_file_stamps
+                .insert(path.to_path_buf(), stamp.clone());
+            match io::read_snapshot_checked(path) {
+                Ok(bytes) if bytes.as_slice() == snapshot => {
+                    self.pending_external_changes.remove(path);
+                }
+                Ok(bytes) => {
+                    self.pending_external_changes.insert(
+                        path.to_path_buf(),
+                        PendingExternalChange {
+                            stamp,
+                            bytes,
+                            first_seen: now,
+                        },
+                    );
+                }
+                Err(error) => return ExternalProbe::Missing(describe_read_error(&error)),
+            }
+            return ExternalProbe::Waiting;
+        }
+
+        let is_stable = self
+            .pending_external_changes
+            .get(path)
+            .is_some_and(|pending| {
+                pending.stamp == stamp && now - pending.first_seen >= EXTERNAL_STABLE_DELAY
+            });
+        if is_stable && let Some(pending) = self.pending_external_changes.remove(path) {
+            return ExternalProbe::Stable(pending.bytes);
+        }
+        ExternalProbe::Waiting
+    }
+
+    fn poll_external_changes(&mut self, ctx: &egui::Context, now: f64) {
+        if !self.auto_reload_external {
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_secs_f64(EXTERNAL_POLL_INTERVAL));
+        if now - self.last_external_poll < EXTERNAL_POLL_INTERVAL {
+            return;
+        }
+        self.last_external_poll = now;
+
+        let active_path = self.path.clone();
+        if let Some(path) = active_path {
+            let snapshot = self.disk_snapshot.clone();
+            match self.probe_external_change(&path, &snapshot, now) {
+                ExternalProbe::Stable(bytes) => {
+                    let id = self.tabs[self.active_tab].id;
+                    let mut tab = self.capture_active_tab(id);
+                    match apply_external_bytes(&mut tab, bytes) {
+                        Ok(ExternalChangeResult::Unchanged) => {}
+                        Ok(_) => {
+                            self.tabs[self.active_tab] = tab;
+                            self.load_tab_state(self.active_tab);
+                        }
+                        Err(error) => {
+                            self.status_note = format!(
+                                "检测到外部修改，但无法加载：{}",
+                                describe_read_error(&error)
+                            );
+                        }
+                    }
+                }
+                ExternalProbe::Missing(error) => {
+                    let note = format!("无法监视磁盘文件：{error}");
+                    if self.status_note != note {
+                        self.status_note = note;
+                    }
+                }
+                ExternalProbe::Waiting => {}
+            }
+        }
+
+        for index in 0..self.tabs.len() {
+            if index == self.active_tab {
+                continue;
+            }
+            let Some(path) = self.tabs[index].path.clone() else {
+                continue;
+            };
+            let snapshot = self.tabs[index].disk_snapshot.clone();
+            match self.probe_external_change(&path, &snapshot, now) {
+                ExternalProbe::Stable(bytes) => {
+                    if let Err(error) = apply_external_bytes(&mut self.tabs[index], bytes) {
+                        self.tabs[index].status_note = format!(
+                            "检测到外部修改，但无法加载：{}",
+                            describe_read_error(&error)
+                        );
+                    }
+                }
+                ExternalProbe::Missing(error) => {
+                    self.tabs[index].status_note = format!("无法监视磁盘文件：{error}");
+                }
+                ExternalProbe::Waiting => {}
+            }
+        }
+    }
+
     fn autosave_draft(&mut self, now: f64) {
         let dirty = !matches!(self.status, DocStatus::Saved) && !self.text.is_empty();
         if dirty && now - self.last_edit_time > 30.0 && now - self.draft_last_write > 30.0 {
@@ -827,6 +1010,31 @@ impl MdEditorApp {
         for path in paths {
             self.open_path(&path);
         }
+    }
+
+    fn open_dropped_paths(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+
+        let mut opened = 0usize;
+        let mut ignored = 0usize;
+        for path in paths {
+            if path.is_file() && has_supported_text_extension(&path) {
+                self.open_path(&path);
+                opened += 1;
+            } else {
+                ignored += 1;
+            }
+        }
+
+        self.status_note = match (opened, ignored) {
+            (0, _) => "未找到可打开的 Markdown 或文本文件".to_string(),
+            (opened, 0) => format!("已拖入打开 {opened} 个文件"),
+            (opened, ignored) => {
+                format!("已拖入打开 {opened} 个文件，忽略 {ignored} 个不支持的项目")
+            }
+        };
     }
 
     fn open_path(&mut self, path: &PathBuf) {
@@ -1204,6 +1412,15 @@ impl MdEditorApp {
                         self.body_font_size = 15.5;
                     }
                     ui.separator();
+                    let watch_changed = ui
+                        .checkbox(&mut self.auto_reload_external, "自动加载外部修改")
+                        .on_hover_text("Agent 或其他程序修改当前 Markdown 后自动刷新")
+                        .changed();
+                    if watch_changed {
+                        self.observed_file_stamps.clear();
+                        self.pending_external_changes.clear();
+                        self.last_external_poll = f64::NEG_INFINITY;
+                    }
                     ui.checkbox(&mut self.show_status, "显示状态栏");
                     let theme = if self.dark {
                         "浅色外观"
@@ -1552,6 +1769,20 @@ impl eframe::App for MdEditorApp {
         let mut split_editor_scroll = None;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut preview_heading_target = None;
+
+        let mut dropped_paths = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect::<Vec<_>>()
+        });
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        dropped_paths.extend(self.browser_preview.take_dropped_paths());
+        self.open_dropped_paths(dropped_paths);
+
+        self.poll_external_changes(&ctx, now);
 
         if self.text != self.last_parsed {
             self.blocks = markdown::parse(&self.text);
@@ -1948,6 +2179,16 @@ fn pick_save_path() -> Option<PathBuf> {
         .save_file()
 }
 
+fn has_supported_text_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md")
+                || extension.eq_ignore_ascii_case("markdown")
+                || extension.eq_ignore_ascii_case("txt")
+        })
+}
+
 fn describe_read_error(e: &io::ReadError) -> String {
     match e {
         io::ReadError::TooLarge { size, limit } => {
@@ -2137,5 +2378,73 @@ mod app_tests {
             char_index_from_source_position(text, 99.0),
             text.chars().count()
         );
+    }
+
+    #[test]
+    fn 无本地修改时自动采用外部内容() {
+        let mut tab = DocumentTab::from_file(
+            1,
+            PathBuf::from("agent.md"),
+            "旧内容".to_string(),
+            b"\xe6\x97\xa7\xe5\x86\x85\xe5\xae\xb9".to_vec(),
+        );
+        let result = apply_external_bytes(&mut tab, "Agent 新内容".as_bytes().to_vec()).unwrap();
+        assert_eq!(result, ExternalChangeResult::Reloaded);
+        assert_eq!(tab.text, "Agent 新内容");
+        assert_eq!(tab.disk_snapshot, "Agent 新内容".as_bytes());
+        assert_eq!(tab.status, DocStatus::Saved);
+    }
+
+    #[test]
+    fn 有本地修改时保留内容并标记外部冲突() {
+        let mut tab = DocumentTab::from_file(
+            1,
+            PathBuf::from("agent.md"),
+            "原文".to_string(),
+            "原文".as_bytes().to_vec(),
+        );
+        tab.text = "本地尚未保存".to_string();
+        let result = apply_external_bytes(&mut tab, "Agent 修改".as_bytes().to_vec()).unwrap();
+        assert_eq!(result, ExternalChangeResult::Conflict);
+        assert_eq!(tab.text, "本地尚未保存");
+        assert_eq!(tab.disk_snapshot, "原文".as_bytes());
+        assert_eq!(tab.status, DocStatus::Conflict);
+        assert_eq!(tab.conflict, Some(PathBuf::from("agent.md")));
+    }
+
+    #[test]
+    fn 外部写入恰好等于编辑区内容时直接确认为已保存() {
+        let mut tab = DocumentTab::from_file(
+            1,
+            PathBuf::from("agent.md"),
+            "原文".to_string(),
+            "原文".as_bytes().to_vec(),
+        );
+        tab.text = "共同的新内容".to_string();
+        let result = apply_external_bytes(&mut tab, "共同的新内容".as_bytes().to_vec()).unwrap();
+        assert_eq!(result, ExternalChangeResult::Reconciled);
+        assert_eq!(tab.status, DocStatus::Saved);
+        assert_eq!(tab.disk_snapshot, "共同的新内容".as_bytes());
+    }
+
+    #[test]
+    fn 带bom的磁盘快照不会被误判为本地修改() {
+        let snapshot = [b"\xef\xbb\xbf".as_slice(), "正文".as_bytes()].concat();
+        assert!(snapshot_matches_text(&snapshot, "正文"));
+        assert!(!document_is_dirty(
+            Some(&PathBuf::from("bom.md")),
+            "正文",
+            &snapshot,
+            &DocStatus::Saved,
+        ));
+    }
+
+    #[test]
+    fn 拖入文件扩展名大小写不敏感且只接受文本类型() {
+        assert!(has_supported_text_extension(Path::new("说明.MD")));
+        assert!(has_supported_text_extension(Path::new("notes.MarkDown")));
+        assert!(has_supported_text_extension(Path::new("草稿.TXT")));
+        assert!(!has_supported_text_extension(Path::new("图片.png")));
+        assert!(!has_supported_text_extension(Path::new("无扩展名")));
     }
 }

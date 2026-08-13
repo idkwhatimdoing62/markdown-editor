@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 
@@ -10,6 +11,12 @@ pub enum ReadError {
     TooLarge { size: u64, limit: u64 },
     InvalidUtf8,
     Io(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStamp {
+    pub modified: Option<SystemTime>,
+    pub len: u64,
 }
 
 pub fn check_size(size: u64) -> Result<(), ReadError> {
@@ -24,11 +31,28 @@ pub fn check_size(size: u64) -> Result<(), ReadError> {
 }
 
 pub fn read_markdown(path: &Path) -> Result<String, ReadError> {
-    let meta = fs::metadata(path).map_err(|e| ReadError::Io(e.to_string()))?;
-    check_size(meta.len())?;
-    let bytes = fs::read(path).map_err(|e| ReadError::Io(e.to_string()))?;
-    let text = String::from_utf8(bytes).map_err(|_| ReadError::InvalidUtf8)?;
+    let bytes = read_snapshot_checked(path)?;
+    decode_markdown_bytes(&bytes)
+}
+
+pub fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, ReadError> {
+    let text = String::from_utf8(bytes.to_vec()).map_err(|_| ReadError::InvalidUtf8)?;
     Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
+pub fn file_stamp(path: &Path) -> Result<FileStamp, ReadError> {
+    let metadata = fs::metadata(path).map_err(|error| ReadError::Io(error.to_string()))?;
+    check_size(metadata.len())?;
+    Ok(FileStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+pub fn read_snapshot_checked(path: &Path) -> Result<Vec<u8>, ReadError> {
+    let metadata = fs::metadata(path).map_err(|error| ReadError::Io(error.to_string()))?;
+    check_size(metadata.len())?;
+    fs::read(path).map_err(|error| ReadError::Io(error.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq)]

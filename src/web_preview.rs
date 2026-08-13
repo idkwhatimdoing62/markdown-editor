@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd, html};
@@ -12,7 +12,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
 use wry::http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_TYPE};
 use wry::http::{Request, Response};
-use wry::{Rect, WebView, WebViewBuilder};
+use wry::{DragDropEvent, Rect, WebView, WebViewBuilder};
 #[cfg(target_os = "windows")]
 use wry::{ScrollBarStyle, WebViewBuilderExtWindows};
 
@@ -30,6 +30,7 @@ pub struct BrowserPreview {
 struct ScrollBridge {
     source_position: Option<f32>,
     user_source_position: Option<f32>,
+    dropped_paths: Vec<PathBuf>,
 }
 
 const SCROLL_SYNC_SCRIPT: &str = r#"
@@ -194,7 +195,9 @@ impl BrowserPreview {
                 .with_browser_accelerator_keys(false)
                 .with_scroll_bar_style(ScrollBarStyle::FluentOverlay);
             let scroll_bridge = Arc::clone(&self.scroll_bridge);
-            let repaint_ctx = ctx.clone();
+            let ipc_repaint_ctx = ctx.clone();
+            let drop_bridge = Arc::clone(&self.scroll_bridge);
+            let drop_repaint_ctx = ctx.clone();
             let webview = builder
                 .with_custom_protocol("mdfont".into(), |_webview_id, request| {
                     preview_asset_response(request)
@@ -213,8 +216,18 @@ impl BrowserPreview {
                                 bridge.user_source_position = Some(source_position);
                             }
                         }
-                        repaint_ctx.request_repaint();
+                        ipc_repaint_ctx.request_repaint();
                     }
+                })
+                .with_drag_drop_handler(move |event| {
+                    if let DragDropEvent::Drop { paths, .. } = event {
+                        if let Ok(mut bridge) = drop_bridge.lock() {
+                            bridge.dropped_paths.extend(paths);
+                        }
+                        drop_repaint_ctx.request_repaint();
+                    }
+                    // Prevent the browser engine from navigating to the dropped file.
+                    true
                 })
                 .with_html(document.to_owned())
                 .with_bounds(to_wry_rect(bounds))
@@ -338,6 +351,13 @@ impl BrowserPreview {
             .lock()
             .ok()
             .and_then(|mut bridge| bridge.user_source_position.take())
+    }
+
+    pub fn take_dropped_paths(&mut self) -> Vec<PathBuf> {
+        self.scroll_bridge
+            .lock()
+            .map(|mut bridge| std::mem::take(&mut bridge.dropped_paths))
+            .unwrap_or_default()
     }
 
     pub fn source_position(&self) -> Option<f32> {
