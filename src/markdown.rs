@@ -1,6 +1,7 @@
 //! 把 Markdown 解析为可渲染的块模型。
 
 use std::borrow::Cow;
+use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
@@ -202,14 +203,86 @@ pub enum Block {
     Raw(String),
 }
 
-pub fn parse(markdown: &str) -> Vec<Block> {
-    let markdown = normalize_compat_markdown(markdown);
-    let parser = Parser::new_ext(&markdown, parse_options());
-    let mut builder = Builder::default();
-    for event in parser {
-        builder.push(event);
+/// Markdown 的单一解析产物。
+///
+/// 内部预览读取 `blocks`；浏览器预览和导出读取同一次解析产生的
+/// `events`。任何消费者都不得再次从源码创建 `pulldown_cmark::Parser`。
+#[derive(Debug, Clone)]
+pub struct ParsedDocument {
+    source: String,
+    normalized: Option<String>,
+    blocks: Vec<Block>,
+    events: Vec<SpannedEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpannedEvent {
+    pub event: Event<'static>,
+    pub range: Range<usize>,
+}
+
+impl ParsedDocument {
+    pub fn source(&self) -> &str {
+        &self.source
     }
-    builder.finish()
+
+    pub fn normalized_source(&self) -> &str {
+        self.normalized.as_deref().unwrap_or(&self.source)
+    }
+
+    pub fn blocks(&self) -> &[Block] {
+        &self.blocks
+    }
+
+    pub fn events(&self) -> &[SpannedEvent] {
+        &self.events
+    }
+
+    pub fn has_mermaid(&self) -> bool {
+        self.events.iter().any(|item| {
+            matches!(
+                &item.event,
+                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
+                    if info.split_whitespace().next().is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+            )
+        })
+    }
+}
+
+impl Default for ParsedDocument {
+    fn default() -> Self {
+        parse_document("")
+    }
+}
+
+pub fn parse_document(markdown: &str) -> ParsedDocument {
+    let normalized = normalize_compat_markdown(markdown);
+    let events = Parser::new_ext(&normalized, parse_options())
+        .into_offset_iter()
+        .map(|(event, range)| SpannedEvent {
+            event: event.into_static(),
+            range,
+        })
+        .collect::<Vec<_>>();
+    let mut builder = Builder::default();
+    for item in &events {
+        builder.push(item.event.clone());
+    }
+    let normalized = match normalized {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(value) => Some(value),
+    };
+    ParsedDocument {
+        source: markdown.to_string(),
+        normalized,
+        blocks: builder.finish(),
+        events,
+    }
+}
+
+#[cfg(test)]
+pub fn parse(markdown: &str) -> Vec<Block> {
+    parse_document(markdown).blocks
 }
 
 pub fn plain_text(blocks: &[Block]) -> String {
@@ -708,6 +781,95 @@ fn plain_of_inlines(inlines: &[Inline]) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct StructureCounts {
+        headings: usize,
+        lists: usize,
+        list_items: usize,
+        code_blocks: usize,
+        tables: usize,
+        images: usize,
+        links: usize,
+        strong: usize,
+    }
+
+    fn event_structure(document: &ParsedDocument) -> StructureCounts {
+        let mut counts = StructureCounts::default();
+        for item in document.events() {
+            match &item.event {
+                Event::Start(Tag::Heading { .. }) => counts.headings += 1,
+                Event::Start(Tag::List(_)) => counts.lists += 1,
+                Event::Start(Tag::Item) => counts.list_items += 1,
+                Event::Start(Tag::CodeBlock(_)) => counts.code_blocks += 1,
+                Event::Start(Tag::Table(_)) => counts.tables += 1,
+                Event::Start(Tag::Image { .. }) => counts.images += 1,
+                Event::Start(Tag::Link { .. }) => counts.links += 1,
+                Event::Start(Tag::Strong) => counts.strong += 1,
+                _ => {}
+            }
+        }
+        counts
+    }
+
+    fn block_structure(blocks: &[Block]) -> StructureCounts {
+        fn visit_inlines(inlines: &[Inline], counts: &mut StructureCounts) {
+            for inline in inlines {
+                match inline {
+                    Inline::Emphasis(children) | Inline::Strikethrough(children) => {
+                        visit_inlines(children, counts)
+                    }
+                    Inline::Strong(children) => {
+                        counts.strong += 1;
+                        visit_inlines(children, counts);
+                    }
+                    Inline::Link { children, .. } => {
+                        counts.links += 1;
+                        visit_inlines(children, counts);
+                    }
+                    Inline::Image { .. } => counts.images += 1,
+                    Inline::Text(_) | Inline::Code(_) | Inline::SoftBreak | Inline::HardBreak => {}
+                }
+            }
+        }
+
+        fn visit_blocks(blocks: &[Block], counts: &mut StructureCounts) {
+            for block in blocks {
+                match block {
+                    Block::Heading { inlines, .. } => {
+                        counts.headings += 1;
+                        visit_inlines(inlines, counts);
+                    }
+                    Block::Paragraph(inlines) => visit_inlines(inlines, counts),
+                    Block::List { items, .. } => {
+                        counts.lists += 1;
+                        counts.list_items += items.len();
+                        for item in items {
+                            visit_blocks(item, counts);
+                        }
+                    }
+                    Block::Code { .. } => counts.code_blocks += 1,
+                    Block::Quote(children) => visit_blocks(children, counts),
+                    Block::Table { headers, rows } => {
+                        counts.tables += 1;
+                        for cell in headers {
+                            visit_inlines(cell, counts);
+                        }
+                        for row in rows {
+                            for cell in row {
+                                visit_inlines(cell, counts);
+                            }
+                        }
+                    }
+                    Block::Rule | Block::Raw(_) => {}
+                }
+            }
+        }
+
+        let mut counts = StructureCounts::default();
+        visit_blocks(blocks, &mut counts);
+        counts
+    }
+
     #[test]
     fn moves_whitespace_behind_strong_closing_delimiter() {
         let source = "1. **结构层： **训练一个统一的纹样 LoRA。";
@@ -805,5 +967,47 @@ mod tests {
         assert!(text.contains("标题"));
         assert!(text.contains("段落加粗。"));
         assert!(text.contains("条目一"));
+    }
+
+    #[test]
+    fn 单一解析产物的事件流和内部模型结构一致() {
+        let source = r#"# 总览
+
+正文包含 **重点**、[链接](https://example.com) 和图片：![莲花](lotus.png)。
+
+- 第一项
+- 第二项
+
+| 名称 | 数量 |
+| --- | ---: |
+| 莲花 | 3 |
+
+```rust
+fn main() {}
+```
+"#;
+        let document = parse_document(source);
+        assert_eq!(
+            event_structure(&document),
+            block_structure(document.blocks()),
+            "新增 Markdown 语法必须同时进入事件流和内部块模型"
+        );
+
+        let mut browser_html = String::new();
+        pulldown_cmark::html::push_html(
+            &mut browser_html,
+            document.events().iter().map(|item| item.event.clone()),
+        );
+        let expected = event_structure(&document);
+        assert_eq!(browser_html.matches("<h1").count(), expected.headings);
+        assert_eq!(browser_html.matches("<li>").count(), expected.list_items);
+        assert_eq!(browser_html.matches("<table>").count(), expected.tables);
+        assert_eq!(
+            browser_html.matches("<pre><code").count(),
+            expected.code_blocks
+        );
+        assert_eq!(browser_html.matches("<img ").count(), expected.images);
+        assert_eq!(browser_html.matches("<a ").count(), expected.links);
+        assert_eq!(browser_html.matches("<strong>").count(), expected.strong);
     }
 }

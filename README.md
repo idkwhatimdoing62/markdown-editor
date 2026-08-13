@@ -36,6 +36,15 @@ cargo build --release
 
 构建产物位于 `target/release/markdown-editor.exe`。
 
+长文档解析、预览 HTML、WebView 和完整进程树内存基准：
+
+```powershell
+.\scripts\benchmark-long-docs.ps1
+.\scripts\benchmark-long-docs.ps1 -EnforceBudgets
+```
+
+结果写入 `artifacts/performance/latest.json`，设计和预算说明见 [ADR-0003](docs/adr/0003-long-document-performance-budget.md)。
+
 生成安装版需要 Inno Setup 6：
 
 ```powershell

@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{CowStr, Event, Tag, TagEnd, html};
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
@@ -19,11 +19,38 @@ use wry::{ScrollBarStyle, WebViewBuilderExtWindows};
 pub struct BrowserPreview {
     webview: Option<WebView>,
     document_hash: u64,
+    document_source: Option<Arc<PreviewDocument>>,
     document_changed: bool,
     bounds: Option<[i32; 4]>,
     visible: bool,
     frozen_frame: Option<egui::TextureHandle>,
     scroll_bridge: Arc<Mutex<ScrollBridge>>,
+    document_payload: Arc<Mutex<Option<Arc<PreviewDocument>>>>,
+}
+
+#[derive(Clone)]
+pub struct PreviewDocument {
+    shell: Arc<str>,
+    chunks: Arc<[PreviewChunk]>,
+    hash: u64,
+    total_bytes: usize,
+}
+
+#[derive(Clone)]
+struct PreviewChunk {
+    html: Arc<str>,
+    source_start: f32,
+    source_end: f32,
+    estimated_height: f32,
+    heading_start: Option<usize>,
+    heading_end: Option<usize>,
+}
+
+impl PreviewDocument {
+    #[allow(dead_code)]
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
 }
 
 #[derive(Default)]
@@ -31,6 +58,15 @@ struct ScrollBridge {
     source_position: Option<f32>,
     user_source_position: Option<f32>,
     dropped_paths: Vec<PathBuf>,
+    ready: Option<WebViewReady>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WebViewReady {
+    pub content_height: f32,
+    pub viewport_height: f32,
+    pub element_count: usize,
+    pub error: Option<String>,
 }
 
 const SCROLL_SYNC_SCRIPT: &str = r#"
@@ -68,6 +104,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   };
 
   const yForSource = (source) => {
+    if (window.__mdVirtualPreview) return window.__mdVirtualPreview.yForSource(source);
     const list = anchors();
     if (!list.length) return 0;
     let low = 0;
@@ -83,6 +120,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   };
 
   const sourceForY = (y) => {
+    if (window.__mdVirtualPreview) return window.__mdVirtualPreview.sourceForY(y);
     const list = anchors();
     if (!list.length) return 0;
     let low = 0;
@@ -145,16 +183,197 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   }, { passive: true });
 
   window.addEventListener('load', () => {
+    if (window.__mdVirtualPreview) return;
     suppressUntil = performance.now() + 300;
     const match = /^md-source:([0-9.]+)$/.exec(window.name);
     const saved = match ? Number(match[1]) : 0;
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        window.__mdEditorSetSourcePosition(saved, false);
-        report();
+        if (saved <= 0) window.scrollTo(0, 0);
+        window.name = `md-source:${saved}`;
+        window.ipc.postMessage(`md-source:program:${saved}`);
+        document.fonts.ready.then(() => {
+          window.requestAnimationFrame(() => {
+            const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+            window.ipc.postMessage(`md-ready:${height}:${window.innerHeight}:${document.body.getElementsByTagName('*').length}`);
+            if (saved > 0) {
+              const restore = () => window.__mdEditorSetSourcePosition(saved, false);
+              if ('requestIdleCallback' in window) window.requestIdleCallback(restore);
+              else window.setTimeout(restore, 0);
+            }
+          });
+        });
       });
     });
   });
+})();
+"#;
+
+const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
+(() => {
+  const manifestNode = document.getElementById('md-virtual-manifest');
+  if (!manifestNode) return;
+  const chunks = JSON.parse(manifestNode.textContent || '[]');
+  const revision = new URL(location.href).searchParams.get('revision') || '';
+  let scheduled = false;
+
+  const placeholderFor = (chunk) => {
+    const node = document.createElement('div');
+    node.className = 'md-virtual-placeholder';
+    node.dataset.chunk = String(chunk.index);
+    node.style.cssText = `display:block;height:${chunk.height}px;margin:0;padding:0;border:0;contain:strict;content-visibility:auto;`;
+    chunk.placeholder = node;
+    return node;
+  };
+
+  const edge = (kind, index) => {
+    const node = document.createElement('div');
+    node.dataset.mdChunkEdge = `${kind}:${index}`;
+    node.style.cssText = 'display:block;height:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;overflow:hidden!important;';
+    return node;
+  };
+
+  const chunkTop = (chunk) => {
+    const node = chunk.placeholder || chunk.start;
+    return node ? node.offsetTop : 0;
+  };
+
+  const findBySource = (source) => {
+    let low = 0;
+    let high = chunks.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (chunks[mid].sourceEnd <= source) low = mid + 1;
+      else high = mid;
+    }
+    return chunks[Math.min(chunks.length - 1, low)] || null;
+  };
+
+  const findByY = (y) => {
+    let low = 0;
+    let high = chunks.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (chunkTop(chunks[mid]) + chunks[mid].height <= y) low = mid + 1;
+      else high = mid;
+    }
+    return chunks[Math.min(chunks.length - 1, low)] || null;
+  };
+
+  const yForSource = (source) => {
+    const chunk = findBySource(source);
+    if (!chunk) return 0;
+    const span = Math.max(1, chunk.sourceEnd - chunk.sourceStart);
+    const ratio = Math.min(1, Math.max(0, (source - chunk.sourceStart) / span));
+    return chunkTop(chunk) + ratio * chunk.height;
+  };
+
+  const sourceForY = (y) => {
+    const chunk = findByY(y);
+    if (!chunk) return 0;
+    const ratio = Math.min(1, Math.max(0, (y - chunkTop(chunk)) / Math.max(1, chunk.height)));
+    return chunk.sourceStart + ratio * (chunk.sourceEnd - chunk.sourceStart);
+  };
+
+  const scrollHeading = async (index) => {
+    const chunk = chunks.find((chunk) => chunk.headingStart !== null && index >= chunk.headingStart && index < chunk.headingEnd);
+    if (!chunk) return;
+    await load(chunk);
+    document.getElementById(`md-heading-${index}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const unload = (chunk) => {
+    if (!chunk.start || !chunk.end) return;
+    const placeholder = placeholderFor(chunk);
+    chunk.start.before(placeholder);
+    let node = chunk.start;
+    while (node) {
+      const next = node.nextSibling;
+      const finished = node === chunk.end;
+      node.remove();
+      if (finished) break;
+      node = next;
+    }
+    chunk.start = null;
+    chunk.end = null;
+  };
+
+  const load = async (chunk) => {
+    if (!chunk || chunk.loading || chunk.start) return;
+    chunk.loading = true;
+    try {
+      const chunkUrl = new URL(`/chunk/${chunk.index}?revision=${encodeURIComponent(revision)}`, location.origin);
+      const response = await fetch(chunkUrl, { cache: 'no-store' });
+      if (!response.ok) return;
+      const template = document.createElement('template');
+      template.innerHTML = await response.text();
+      const start = edge('start', chunk.index);
+      const end = edge('end', chunk.index);
+      const fragment = document.createDocumentFragment();
+      fragment.append(start, template.content, end);
+      chunk.placeholder.replaceWith(fragment);
+      chunk.placeholder = null;
+      chunk.start = start;
+      chunk.end = end;
+      if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      chunk.height = Math.max(1, end.offsetTop - start.offsetTop);
+      const saved = /^md-source:([0-9.]+)$/.exec(window.name || '');
+      if (saved) {
+        const source = Number(saved[1]);
+        if (source >= chunk.sourceStart && source < chunk.sourceEnd) window.scrollTo(0, yForSource(source));
+      }
+    } finally {
+      chunk.loading = false;
+    }
+  };
+
+  const maintainWindow = () => {
+    scheduled = false;
+    const top = window.scrollY;
+    const bottom = top + window.innerHeight;
+    const loadMargin = window.innerHeight * 2.5;
+    const keepMargin = window.innerHeight * 5;
+    for (const chunk of chunks) {
+      const chunkStart = chunkTop(chunk);
+      const chunkEnd = chunkStart + chunk.height;
+      if (chunkEnd >= top - loadMargin && chunkStart <= bottom + loadMargin) load(chunk);
+      else if (chunk.start && (chunkEnd < top - keepMargin || chunkStart > bottom + keepMargin)) unload(chunk);
+    }
+  };
+
+  const schedule = () => {
+    if (!scheduled) {
+      scheduled = true;
+      requestAnimationFrame(maintainWindow);
+    }
+  };
+
+  const scriptNode = document.currentScript;
+  const reference = manifestNode;
+  for (const chunk of chunks) reference.before(placeholderFor(chunk));
+  manifestNode.remove();
+  if (scriptNode) scriptNode.remove();
+  window.__mdVirtualPreview = { yForSource, sourceForY, scrollHeading, loadSource: (source) => load(findBySource(source)) };
+  window.addEventListener('scroll', schedule, { passive: true });
+  window.addEventListener('resize', schedule, { passive: true });
+
+  const boot = async () => {
+    try {
+      await Promise.all(chunks.slice(0, 1).map(load));
+      await document.fonts.ready;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+      window.name = 'md-source:0';
+      window.ipc.postMessage(`md-source:program:0`);
+      window.ipc.postMessage(`md-ready:${height}:${window.innerHeight}:${document.body.getElementsByTagName('*').length}`);
+      schedule();
+    } catch (error) {
+      window.ipc.postMessage(`md-ready-error:${error?.stack || error?.message || String(error)}`);
+    }
+  };
+  if (document.readyState === 'complete') boot();
+  else window.addEventListener('load', boot, { once: true });
 })();
 "#;
 
@@ -163,11 +382,13 @@ impl Default for BrowserPreview {
         Self {
             webview: None,
             document_hash: 0,
+            document_source: None,
             document_changed: false,
             bounds: None,
             visible: false,
             frozen_frame: None,
             scroll_bridge: Arc::new(Mutex::new(ScrollBridge::default())),
+            document_payload: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -179,12 +400,17 @@ impl BrowserPreview {
         ctx: &egui::Context,
         rect: egui::Rect,
         pixels_per_point: f32,
-        document: &str,
+        document: &Arc<PreviewDocument>,
     ) -> Result<(), String> {
         let bounds = physical_bounds(rect, pixels_per_point);
-        let document_hash = hash(document);
+        let source_changed = self
+            .document_source
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, document));
+        let document_hash = document.hash;
 
         if self.webview.is_none() {
+            self.store_document(document);
             let window = frame
                 .winit_window()
                 .ok_or_else(|| "当前窗口后端不支持浏览器预览".to_string())?;
@@ -198,7 +424,11 @@ impl BrowserPreview {
             let ipc_repaint_ctx = ctx.clone();
             let drop_bridge = Arc::clone(&self.scroll_bridge);
             let drop_repaint_ctx = ctx.clone();
+            let document_payload = Arc::clone(&self.document_payload);
             let webview = builder
+                .with_custom_protocol("mdpreview".into(), move |_webview_id, request| {
+                    preview_document_response(request, &document_payload)
+                })
                 .with_custom_protocol("mdfont".into(), |_webview_id, request| {
                     preview_asset_response(request)
                 })
@@ -207,7 +437,14 @@ impl BrowserPreview {
                 })
                 .with_initialization_script(SCROLL_SYNC_SCRIPT)
                 .with_ipc_handler(move |request| {
-                    if let Some((source_position, user_initiated)) =
+                    if let Some(ready) = parse_ready_message(request.body())
+                        .or_else(|| parse_ready_error(request.body()))
+                    {
+                        if let Ok(mut bridge) = scroll_bridge.lock() {
+                            bridge.ready = Some(ready);
+                        }
+                        ipc_repaint_ctx.request_repaint();
+                    } else if let Some((source_position, user_initiated)) =
                         parse_source_message(request.body())
                     {
                         if let Ok(mut bridge) = scroll_bridge.lock() {
@@ -229,7 +466,7 @@ impl BrowserPreview {
                     // Prevent the browser engine from navigating to the dropped file.
                     true
                 })
-                .with_html(document.to_owned())
+                .with_url(preview_document_url(document_hash))
                 .with_bounds(to_wry_rect(bounds))
                 .with_visible(true)
                 .with_focused(false)
@@ -238,10 +475,15 @@ impl BrowserPreview {
                 .map_err(|error| format!("无法创建浏览器预览：{error}"))?;
             self.webview = Some(webview);
             self.document_hash = document_hash;
+            self.document_source = Some(Arc::clone(document));
             self.document_changed = true;
             self.bounds = Some(bounds);
             self.visible = true;
             return Ok(());
+        }
+
+        if source_changed {
+            self.store_document(document);
         }
 
         let webview = self.webview.as_ref().expect("webview 已初始化");
@@ -251,11 +493,12 @@ impl BrowserPreview {
                 .map_err(|error| format!("无法调整预览区域：{error}"))?;
             self.bounds = Some(bounds);
         }
-        if self.document_hash != document_hash {
+        if source_changed {
             webview
-                .load_html(document)
+                .load_url(&preview_document_url(document_hash))
                 .map_err(|error| format!("无法刷新浏览器预览：{error}"))?;
             self.document_hash = document_hash;
+            self.document_source = Some(Arc::clone(document));
             self.document_changed = true;
         }
         if !self.visible {
@@ -265,6 +508,12 @@ impl BrowserPreview {
             self.visible = true;
         }
         Ok(())
+    }
+
+    fn store_document(&self, document: &Arc<PreviewDocument>) {
+        if let Ok(mut payload) = self.document_payload.lock() {
+            *payload = Some(Arc::clone(document));
+        }
     }
 
     pub fn hide(&mut self) {
@@ -283,6 +532,7 @@ impl BrowserPreview {
         self.hide();
         self.webview = None;
         self.document_hash = 0;
+        self.document_source = None;
         self.document_changed = false;
         self.bounds = None;
         self.frozen_frame = None;
@@ -360,6 +610,13 @@ impl BrowserPreview {
             .unwrap_or_default()
     }
 
+    pub fn take_ready(&mut self) -> Option<WebViewReady> {
+        self.scroll_bridge
+            .lock()
+            .ok()
+            .and_then(|mut bridge| bridge.ready.take())
+    }
+
     pub fn source_position(&self) -> Option<f32> {
         self.scroll_bridge
             .lock()
@@ -390,7 +647,7 @@ impl BrowserPreview {
         };
         webview
             .evaluate_script(&format!(
-                "window.__mdEditorSuppressScroll?.(700); document.getElementById('md-heading-{index}')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }});"
+                "window.__mdEditorSuppressScroll?.(700); if (window.__mdVirtualPreview) {{ window.__mdVirtualPreview.scrollHeading({index}); }} else {{ document.getElementById('md-heading-{index}')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }}); }}"
             ))
             .map_err(|error| format!("无法定位章节：{error}"))
     }
@@ -411,6 +668,29 @@ fn parse_source_message(message: &str) -> Option<(f32, bool)> {
         "program" => Some((source_position, false)),
         _ => None,
     }
+}
+
+fn parse_ready_message(message: &str) -> Option<WebViewReady> {
+    let mut parts = message.split(':');
+    if parts.next()? != "md-ready" {
+        return None;
+    }
+    let ready = WebViewReady {
+        content_height: parts.next()?.parse::<f32>().ok()?.max(0.0),
+        viewport_height: parts.next()?.parse::<f32>().ok()?.max(0.0),
+        element_count: parts.next()?.parse::<usize>().ok()?,
+        error: None,
+    };
+    parts.next().is_none().then_some(ready)
+}
+
+fn parse_ready_error(message: &str) -> Option<WebViewReady> {
+    Some(WebViewReady {
+        content_height: 0.0,
+        viewport_height: 0.0,
+        element_count: 0,
+        error: Some(message.strip_prefix("md-ready-error:")?.to_string()),
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -520,18 +800,20 @@ fn capture_preview(
 }
 
 pub fn document(
-    markdown: &str,
+    document: &crate::markdown::ParsedDocument,
     css: &str,
     base_directory: Option<&Path>,
     font_size_override: Option<f32>,
 ) -> String {
-    let markdown = crate::markdown::normalize_compat_markdown(markdown);
-    let has_mermaid = contains_mermaid_code_block(&markdown);
+    let markdown = document.normalized_source();
+    let line_starts = source_line_starts(&markdown);
+    let has_mermaid = document.has_mermaid();
     let mut heading_index = 0usize;
-    let parser = Parser::new_ext(&markdown, crate::markdown::parse_options()).into_offset_iter();
     let mut block_depth = 0usize;
     let mut events = vec![Event::Html(source_anchor(0.0).into())];
-    for (mut event, range) in parser {
+    for item in document.events() {
+        let mut event = item.event.clone();
+        let range = item.range.clone();
         if let Event::Start(Tag::Heading { id, .. }) = &mut event {
             *id = Some(format!("md-heading-{heading_index}").into());
             heading_index += 1;
@@ -540,13 +822,13 @@ pub fn document(
         if starts_block {
             if block_depth == 0 {
                 events.push(Event::Html(
-                    source_anchor(source_line_at_byte(&markdown, range.start)).into(),
+                    source_anchor(source_line_at_byte(&line_starts, range.start)).into(),
                 ));
             }
             block_depth += 1;
         } else if block_depth == 0 && matches!(event, Event::Rule) {
             events.push(Event::Html(
-                source_anchor(source_line_at_byte(&markdown, range.start)).into(),
+                source_anchor(source_line_at_byte(&line_starts, range.start)).into(),
             ));
         }
         let ends_block = matches!(&event, Event::End(tag) if is_block_tag_end(*tag));
@@ -555,7 +837,7 @@ pub fn document(
             block_depth = block_depth.saturating_sub(1);
         }
     }
-    let source_end = markdown.bytes().filter(|byte| *byte == b'\n').count() as f32 + 1.0;
+    let source_end = line_starts.len() as f32;
     events.push(Event::Html(source_anchor(source_end).into()));
     let mut body = String::new();
     html::push_html(&mut body, events.into_iter());
@@ -586,15 +868,152 @@ pub fn document(
     )
 }
 
+pub fn preview_document(
+    document: &crate::markdown::ParsedDocument,
+    css: &str,
+    base_directory: Option<&Path>,
+    font_size_override: Option<f32>,
+) -> PreviewDocument {
+    let html = self::document(document, css, base_directory, font_size_override);
+    virtualize_document(html)
+}
+
+fn virtualize_document(html: String) -> PreviewDocument {
+    const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
+    const TARGET_CHUNK_BYTES: usize = 96 * 1024;
+    let hash = hash(&html);
+    let total_bytes = html.len();
+    if total_bytes < VIRTUALIZE_AT_BYTES {
+        return PreviewDocument {
+            shell: html.into(),
+            chunks: Arc::from([]),
+            hash,
+            total_bytes,
+        };
+    }
+
+    let Some(body_start_tag) = html.find("<body>") else {
+        return PreviewDocument {
+            shell: html.into(),
+            chunks: Arc::from([]),
+            hash,
+            total_bytes,
+        };
+    };
+    let body_start = body_start_tag + "<body>".len();
+    let Some(body_end) = html.rfind("</body>") else {
+        return PreviewDocument {
+            shell: html.into(),
+            chunks: Arc::from([]),
+            hash,
+            total_bytes,
+        };
+    };
+    let body = &html[body_start..body_end];
+    let mut boundaries = vec![0usize];
+    let mut search_from = 1usize;
+    let mut chunk_start = 0usize;
+    while let Some(relative) = body[search_from..].find("<!--md-source:") {
+        let position = search_from + relative;
+        if position.saturating_sub(chunk_start) >= TARGET_CHUNK_BYTES {
+            boundaries.push(position);
+            chunk_start = position;
+        }
+        search_from = position + "<!--md-source:".len();
+    }
+    boundaries.push(body.len());
+
+    let source_end =
+        source_marker_at(body, body.rfind("<!--md-source:").unwrap_or(0)).unwrap_or(1.0);
+    let mut chunks = Vec::with_capacity(boundaries.len().saturating_sub(1));
+    for pair in boundaries.windows(2) {
+        let start = pair[0];
+        let end = pair[1];
+        let source_start = source_marker_at(body, start).unwrap_or(0.0);
+        let source_end_for_chunk = source_marker_at(body, end).unwrap_or(source_end);
+        let estimated_height = ((source_end_for_chunk - source_start).max(1.0) * 34.0).max(96.0);
+        let heading_bounds = heading_bounds(&body[start..end]);
+        chunks.push(PreviewChunk {
+            html: Arc::from(&body[start..end]),
+            source_start,
+            source_end: source_end_for_chunk,
+            estimated_height,
+            heading_start: heading_bounds.map(|bounds| bounds.0),
+            heading_end: heading_bounds.map(|bounds| bounds.1),
+        });
+    }
+
+    let manifest = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            format!(
+                "{{\"index\":{index},\"sourceStart\":{},\"sourceEnd\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
+                chunk.source_start,
+                chunk.source_end,
+                chunk.estimated_height,
+                chunk.heading_start.map_or("null".to_string(), |value| value.to_string()),
+                chunk.heading_end.map_or("null".to_string(), |value| value.to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let virtual_script = format!(
+        "<script id=\"md-virtual-manifest\" type=\"application/json\">[{manifest}]</script><script defer src=\"{}\"></script>",
+        custom_protocol_url("mdfont", "virtual-preview.js")
+    );
+    let mut shell = String::with_capacity(html.len() - body.len() + virtual_script.len());
+    shell.push_str(&html[..body_start]);
+    shell.push_str(&virtual_script);
+    shell.push_str(&html[body_end..]);
+    PreviewDocument {
+        shell: shell.into(),
+        chunks: chunks.into(),
+        hash,
+        total_bytes,
+    }
+}
+
+fn source_marker_at(body: &str, position: usize) -> Option<f32> {
+    let marker = body.get(position..)?.strip_prefix("<!--md-source:")?;
+    marker.split("-->").next()?.parse().ok()
+}
+
+fn heading_bounds(html: &str) -> Option<(usize, usize)> {
+    let mut search_from = 0usize;
+    let mut first = None;
+    let mut last = None;
+    while let Some(relative) = html[search_from..].find("id=\"md-heading-") {
+        let start = search_from + relative + "id=\"md-heading-".len();
+        let end = start + html[start..].find('"')?;
+        let index = html[start..end].parse::<usize>().ok()?;
+        first.get_or_insert(index);
+        last = Some(index + 1);
+        search_from = end + 1;
+    }
+    first.zip(last)
+}
+
 fn source_anchor(source_line: f32) -> String {
     format!("<!--md-source:{source_line}-->")
 }
 
-fn source_line_at_byte(markdown: &str, byte_offset: usize) -> f32 {
-    markdown.as_bytes()[..byte_offset.min(markdown.len())]
-        .iter()
-        .filter(|byte| **byte == b'\n')
-        .count() as f32
+fn source_line_starts(markdown: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(markdown.len() / 48 + 1);
+    starts.push(0);
+    starts.extend(
+        markdown
+            .bytes()
+            .enumerate()
+            .filter_map(|(index, byte)| (byte == b'\n').then_some(index + 1)),
+    );
+    starts
+}
+
+fn source_line_at_byte(line_starts: &[usize], byte_offset: usize) -> f32 {
+    line_starts
+        .partition_point(|start| *start <= byte_offset)
+        .saturating_sub(1) as f32
 }
 
 fn is_block_tag(tag: &Tag<'_>) -> bool {
@@ -692,16 +1111,6 @@ fn local_image_url(destination: &str, base_directory: Option<&Path>) -> Option<S
     Some(custom_protocol_url("mdfile", file_url.path()))
 }
 
-fn contains_mermaid_code_block(markdown: &str) -> bool {
-    Parser::new_ext(markdown, crate::markdown::parse_options()).any(|event| {
-        matches!(
-            event,
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
-                if info.split_whitespace().next().is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
-        )
-    })
-}
-
 fn editor_font_css() -> String {
     format!(
         "@font-face{{font-family:'Markdown Editor Mono';src:url('{}') format('truetype');font-style:normal;font-weight:400;font-display:block;}}\
@@ -715,6 +1124,45 @@ fn editor_font_css() -> String {
         custom_protocol_url("mdfont", "lxgw-regular.ttf"),
         custom_protocol_url("mdfont", "lxgw-medium.ttf")
     )
+}
+
+fn preview_document_url(document_hash: u64) -> String {
+    format!(
+        "{}?revision={document_hash:016x}",
+        custom_protocol_url("mdpreview", "document")
+    )
+}
+
+fn preview_document_response(
+    request: Request<Vec<u8>>,
+    document_payload: &Arc<Mutex<Option<Arc<PreviewDocument>>>>,
+) -> Response<Cow<'static, [u8]>> {
+    let payload = document_payload
+        .lock()
+        .ok()
+        .and_then(|payload| payload.clone());
+    let path = request.uri().path();
+    let bytes = payload
+        .as_ref()
+        .and_then(|payload| {
+            if path == "/document" {
+                Some(payload.shell.as_bytes().to_vec())
+            } else {
+                path.strip_prefix("/chunk/")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| payload.chunks.get(index))
+                    .map(|chunk| chunk.html.as_bytes().to_vec())
+            }
+        })
+        .unwrap_or_default();
+    let status = if bytes.is_empty() { 404 } else { 200 };
+    Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(CACHE_CONTROL, "no-store")
+        .body(Cow::Owned(bytes))
+        .expect("valid preview document response")
 }
 
 fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
@@ -747,6 +1195,11 @@ fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u
             ),
             "/mermaid-init.js" => (
                 MERMAID_BOOTSTRAP.as_bytes(),
+                "text/javascript; charset=utf-8",
+                "no-cache",
+            ),
+            "/virtual-preview.js" => (
+                VIRTUAL_PREVIEW_SCRIPT.as_bytes(),
                 "text/javascript; charset=utf-8",
                 "no-cache",
             ),
@@ -817,17 +1270,21 @@ fn image_content_type(path: &Path) -> Option<&'static str> {
 
 const MERMAID_BOOTSTRAP: &str = r#"
 (async () => {
-    const blocks = Array.from(document.querySelectorAll('pre > code.language-mermaid'));
-    if (blocks.length === 0) return;
-
-    mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: 'strict',
-        suppressErrorRendering: true,
-        fontFamily: "'Markdown Editor Mono', 'LXGW WenKai Lite', monospace"
-    });
-
-    for (const [index, code] of blocks.entries()) {
+    let initialized = false;
+    let nextId = 0;
+    window.__mdRenderMermaid = async (root = document) => {
+      const blocks = Array.from(root.querySelectorAll('pre > code.language-mermaid'));
+      if (blocks.length === 0) return;
+      if (!initialized) {
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: 'strict',
+          suppressErrorRendering: true,
+          fontFamily: "'Markdown Editor Mono', 'LXGW WenKai Lite', monospace"
+        });
+        initialized = true;
+      }
+      for (const code of blocks) {
         const source = code.textContent || '';
         const pre = code.parentElement;
         const diagram = document.createElement('div');
@@ -836,7 +1293,7 @@ const MERMAID_BOOTSTRAP: &str = r#"
         diagram.setAttribute('aria-label', 'Mermaid diagram');
 
         try {
-            const rendered = await mermaid.render(`markdown-editor-mermaid-${index}`, source);
+            const rendered = await mermaid.render(`markdown-editor-mermaid-${nextId++}`, source);
             diagram.innerHTML = rendered.svg;
             pre.replaceWith(diagram);
             if (rendered.bindFunctions) rendered.bindFunctions(diagram);
@@ -848,7 +1305,9 @@ const MERMAID_BOOTSTRAP: &str = r#"
             message.textContent = `Mermaid 图表语法错误：${error?.message || String(error)}`;
             pre.after(message);
         }
-    }
+      }
+    };
+    await window.__mdRenderMermaid(document);
 })();
 "#;
 
@@ -900,6 +1359,12 @@ ol:not(#footnotes), ul {
 }
 ol:not(#footnotes) > li::marker {
     font-variant-numeric: tabular-nums;
+}
+body > h1, body > h2, body > h3, body > h4, body > h5, body > h6,
+body > p, body > blockquote, body > pre, body > ul, body > ol,
+body > table, body > hr, body > .mermaid-diagram {
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto 96px;
 }
 html { scrollbar-width: none; }
 ::-webkit-scrollbar { width: 0; height: 0; }
@@ -1007,10 +1472,49 @@ fn normalize_footnote_dom(body: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCROLL_SYNC_SCRIPT, custom_protocol_script_source, custom_protocol_url, document,
-        local_image_response, local_image_url, parse_source_message, preview_asset_response,
+        SCROLL_SYNC_SCRIPT, VIRTUAL_PREVIEW_SCRIPT, custom_protocol_script_source,
+        custom_protocol_url, document, local_image_response, local_image_url, parse_ready_message,
+        parse_source_message, preview_asset_response, source_line_at_byte, source_line_starts,
     };
     use wry::http::Request;
+
+    fn render_document(
+        markdown: &str,
+        css: &str,
+        base_directory: Option<&std::path::Path>,
+        font_size_override: Option<f32>,
+    ) -> String {
+        let parsed = crate::markdown::parse_document(markdown);
+        document(&parsed, css, base_directory, font_size_override)
+    }
+
+    #[test]
+    fn source_line_index_maps_byte_offsets_without_rescanning_the_document() {
+        let source = "第一行\nsecond\n第三行";
+        let starts = source_line_starts(source);
+        assert_eq!(starts, vec![0, 10, 17]);
+        assert_eq!(source_line_at_byte(&starts, 0), 0.0);
+        assert_eq!(source_line_at_byte(&starts, 9), 0.0);
+        assert_eq!(source_line_at_byte(&starts, 10), 1.0);
+        assert_eq!(source_line_at_byte(&starts, source.len()), 2.0);
+    }
+
+    #[test]
+    fn large_preview_is_split_into_virtual_chunks_without_wrapping_theme_nodes() {
+        let markdown = "## 章节\n\n正文段落。\n\n".repeat(30_000);
+        let parsed = crate::markdown::parse_document(&markdown);
+        let preview = super::preview_document(&parsed, "body > h2 { color: red; }", None, None);
+        assert!(preview.chunks.len() > 2);
+        assert!(preview.shell.contains("md-virtual-manifest"));
+        assert!(preview.shell.contains("virtual-preview.js"));
+        assert!(!preview.shell.contains("正文段落"));
+        assert!(preview.chunks[0].html.contains("<h2 id=\"md-heading-0\""));
+        assert_eq!(preview.chunks[0].heading_start, Some(0));
+        assert!(preview.chunks[0].heading_end.unwrap() > 0);
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("scrollHeading"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("window.__mdRenderMermaid"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("unload(chunk)"));
+    }
 
     #[test]
     fn browser_scroll_messages_distinguish_user_and_programmatic_updates() {
@@ -1028,11 +1532,16 @@ mod tests {
         assert!(SCROLL_SYNC_SCRIPT.contains("distance * 0.38"));
         assert!(SCROLL_SYNC_SCRIPT.contains("cancelAnimationFrame"));
         assert!(SCROLL_SYNC_SCRIPT.contains("requestAnimationFrame(report)"));
+        let ready = parse_ready_message("md-ready:8400.5:720:1234").unwrap();
+        assert_eq!(ready.content_height, 8400.5);
+        assert_eq!(ready.viewport_height, 720.0);
+        assert_eq!(ready.element_count, 1234);
+        assert!(parse_ready_message("md-ready:broken").is_none());
     }
 
     #[test]
     fn compatible_strong_markup_uses_the_bold_font_face() {
-        let html = document("1. **结构层： **训练一个统一的纹样 LoRA。", "", None, None);
+        let html = render_document("1. **结构层： **训练一个统一的纹样 LoRA。", "", None, None);
         assert!(html.contains("<strong>结构层：</strong> 训练一个统一的纹样 LoRA。"));
         assert!(html.contains("font-weight:500;font-display:block"));
         assert!(html.contains("strong,b{font-weight:800!important;}"));
@@ -1041,7 +1550,7 @@ mod tests {
 
     #[test]
     fn standard_strong_markup_next_to_chinese_text_is_rendered() {
-        let html = document(
+        let html = render_document(
             "- **识别与生成：**区分植物、动物、几何和复合纹样；",
             "",
             None,
@@ -1070,7 +1579,7 @@ mod tests {
         assert!(url.starts_with(&custom_protocol_url("mdfile", "")));
         assert!(url.contains("%E7%BA%B9%E6%A0%B7"));
 
-        let html = document(
+        let html = render_document(
             "![莲花纹](纹样讲稿图片/01-莲花纹.jpg)",
             "",
             Some(&base),
@@ -1089,14 +1598,14 @@ mod tests {
 
     #[test]
     fn ordinary_documents_do_not_load_mermaid_runtime() {
-        let html = document("# 标题\n\n普通正文", "", None, None);
+        let html = render_document("# 标题\n\n普通正文", "", None, None);
         assert!(!html.contains("mermaid.min.js"));
         assert!(!html.contains("mermaid-init.js"));
     }
 
     #[test]
     fn markdown与css原样进入浏览器文档() {
-        let html = document(
+        let html = render_document(
             "# 标题\n\n`代码`",
             "h1 { color: #f00; } code::before { content: '>'; }",
             None,
@@ -1111,7 +1620,7 @@ mod tests {
 
     #[test]
     fn 用户字号覆盖位于主题之后() {
-        let html = document("正文", "body { font-size: 15px; }", None, Some(18.0));
+        let html = render_document("正文", "body { font-size: 15px; }", None, Some(18.0));
         let theme = html.find("font-size: 15px").unwrap();
         let override_rule = html.find("font-size: 18.00px !important").unwrap();
         assert!(override_rule > theme);
@@ -1119,7 +1628,7 @@ mod tests {
 
     #[test]
     fn 窄分栏使用响应式阅读节奏() {
-        let html = document("# 标题\n\n正文\n\n- 一\n- 二", "", None, None);
+        let html = render_document("# 标题\n\n正文\n\n- 一\n- 二", "", None, None);
         assert!(html.contains("@media (max-width: 700px)"));
         assert!(html.contains("body > h1:first-child { margin-top: 0; margin-bottom: 10px; }"));
         assert!(html.contains("li { margin-top: .45em; margin-bottom: .45em; }"));
@@ -1127,7 +1636,7 @@ mod tests {
 
     #[test]
     fn 普通列表使用稳定缩进且不影响脚注() {
-        let html = document(
+        let html = render_document(
             "1. 第一项\n2. 第二项",
             crate::theme::BUILT_IN_SSPAI_CSS,
             None,
@@ -1141,7 +1650,7 @@ mod tests {
 
     #[test]
     fn 预览使用编辑区内置字体() {
-        let html = document(
+        let html = render_document(
             "# 标题\n\n正文 `代码`",
             "body { font-family: serif; }",
             None,
@@ -1173,7 +1682,7 @@ mod tests {
 
     #[test]
     fn 围栏代码在右上角标注语言() {
-        let html = document("```rust\nfn main() {}\n```", "", None, None);
+        let html = render_document("```rust\nfn main() {}\n```", "", None, None);
         assert!(html.contains("<pre data-language=\"rust\"><code class=\"language-rust\">"));
         assert!(html.contains("content: attr(data-language)"));
         assert!(html.contains("text-transform: uppercase"));
@@ -1181,7 +1690,7 @@ mod tests {
 
     #[test]
     fn mermaid_代码块加载内置渲染器() {
-        let html = document(
+        let html = render_document(
             "```mermaid\nstateDiagram-v2\n    [*] --> Standby\n```",
             "",
             None,
@@ -1216,14 +1725,14 @@ mod tests {
 
     #[test]
     fn 未声明语言的代码块不显示标签() {
-        let html = document("```\nplain\n```", "", None, None);
+        let html = render_document("```\nplain\n```", "", None, None);
         assert!(html.contains("<pre><code>plain"));
         assert!(!html.contains("<pre data-language="));
     }
 
     #[test]
     fn 少数派二级标题保留粉色边线() {
-        let html = document("## 小结", crate::theme::BUILT_IN_SSPAI_CSS, None, None);
+        let html = render_document("## 小结", crate::theme::BUILT_IN_SSPAI_CSS, None, None);
         assert!(html.contains("<h2 id=\"md-heading-0\">小结</h2>"));
         assert!(html.contains("border-left: 6px solid #ff7e79"));
     }
@@ -1231,7 +1740,7 @@ mod tests {
     #[test]
     fn 审计markdown生成的主题选择器结构() {
         let markdown = "# 一级\n\n## 二级\n\n> 引用\n\n行内 `代码`。\n\n```rust\nfn main() {}\n```\n\n![图片](image.png)\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n\n脚注[^1]\n\n[^1]: 脚注内容\n";
-        let html = document(markdown, crate::theme::BUILT_IN_SSPAI_CSS, None, None);
+        let html = render_document(markdown, crate::theme::BUILT_IN_SSPAI_CSS, None, None);
         assert!(html.contains("<h1 id=\"md-heading-0\">一级</h1>"));
         assert!(html.contains("<h2 id=\"md-heading-1\">二级</h2>"));
         assert!(html.contains("<blockquote>"));
@@ -1245,7 +1754,7 @@ mod tests {
 
     #[test]
     fn 每个章节生成稳定且唯一的定位锚点() {
-        let html = document("# 相同标题\n\n## 相同标题\n\n### 末章", "", None, None);
+        let html = render_document("# 相同标题\n\n## 相同标题\n\n### 末章", "", None, None);
         assert!(html.contains("<h1 id=\"md-heading-0\">相同标题</h1>"));
         assert!(html.contains("<h2 id=\"md-heading-1\">相同标题</h2>"));
         assert!(html.contains("<h3 id=\"md-heading-2\">末章</h3>"));
@@ -1253,7 +1762,7 @@ mod tests {
 
     #[test]
     fn 每个顶层markdown块生成源码行锚点() {
-        let html = document(
+        let html = render_document(
             "# 标题\n\n第一段\n\n- 项目一\n- 项目二\n\n## 结尾",
             "",
             None,

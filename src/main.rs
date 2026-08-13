@@ -13,11 +13,11 @@ mod web_preview;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::containers::scroll_area::ScrollAreaOutput;
-use markdown::Block;
+use markdown::{Block, ParsedDocument};
 use theme::{ThemePackage, ThemeSpec};
 
 #[cfg(target_os = "macos")]
@@ -29,7 +29,7 @@ const EXTERNAL_POLL_INTERVAL: f64 = 0.35;
 const EXTERNAL_STABLE_DELAY: f64 = 0.45;
 
 fn main() -> eframe::Result {
-    let open_path = std::env::args().nth(1).map(PathBuf::from);
+    let launch = LaunchOptions::from_env();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -43,12 +43,51 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = MdEditorApp::new(cc);
-            if let Some(path) = open_path {
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if let Some(report_path) = launch.benchmark_report {
+                app.view_mode = ViewMode::Preview;
+                app.benchmark_probe = Some(BenchmarkProbe {
+                    started: Instant::now(),
+                    report_path,
+                    completed: false,
+                });
+            }
+            if let Some(path) = launch.open_path {
                 app.open_path(&path);
             }
             Ok(Box::new(app))
         }),
     )
+}
+
+struct LaunchOptions {
+    open_path: Option<PathBuf>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    benchmark_report: Option<PathBuf>,
+}
+
+impl LaunchOptions {
+    fn from_env() -> Self {
+        let mut open_path = None;
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let mut benchmark_report = None;
+        let mut args = std::env::args().skip(1);
+        while let Some(argument) = args.next() {
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if argument == "--benchmark-webview-report" {
+                benchmark_report = args.next().map(PathBuf::from);
+                continue;
+            }
+            if !argument.starts_with('-') && open_path.is_none() {
+                open_path = Some(PathBuf::from(argument));
+            }
+        }
+        Self {
+            open_path,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            benchmark_report,
+        }
+    }
 }
 
 fn app_icon() -> Arc<egui::IconData> {
@@ -86,8 +125,8 @@ struct DocumentTab {
     path: Option<PathBuf>,
     disk_snapshot: Vec<u8>,
     status: DocStatus,
-    blocks: Vec<Block>,
-    last_parsed: String,
+    document: ParsedDocument,
+    document_revision: u64,
     status_note: String,
     conflict: Option<PathBuf>,
     draft_last_write: f64,
@@ -101,6 +140,29 @@ struct PendingExternalChange {
     stamp: io::FileStamp,
     bytes: Vec<u8>,
     first_seen: f64,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct BenchmarkProbe {
+    started: Instant,
+    report_path: PathBuf,
+    completed: bool,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[derive(Clone, PartialEq, Eq)]
+struct BrowserDocumentKey {
+    tab_id: u64,
+    document_revision: u64,
+    theme_revision: u64,
+    body_font_size_bits: u32,
+    base_directory: Option<PathBuf>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct BrowserDocumentCache {
+    key: BrowserDocumentKey,
+    document: Arc<web_preview::PreviewDocument>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,8 +187,8 @@ impl DocumentTab {
             path: None,
             disk_snapshot: Vec::new(),
             status: DocStatus::Unsaved,
-            blocks: Vec::new(),
-            last_parsed: String::new(),
+            document: markdown::parse_document(""),
+            document_revision: 0,
             status_note: String::new(),
             conflict: None,
             draft_last_write: 0.0,
@@ -138,15 +200,15 @@ impl DocumentTab {
     }
 
     fn from_file(id: u64, path: PathBuf, text: String, snapshot: Vec<u8>) -> Self {
-        let blocks = markdown::parse(&text);
+        let document = markdown::parse_document(&text);
         Self {
             id,
-            last_parsed: text.clone(),
             text,
             path: Some(path),
             disk_snapshot: snapshot,
             status: DocStatus::Saved,
-            blocks,
+            document,
+            document_revision: 1,
             status_note: String::new(),
             conflict: None,
             draft_last_write: 0.0,
@@ -202,8 +264,8 @@ fn apply_external_bytes(
 
     tab.text = disk_text;
     tab.disk_snapshot = bytes;
-    tab.blocks = markdown::parse(&tab.text);
-    tab.last_parsed = tab.text.clone();
+    tab.document = markdown::parse_document(&tab.text);
+    tab.document_revision = tab.document_revision.wrapping_add(1);
     tab.status = DocStatus::Saved;
     tab.conflict = None;
     tab.status_note = format!("已自动加载外部修改 {}", clock_time());
@@ -515,8 +577,8 @@ struct MdEditorApp {
     path: Option<PathBuf>,
     disk_snapshot: Vec<u8>,
     status: DocStatus,
-    blocks: Vec<Block>,
-    last_parsed: String,
+    document: ParsedDocument,
+    document_revision: u64,
     status_note: String,
     conflict: Option<PathBuf>,
     recovery: Option<String>,
@@ -532,12 +594,17 @@ struct MdEditorApp {
     show_status: bool,
     body_font_size: f32,
     theme_package: Option<ThemePackage>,
+    theme_revision: u64,
     auto_reload_external: bool,
     last_external_poll: f64,
     observed_file_stamps: HashMap<PathBuf, io::FileStamp>,
     pending_external_changes: HashMap<PathBuf, PendingExternalChange>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_preview: web_preview::BrowserPreview,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    benchmark_probe: Option<BenchmarkProbe>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    browser_document_cache: Option<BrowserDocumentCache>,
 }
 
 impl MdEditorApp {
@@ -567,8 +634,8 @@ impl MdEditorApp {
             path: None,
             disk_snapshot: Vec::new(),
             status: DocStatus::Modified,
-            blocks: Vec::new(),
-            last_parsed: String::new(),
+            document: markdown::parse_document(&sample),
+            document_revision: 1,
             status_note: String::new(),
             conflict: None,
             recovery,
@@ -584,15 +651,18 @@ impl MdEditorApp {
             show_status: true,
             body_font_size: initial_body_font_size,
             theme_package,
+            theme_revision: 1,
             auto_reload_external: true,
             last_external_poll: f64::NEG_INFINITY,
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            benchmark_probe: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            browser_document_cache: None,
         };
-        app.blocks = markdown::parse(&app.text);
-        app.last_parsed = app.text.clone();
         app.tabs.push(app.capture_active_tab(1));
         app
     }
@@ -604,8 +674,8 @@ impl MdEditorApp {
             path: self.path.clone(),
             disk_snapshot: self.disk_snapshot.clone(),
             status: self.status.clone(),
-            blocks: self.blocks.clone(),
-            last_parsed: self.last_parsed.clone(),
+            document: self.document.clone(),
+            document_revision: self.document_revision,
             status_note: self.status_note.clone(),
             conflict: self.conflict.clone(),
             draft_last_write: self.draft_last_write,
@@ -633,8 +703,8 @@ impl MdEditorApp {
         self.path = tab.path;
         self.disk_snapshot = tab.disk_snapshot;
         self.status = tab.status;
-        self.blocks = tab.blocks;
-        self.last_parsed = tab.last_parsed;
+        self.document = tab.document;
+        self.document_revision = tab.document_revision;
         self.status_note = tab.status_note;
         self.conflict = tab.conflict;
         self.draft_last_write = tab.draft_last_write;
@@ -762,15 +832,76 @@ impl MdEditorApp {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn browser_document(&self) -> String {
+    fn browser_document(&mut self) -> Arc<web_preview::PreviewDocument> {
+        let base_directory = self
+            .path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(Path::to_path_buf);
+        let key = BrowserDocumentKey {
+            tab_id: self.tabs.get(self.active_tab).map_or(0, |tab| tab.id),
+            document_revision: self.document_revision,
+            theme_revision: self.theme_revision,
+            body_font_size_bits: self.body_font_size.to_bits(),
+            base_directory: base_directory.clone(),
+        };
+        if let Some(cache) = &self.browser_document_cache
+            && cache.key == key
+        {
+            return Arc::clone(&cache.document);
+        }
+
         let built_in = ThemePackage::built_in_sspai();
         let package = self.theme_package.as_ref().unwrap_or(&built_in);
         let css = package.browser_css().unwrap_or(theme::BUILT_IN_SSPAI_CSS);
         let default_size = package.recommended_body_font_size();
         let font_override =
             ((self.body_font_size - default_size).abs() > 0.01).then_some(self.body_font_size);
-        let base_directory = self.path.as_deref().and_then(std::path::Path::parent);
-        web_preview::document(&self.text, css, base_directory, font_override)
+        let document = Arc::new(web_preview::preview_document(
+            &self.document,
+            css,
+            base_directory.as_deref(),
+            font_override,
+        ));
+        self.browser_document_cache = Some(BrowserDocumentCache {
+            key,
+            document: Arc::clone(&document),
+        });
+        document
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn finish_benchmark_probe(&mut self, ready: web_preview::WebViewReady) {
+        let Some(probe) = &mut self.benchmark_probe else {
+            return;
+        };
+        if probe.completed {
+            return;
+        }
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "pid": std::process::id(),
+            "source_bytes": self.text.len(),
+            "blocks": self.document.blocks().len(),
+            "events": self.document.events().len(),
+            "startup_to_webview_ready_ms": probe.started.elapsed().as_secs_f64() * 1000.0,
+            "content_height_css_px": ready.content_height,
+            "viewport_height_css_px": ready.viewport_height,
+            "dom_element_count": ready.element_count,
+            "error": ready.error,
+        });
+        let result = (|| -> Result<(), String> {
+            if let Some(parent) = probe.report_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            let json = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+            std::fs::write(&probe.report_path, json).map_err(|error| error.to_string())
+        })();
+        probe.completed = result.is_ok();
+        self.status_note = match result {
+            Ok(()) => format!("WebView 基准完成：{}", probe.report_path.display()),
+            Err(error) => format!("WebView 基准写入失败：{error}"),
+        };
     }
 
     fn import_theme(&mut self, ctx: &egui::Context) {
@@ -789,6 +920,7 @@ impl MdEditorApp {
                 let name = package.name.clone();
                 self.body_font_size = package.recommended_body_font_size();
                 self.theme_package = Some(package);
+                self.theme_revision = self.theme_revision.wrapping_add(1);
                 self.apply_current_theme(ctx);
                 self.status_note = format!("已加载主题：{name}");
             }
@@ -798,6 +930,7 @@ impl MdEditorApp {
 
     fn remove_theme(&mut self, ctx: &egui::Context) {
         self.theme_package = None;
+        self.theme_revision = self.theme_revision.wrapping_add(1);
         self.body_font_size = ThemePackage::built_in_sspai().recommended_body_font_size();
         theme::clear_saved();
         self.apply_current_theme(ctx);
@@ -1140,7 +1273,8 @@ impl MdEditorApp {
                     self.text = text;
                     self.path = Some(path.clone());
                     self.disk_snapshot = io::read_snapshot(&path).unwrap_or_default();
-                    self.last_parsed.clear();
+                    self.document = markdown::parse_document(&self.text);
+                    self.document_revision = self.document_revision.wrapping_add(1);
                     self.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
                     io::clear_draft();
@@ -1162,7 +1296,9 @@ impl MdEditorApp {
         else {
             return;
         };
-        match export::export_html(&path, &self.text) {
+        let title = self.export_title();
+        let options = self.export_options(&title);
+        match export::export_html(&path, &self.document, options) {
             Ok(()) => self.status_note = format!("已导出 HTML：{}", path.display()),
             Err(e) => self.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
         }
@@ -1176,9 +1312,38 @@ impl MdEditorApp {
         else {
             return;
         };
-        match export::export_pdf(&path, &self.text) {
+        let title = self.export_title();
+        let options = self.export_options(&title);
+        match export::export_pdf(&path, &self.document, options) {
             Ok(()) => self.status_note = format!("已导出 PDF：{}", path.display()),
             Err(e) => self.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
+        }
+    }
+
+    fn export_title(&self) -> String {
+        self.path
+            .as_deref()
+            .and_then(Path::file_stem)
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("未命名文档")
+            .to_string()
+    }
+
+    fn export_options<'a>(&'a self, title: &'a str) -> export::ExportOptions<'a> {
+        let package = self.theme_package.as_ref();
+        let theme_css = package
+            .and_then(ThemePackage::browser_css)
+            .unwrap_or(theme::BUILT_IN_SSPAI_CSS);
+        let default_size = package
+            .map(ThemePackage::recommended_body_font_size)
+            .unwrap_or_else(|| ThemePackage::built_in_sspai().recommended_body_font_size());
+        export::ExportOptions {
+            title,
+            theme_css,
+            base_directory: self.path.as_deref().and_then(Path::parent),
+            body_font_size: ((self.body_font_size - default_size).abs() > 0.01)
+                .then_some(self.body_font_size),
         }
     }
 
@@ -1221,12 +1386,12 @@ impl MdEditorApp {
             });
             ui.menu_button("编辑", |ui| {
                 if ui.button("复制渲染内容").clicked() {
-                    ctx.copy_text(markdown::plain_text(&self.blocks));
+                    ctx.copy_text(markdown::plain_text(self.document.blocks()));
                     self.status_note = "已复制渲染内容".to_string();
                     ui.close();
                 }
                 if ui.button("复制 HTML").clicked() {
-                    ctx.copy_text(export::render_html(&self.text));
+                    ctx.copy_text(export::render_html(&self.document));
                     self.status_note = "已复制 HTML".to_string();
                     ui.close();
                 }
@@ -1379,11 +1544,12 @@ impl MdEditorApp {
                 ui.menu_button(egui::RichText::new("编辑").size(CHROME_FONT_SIZE), |ui| {
                     if ui.button("复制渲染内容").clicked() {
                         ui.close();
-                        ui.ctx().copy_text(markdown::plain_text(&self.blocks));
+                        ui.ctx()
+                            .copy_text(markdown::plain_text(self.document.blocks()));
                     }
                     if ui.button("复制 HTML").clicked() {
                         ui.close();
-                        ui.ctx().copy_text(export::render_html(&self.text));
+                        ui.ctx().copy_text(export::render_html(&self.document));
                     }
                 });
                 ui.menu_button(egui::RichText::new("视图").size(CHROME_FONT_SIZE), |ui| {
@@ -1730,7 +1896,8 @@ impl MdEditorApp {
                     if ui.button("恢复草稿").clicked() {
                         if let Some(draft) = self.recovery.take() {
                             self.text = draft;
-                            self.last_parsed.clear();
+                            self.document = markdown::parse_document(&self.text);
+                            self.document_revision = self.document_revision.wrapping_add(1);
                             self.refresh_status();
                             self.status_note = "已恢复草稿".to_string();
                             io::clear_draft();
@@ -1803,9 +1970,9 @@ impl eframe::App for MdEditorApp {
 
         self.poll_external_changes(&ctx, now);
 
-        if self.text != self.last_parsed {
-            self.blocks = markdown::parse(&self.text);
-            self.last_parsed = self.text.clone();
+        if self.text != self.document.source() {
+            self.document = markdown::parse_document(&self.text);
+            self.document_revision = self.document_revision.wrapping_add(1);
             self.last_edit_time = now;
             self.refresh_status();
         }
@@ -1887,7 +2054,7 @@ impl eframe::App for MdEditorApp {
                             .inner_margin(egui::Margin::symmetric(14, 0)),
                     )
                     .show(ui, |ui| {
-                        let target = reading_toc(ui, &self.blocks);
+                        let target = reading_toc(ui, self.document.blocks());
                         #[cfg(any(target_os = "windows", target_os = "macos"))]
                         if target.is_some() {
                             preview_heading_target = target;
@@ -1905,14 +2072,19 @@ impl eframe::App for MdEditorApp {
                             } else {
                                 show_centered_preview(
                                     ui,
-                                    &self.blocks,
+                                    self.document.blocks(),
                                     self.body_font_size,
                                     &doc_theme,
                                 );
                             }
                         }
                         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                        show_centered_preview(ui, &self.blocks, self.body_font_size, &doc_theme);
+                        show_centered_preview(
+                            ui,
+                            self.document.blocks(),
+                            self.body_font_size,
+                            &doc_theme,
+                        );
                     });
             }
             ViewMode::Split => {
@@ -1949,7 +2121,7 @@ impl eframe::App for MdEditorApp {
                         } else {
                             let _ = show_preview_scroll(
                                 ui,
-                                &self.blocks,
+                                self.document.blocks(),
                                 self.body_font_size,
                                 &doc_theme,
                             );
@@ -1969,7 +2141,12 @@ impl eframe::App for MdEditorApp {
                                 }),
                         )
                         .show(ui, |ui| {
-                            show_preview_scroll(ui, &self.blocks, self.body_font_size, &doc_theme)
+                            show_preview_scroll(
+                                ui,
+                                self.document.blocks(),
+                                self.body_font_size,
+                                &doc_theme,
+                            )
                         });
                     self.sync_scrolls(&ctx, &editor_out.inner, &preview_out.inner);
                     self.sync_caret(&ctx, &editor_out.inner, &preview_out.inner);
@@ -2013,6 +2190,9 @@ impl eframe::App for MdEditorApp {
                         && let Err(error) = self.browser_preview.scroll_to_heading(index)
                     {
                         self.status_note = error;
+                    }
+                    if let Some(ready) = self.browser_preview.take_ready() {
+                        self.finish_benchmark_probe(ready);
                     }
                 }
                 if self.editor_focused {
