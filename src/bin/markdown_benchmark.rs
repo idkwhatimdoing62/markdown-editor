@@ -6,6 +6,8 @@
 
 #[path = "../export.rs"]
 mod export;
+#[path = "../html_image.rs"]
+mod html_image;
 #[path = "../markdown.rs"]
 mod markdown;
 #[cfg(any(target_os = "windows", target_os = "macos"))]

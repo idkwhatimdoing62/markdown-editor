@@ -76,6 +76,17 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   let animationFrame = 0;
   let targetSource = 0;
   let anchorCache = null;
+  let navigationRevision = 0;
+
+  const beginNavigation = () => {
+    navigationRevision += 1;
+    window.__mdNavigationRevision = navigationRevision;
+  };
+
+  const cancelSourceAnimation = () => {
+    if (animationFrame) window.cancelAnimationFrame(animationFrame);
+    animationFrame = 0;
+  };
 
   const anchors = () => {
     if (anchorCache) return anchorCache;
@@ -147,6 +158,17 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     suppressUntil = Math.max(suppressUntil, performance.now() + milliseconds);
   };
 
+  window.__mdEditorScrollHeading = async (index) => {
+    beginNavigation();
+    cancelSourceAnimation();
+    suppressUntil = Math.max(suppressUntil, performance.now() + 700);
+    if (window.__mdVirtualPreview) {
+      await window.__mdVirtualPreview.scrollHeading(index);
+    } else {
+      document.getElementById(`md-heading-${index}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  };
+
   const animateToTarget = () => {
     const target = yForSource(targetSource);
     const distance = target - window.scrollY;
@@ -160,15 +182,13 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   };
 
   window.__mdEditorSetSourcePosition = (value, smooth = true) => {
+    beginNavigation();
     const sourcePosition = Math.max(0, Number(value) || 0);
     targetSource = sourcePosition;
     suppressUntil = performance.now() + (smooth ? 600 : 180);
     window.name = `md-source:${sourcePosition}`;
     if (!smooth) {
-      if (animationFrame) {
-        window.cancelAnimationFrame(animationFrame);
-        animationFrame = 0;
-      }
+      cancelSourceAnimation();
       window.scrollTo(0, yForSource(sourcePosition));
     } else if (!animationFrame) {
       animationFrame = window.requestAnimationFrame(animateToTarget);
@@ -187,6 +207,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     suppressUntil = performance.now() + 300;
     const match = /^md-source:([0-9.]+)$/.exec(window.name);
     const saved = match ? Number(match[1]) : 0;
+    const restoreRevision = navigationRevision;
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         if (saved <= 0) window.scrollTo(0, 0);
@@ -197,7 +218,10 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
             const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
             window.ipc.postMessage(`md-ready:${height}:${window.innerHeight}:${document.body.getElementsByTagName('*').length}`);
             if (saved > 0) {
-              const restore = () => window.__mdEditorSetSourcePosition(saved, false);
+              const restore = () => {
+                if (restoreRevision !== navigationRevision) return;
+                window.__mdEditorSetSourcePosition(saved, false);
+              };
               if ('requestIdleCallback' in window) window.requestIdleCallback(restore);
               else window.setTimeout(restore, 0);
             }
@@ -298,34 +322,37 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     chunk.end = null;
   };
 
-  const load = async (chunk) => {
-    if (!chunk || chunk.loading || chunk.start) return;
-    chunk.loading = true;
-    try {
-      const chunkUrl = new URL(`/chunk/${chunk.index}?revision=${encodeURIComponent(revision)}`, location.origin);
-      const response = await fetch(chunkUrl, { cache: 'no-store' });
-      if (!response.ok) return;
-      const template = document.createElement('template');
-      template.innerHTML = await response.text();
-      const start = edge('start', chunk.index);
-      const end = edge('end', chunk.index);
-      const fragment = document.createDocumentFragment();
-      fragment.append(start, template.content, end);
-      chunk.placeholder.replaceWith(fragment);
-      chunk.placeholder = null;
-      chunk.start = start;
-      chunk.end = end;
-      if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      chunk.height = Math.max(1, end.offsetTop - start.offsetTop);
-      const saved = /^md-source:([0-9.]+)$/.exec(window.name || '');
-      if (saved) {
-        const source = Number(saved[1]);
-        if (source >= chunk.sourceStart && source < chunk.sourceEnd) window.scrollTo(0, yForSource(source));
+  const load = (chunk) => {
+    if (!chunk || chunk.start) return Promise.resolve();
+    if (chunk.loading) return chunk.loading;
+    chunk.loading = (async () => {
+      try {
+        const chunkUrl = new URL(`/chunk/${chunk.index}?revision=${encodeURIComponent(revision)}`, location.origin);
+        const response = await fetch(chunkUrl, { cache: 'no-store' });
+        if (!response.ok) return;
+        const template = document.createElement('template');
+        template.innerHTML = await response.text();
+        const start = edge('start', chunk.index);
+        const end = edge('end', chunk.index);
+        const fragment = document.createDocumentFragment();
+        fragment.append(start, template.content, end);
+        chunk.placeholder.replaceWith(fragment);
+        chunk.placeholder = null;
+        chunk.start = start;
+        chunk.end = end;
+        if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        chunk.height = Math.max(1, end.offsetTop - start.offsetTop);
+        const saved = /^md-source:([0-9.]+)$/.exec(window.name || '');
+        if (saved) {
+          const source = Number(saved[1]);
+          if (source >= chunk.sourceStart && source < chunk.sourceEnd) window.scrollTo(0, yForSource(source));
+        }
+      } finally {
+        chunk.loading = null;
       }
-    } finally {
-      chunk.loading = false;
-    }
+    })();
+    return chunk.loading;
   };
 
   const maintainWindow = () => {
@@ -646,9 +673,7 @@ impl BrowserPreview {
             return Err("阅读预览尚未就绪".to_string());
         };
         webview
-            .evaluate_script(&format!(
-                "window.__mdEditorSuppressScroll?.(700); if (window.__mdVirtualPreview) {{ window.__mdVirtualPreview.scrollHeading({index}); }} else {{ document.getElementById('md-heading-{index}')?.scrollIntoView({{ behavior: 'smooth', block: 'start' }}); }}"
-            ))
+            .evaluate_script(&format!("window.__mdEditorScrollHeading?.({index});"))
             .map_err(|error| format!("无法定位章节：{error}"))
     }
 }
@@ -1089,6 +1114,18 @@ fn rewrite_local_image_event<'a>(event: Event<'a>, base_directory: Option<&Path>
                 id,
             })
         }
+        Event::Html(fragment) => Event::Html(
+            crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
+                local_image_url(destination, base_directory)
+            })
+            .into(),
+        ),
+        Event::InlineHtml(fragment) => Event::InlineHtml(
+            crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
+                local_image_url(destination, base_directory)
+            })
+            .into(),
+        ),
         event => event,
     }
 }
@@ -1360,12 +1397,6 @@ ol:not(#footnotes), ul {
 ol:not(#footnotes) > li::marker {
     font-variant-numeric: tabular-nums;
 }
-body > h1, body > h2, body > h3, body > h4, body > h5, body > h6,
-body > p, body > blockquote, body > pre, body > ul, body > ol,
-body > table, body > hr, body > .mermaid-diagram {
-    content-visibility: auto;
-    contain-intrinsic-block-size: auto 96px;
-}
 html { scrollbar-width: none; }
 ::-webkit-scrollbar { width: 0; height: 0; }
 @media (max-width: 700px) {
@@ -1517,6 +1548,59 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_virtual_chunk_load_waits_for_the_inflight_request() {
+        assert!(
+            VIRTUAL_PREVIEW_SCRIPT.contains("if (chunk.loading) return chunk.loading;"),
+            "a directory jump must await a chunk already being loaded by viewport maintenance"
+        );
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("chunk.loading = (async () =>"));
+        assert!(!VIRTUAL_PREVIEW_SCRIPT.contains("chunk.loading || chunk.start"));
+    }
+
+    #[test]
+    fn heading_navigation_cancels_source_sync_animation_before_scrolling() {
+        assert!(
+            SCROLL_SYNC_SCRIPT.contains("window.__mdEditorScrollHeading = async (index) =>"),
+            "directory navigation needs one scroll owner that can stop source-sync animation"
+        );
+        let heading_scroll = SCROLL_SYNC_SCRIPT
+            .split("window.__mdEditorScrollHeading = async (index) =>")
+            .nth(1)
+            .expect("heading scroll implementation")
+            .split("};")
+            .next()
+            .expect("heading scroll body");
+        let cancel = heading_scroll
+            .find("cancelSourceAnimation();")
+            .expect("heading navigation must cancel the previous source animation");
+        let target = heading_scroll
+            .find("scrollHeading(index)")
+            .or_else(|| heading_scroll.find("scrollIntoView"))
+            .expect("heading navigation must still target the requested heading");
+        assert!(
+            cancel < target,
+            "cancellation must happen before heading scroll"
+        );
+    }
+
+    #[test]
+    fn heading_navigation_invalidates_deferred_initial_scroll_restoration() {
+        assert!(SCROLL_SYNC_SCRIPT.contains("let navigationRevision = 0;"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("const restoreRevision = navigationRevision;"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("navigationRevision += 1;"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("if (restoreRevision !== navigationRevision) return;"));
+    }
+
+    #[test]
+    fn heading_layout_does_not_use_approximate_offscreen_block_sizes() {
+        assert!(
+            !super::MARKDOWN_DOM_COMPATIBILITY.contains("content-visibility: auto"),
+            "approximate offscreen block sizes move a distant heading after scrollIntoView"
+        );
+        assert!(!super::MARKDOWN_DOM_COMPATIBILITY.contains("contain-intrinsic-block-size"));
+    }
+
+    #[test]
     fn browser_scroll_messages_distinguish_user_and_programmatic_updates() {
         assert_eq!(
             parse_source_message("md-source:user:625.5"),
@@ -1593,6 +1677,39 @@ mod tests {
         assert_eq!(response.headers()["content-type"], "image/jpeg");
         assert_eq!(response.body().as_ref(), bytes);
 
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn raw_html_img_relative_path_uses_local_resource_protocol() {
+        let base = std::env::temp_dir().join(format!(
+            "markdown-editor-html-image-test-{}",
+            std::process::id()
+        ));
+        let image_dir = base.join("无人机动物检测讲解_assets");
+        std::fs::create_dir_all(&image_dir).unwrap();
+        let image_path = image_dir.join("image7.png");
+        std::fs::write(&image_path, b"test-png-payload").unwrap();
+
+        let expected_url =
+            local_image_url("./无人机动物检测讲解_assets/image7.png", Some(&base)).unwrap();
+        let html = render_document(
+            r#"<img src="./无人机动物检测讲解_assets/image7.png" alt="从无人机原始 JPG 中裁出的羊群正样本" width="720">"#,
+            "img { width: 100%; }",
+            Some(&base),
+            None,
+        );
+
+        assert!(
+            html.contains(&format!(r#"src="{expected_url}""#)),
+            "raw HTML image should use the local resource protocol: {html}"
+        );
+        assert!(html.contains(r#"width="720""#));
+        assert!(
+            html.contains(r#"style="width:720px;max-width:100%""#),
+            "width attribute must outrank the theme's img width rule: {html}"
+        );
+        assert!(html.contains("从无人机原始 JPG 中裁出的羊群正样本"));
         std::fs::remove_dir_all(base).unwrap();
     }
 

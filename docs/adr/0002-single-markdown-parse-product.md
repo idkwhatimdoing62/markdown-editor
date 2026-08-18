@@ -39,8 +39,8 @@ SpannedEvent = {
 消费者规则：
 
 1. `Parser::new_ext` 只能出现在 `markdown.rs`；
-2. `web_preview.rs` 从 `ParsedDocument.events` 克隆事件，添加标题 ID、源码锚点和本地图片协议；
-3. `export.rs` 从同一事件流生成 HTML，按输出类型处理本地图片；
+2. `web_preview.rs` 从 `ParsedDocument.events` 克隆事件，添加标题 ID、源码锚点和本地图片协议；Markdown 图片事件与原生 HTML `img[src]` 使用同一本地资源边界；
+3. `export.rs` 从同一事件流生成 HTML，按输出类型处理 Markdown 图片和原生 HTML 图片；
 4. `preview.rs`、目录和纯文本读取 `ParsedDocument.blocks`；
 5. 活动标签持有 `ParsedDocument`，文本变化时整份替换；
 6. 新语法必须通过事件流与内部模型的结构对照测试。
@@ -63,6 +63,7 @@ SpannedEvent = {
 - 表格；
 - 围栏代码块和语言；
 - 图片；
+- 原生 HTML `<img>` 的相对本地路径、保留属性，以及数值型 `width` 在主题 CSS 下仍然生效；
 - 链接；
 - 加粗。
 

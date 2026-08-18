@@ -150,40 +150,56 @@ fn rewrite_export_image_event<'a>(
     images: &mut BTreeMap<String, printpdf::Base64OrRaw>,
     image_index: &mut usize,
 ) -> Event<'a> {
-    let Event::Start(Tag::Image {
-        link_type,
-        dest_url,
-        title,
-        id,
-    }) = event
-    else {
-        return event;
-    };
-    let Some(path) = local_image_path(dest_url.as_ref(), base_directory) else {
-        return Event::Start(Tag::Image {
+    match event {
+        Event::Start(Tag::Image {
             link_type,
             dest_url,
             title,
             id,
-        });
-    };
-    let Some(content_type) = image_content_type(&path) else {
-        return Event::Start(Tag::Image {
-            link_type,
-            dest_url,
-            title,
-            id,
-        });
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Event::Start(Tag::Image {
-            link_type,
-            dest_url,
-            title,
-            id,
-        });
-    };
-    let destination = match mode {
+        }) => {
+            let destination = export_image_destination(
+                dest_url.as_ref(),
+                base_directory,
+                mode,
+                images,
+                image_index,
+            )
+            .map(CowStr::from)
+            .unwrap_or(dest_url);
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url: destination,
+                title,
+                id,
+            })
+        }
+        Event::Html(fragment) => Event::Html(
+            crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
+                export_image_destination(destination, base_directory, mode, images, image_index)
+            })
+            .into(),
+        ),
+        Event::InlineHtml(fragment) => Event::InlineHtml(
+            crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
+                export_image_destination(destination, base_directory, mode, images, image_index)
+            })
+            .into(),
+        ),
+        event => event,
+    }
+}
+
+fn export_image_destination(
+    destination: &str,
+    base_directory: Option<&Path>,
+    mode: ImageMode,
+    images: &mut BTreeMap<String, printpdf::Base64OrRaw>,
+    image_index: &mut usize,
+) -> Option<String> {
+    let path = local_image_path(destination, base_directory)?;
+    let content_type = image_content_type(&path)?;
+    let bytes = std::fs::read(path).ok()?;
+    Some(match mode {
         ImageMode::StandaloneHtml => {
             format!("data:{content_type};base64,{}", BASE64.encode(bytes))
         }
@@ -193,12 +209,6 @@ fn rewrite_export_image_event<'a>(
             images.insert(key.clone(), printpdf::Base64OrRaw::Raw(bytes));
             key
         }
-    };
-    Event::Start(Tag::Image {
-        link_type,
-        dest_url: CowStr::from(destination),
-        title,
-        id,
     })
 }
 
@@ -526,6 +536,32 @@ mod tests {
         assert!(html.contains("font-family:'Markdown Editor Mono'"));
         assert!(html.contains("src=\"data:image/png;base64,"));
         assert!(!html.contains("src=\"图标.png\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn html导出内嵌原生img标签的相对本地图片() {
+        let dir = std::env::temp_dir().join(format!(
+            "md_editor_raw_html_image_test_{}",
+            std::process::id()
+        ));
+        let assets = dir.join("无人机动物检测讲解_assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(
+            assets.join("image7.png"),
+            include_bytes!("../assets/app-icon-256.png"),
+        )
+        .unwrap();
+        let document = parsed(
+            r#"<img src="./无人机动物检测讲解_assets/image7.png" alt="羊群正样本" width="720">"#,
+        );
+
+        let html = render_styled_html(&document, test_options(Some(&dir)));
+
+        assert!(html.contains("src=\"data:image/png;base64,"));
+        assert!(html.contains("alt=\"羊群正样本\""));
+        assert!(html.contains("width=\"720\""));
+        assert!(!html.contains("./无人机动物检测讲解_assets/image7.png"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

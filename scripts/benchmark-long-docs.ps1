@@ -18,7 +18,9 @@ New-Item -ItemType Directory -Force -Path $corpus, $coreDirectory, $webViewDirec
 Push-Location $repo
 try {
     cargo build --release --features benchmark --bin markdown-benchmark
+    if ($LASTEXITCODE -ne 0) { throw "构建核心基准程序失败" }
     cargo build --release --bin markdown-editor
+    if ($LASTEXITCODE -ne 0) { throw "构建 WebView 基准程序失败" }
 
     $benchmarkExe = Join-Path $repo "target/release/markdown-benchmark.exe"
     $appExe = Join-Path $repo "target/release/markdown-editor.exe"

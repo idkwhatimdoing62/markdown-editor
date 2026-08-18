@@ -3,16 +3,19 @@
 mod export;
 #[cfg(target_os = "windows")]
 mod file_association;
+mod html_image;
 mod io;
 mod markdown;
 mod preview;
+mod single_instance;
+mod storage;
 mod theme;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod web_preview;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc::Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -30,6 +33,22 @@ const EXTERNAL_STABLE_DELAY: f64 = 0.45;
 
 fn main() -> eframe::Result {
     let launch = LaunchOptions::from_env();
+    let instance_requests = if launch.is_benchmark() {
+        None
+    } else {
+        match single_instance::acquire(launch.open_paths.clone()) {
+            single_instance::Acquisition::Primary(receiver) => Some(receiver),
+            single_instance::Acquisition::Forwarded => return Ok(()),
+            single_instance::Acquisition::Unavailable(error) => {
+                rfd::MessageDialog::new()
+                    .set_title("Markdown 编辑器与预览器")
+                    .set_description(&error)
+                    .set_level(rfd::MessageLevel::Error)
+                    .show();
+                return Ok(());
+            }
+        }
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
@@ -43,6 +62,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             let mut app = MdEditorApp::new(cc);
+            app.instance_requests = instance_requests;
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some(report_path) = launch.benchmark_report {
                 app.view_mode = ViewMode::Preview;
@@ -52,7 +72,7 @@ fn main() -> eframe::Result {
                     completed: false,
                 });
             }
-            if let Some(path) = launch.open_path {
+            for path in launch.open_paths {
                 app.open_path(&path);
             }
             Ok(Box::new(app))
@@ -61,14 +81,14 @@ fn main() -> eframe::Result {
 }
 
 struct LaunchOptions {
-    open_path: Option<PathBuf>,
+    open_paths: Vec<PathBuf>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     benchmark_report: Option<PathBuf>,
 }
 
 impl LaunchOptions {
     fn from_env() -> Self {
-        let mut open_path = None;
+        let mut open_paths = Vec::new();
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut benchmark_report = None;
         let mut args = std::env::args().skip(1);
@@ -78,14 +98,33 @@ impl LaunchOptions {
                 benchmark_report = args.next().map(PathBuf::from);
                 continue;
             }
-            if !argument.starts_with('-') && open_path.is_none() {
-                open_path = Some(PathBuf::from(argument));
+            if !argument.starts_with('-') {
+                let path = PathBuf::from(argument);
+                let absolute = if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir()
+                        .map(|directory| directory.join(&path))
+                        .unwrap_or(path)
+                };
+                open_paths.push(absolute.canonicalize().unwrap_or(absolute));
             }
         }
         Self {
-            open_path,
+            open_paths,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             benchmark_report,
+        }
+    }
+
+    fn is_benchmark(&self) -> bool {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            self.benchmark_report.is_some()
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            false
         }
     }
 }
@@ -133,6 +172,7 @@ struct DocumentTab {
     last_edit_time: f64,
     prev_editor_ratio: f32,
     prev_preview_ratio: f32,
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     last_caret_line: usize,
 }
 
@@ -195,6 +235,7 @@ impl DocumentTab {
             last_edit_time: f64::INFINITY,
             prev_editor_ratio: 0.0,
             prev_preview_ratio: 0.0,
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             last_caret_line: 0,
         }
     }
@@ -215,6 +256,7 @@ impl DocumentTab {
             last_edit_time: f64::INFINITY,
             prev_editor_ratio: 0.0,
             prev_preview_ratio: 0.0,
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             last_caret_line: 0,
         }
     }
@@ -270,6 +312,65 @@ fn apply_external_bytes(
     tab.conflict = None;
     tab.status_note = format!("已自动加载外部修改 {}", clock_time());
     Ok(ExternalChangeResult::Reloaded)
+}
+
+fn restore_draft_tab(draft: io::DraftTab) -> DocumentTab {
+    let stored_snapshot = draft.disk_snapshot().unwrap_or_default();
+    let (disk_snapshot, status, conflict, status_note) = match draft.path.as_ref() {
+        Some(path) => match io::read_snapshot_checked(path) {
+            Ok(current) if snapshot_matches_text(&current, &draft.text) => (
+                current,
+                DocStatus::Saved,
+                None,
+                "草稿内容已与磁盘一致".to_string(),
+            ),
+            Ok(current) if current == stored_snapshot => (
+                stored_snapshot,
+                DocStatus::Modified,
+                None,
+                "已恢复未保存草稿".to_string(),
+            ),
+            Ok(_) => (
+                stored_snapshot,
+                DocStatus::Conflict,
+                Some(path.clone()),
+                "恢复草稿时检测到磁盘文件已变化".to_string(),
+            ),
+            Err(error) => (
+                stored_snapshot,
+                DocStatus::Modified,
+                None,
+                format!(
+                    "已恢复草稿；原文件暂时无法读取：{}",
+                    describe_read_error(&error)
+                ),
+            ),
+        },
+        None => (
+            stored_snapshot,
+            DocStatus::Modified,
+            None,
+            "已恢复未命名草稿".to_string(),
+        ),
+    };
+    let document = markdown::parse_document(&draft.text);
+    DocumentTab {
+        id: draft.id,
+        text: draft.text,
+        path: draft.path,
+        disk_snapshot,
+        status,
+        document,
+        document_revision: 1,
+        status_note,
+        conflict,
+        draft_last_write: 0.0,
+        last_edit_time: f64::NEG_INFINITY,
+        prev_editor_ratio: 0.0,
+        prev_preview_ratio: 0.0,
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        last_caret_line: 0,
+    }
 }
 
 fn document_label(id: u64, path: Option<&PathBuf>, dirty: bool) -> String {
@@ -573,21 +674,8 @@ struct MdEditorApp {
     active_tab: usize,
     next_tab_id: u64,
     pending_close: Option<usize>,
-    text: String,
-    path: Option<PathBuf>,
-    disk_snapshot: Vec<u8>,
-    status: DocStatus,
-    document: ParsedDocument,
-    document_revision: u64,
-    status_note: String,
-    conflict: Option<PathBuf>,
-    recovery: Option<String>,
+    recovery: Option<io::DraftSession>,
     dark: bool,
-    draft_last_write: f64,
-    last_edit_time: f64,
-    prev_editor_ratio: f32,
-    prev_preview_ratio: f32,
-    last_caret_line: usize,
     editor_focused: bool,
     view_mode: ViewMode,
     focus_mode: bool,
@@ -599,12 +687,27 @@ struct MdEditorApp {
     last_external_poll: f64,
     observed_file_stamps: HashMap<PathBuf, io::FileStamp>,
     pending_external_changes: HashMap<PathBuf, PendingExternalChange>,
+    instance_requests: Option<Receiver<single_instance::OpenRequest>>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_preview: web_preview::BrowserPreview,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     benchmark_probe: Option<BenchmarkProbe>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_document_cache: Option<BrowserDocumentCache>,
+}
+
+impl std::ops::Deref for MdEditorApp {
+    type Target = DocumentTab;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tabs[self.active_tab]
+    }
+}
+
+impl std::ops::DerefMut for MdEditorApp {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tabs[self.active_tab]
+    }
 }
 
 impl MdEditorApp {
@@ -625,11 +728,8 @@ impl MdEditorApp {
         let recovery = io::load_draft();
         let sample = "# Markdown 编辑器与预览器\n\n左栏编辑，右栏实时预览。\n\n- 支持标题、列表、表格、代码块\n- Ctrl+S 保存，Ctrl+O 打开\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n## 功能\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n| 预览 | 可用 |\n"
             .replace("Ctrl", PRIMARY_SHORTCUT);
-        let mut app = Self {
-            tabs: Vec::new(),
-            active_tab: 0,
-            next_tab_id: 2,
-            pending_close: None,
+        let initial_tab = DocumentTab {
+            id: 1,
             text: sample.to_string(),
             path: None,
             disk_snapshot: Vec::new(),
@@ -638,13 +738,20 @@ impl MdEditorApp {
             document_revision: 1,
             status_note: String::new(),
             conflict: None,
-            recovery,
-            dark: false,
             draft_last_write: 0.0,
             last_edit_time: f64::INFINITY,
             prev_editor_ratio: 0.0,
             prev_preview_ratio: 0.0,
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             last_caret_line: 0,
+        };
+        Self {
+            tabs: vec![initial_tab],
+            active_tab: 0,
+            next_tab_id: 2,
+            pending_close: None,
+            recovery,
+            dark: false,
             editor_focused: false,
             view_mode: ViewMode::Write,
             focus_mode: false,
@@ -656,62 +763,21 @@ impl MdEditorApp {
             last_external_poll: f64::NEG_INFINITY,
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
+            instance_requests: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             benchmark_probe: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_document_cache: None,
-        };
-        app.tabs.push(app.capture_active_tab(1));
-        app
-    }
-
-    fn capture_active_tab(&self, id: u64) -> DocumentTab {
-        DocumentTab {
-            id,
-            text: self.text.clone(),
-            path: self.path.clone(),
-            disk_snapshot: self.disk_snapshot.clone(),
-            status: self.status.clone(),
-            document: self.document.clone(),
-            document_revision: self.document_revision,
-            status_note: self.status_note.clone(),
-            conflict: self.conflict.clone(),
-            draft_last_write: self.draft_last_write,
-            last_edit_time: self.last_edit_time,
-            prev_editor_ratio: self.prev_editor_ratio,
-            prev_preview_ratio: self.prev_preview_ratio,
-            last_caret_line: self.last_caret_line,
         }
     }
 
-    fn persist_active_tab(&mut self) {
-        let Some(tab) = self.tabs.get(self.active_tab) else {
+    fn activate_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
             return;
-        };
-        let state = self.capture_active_tab(tab.id);
-        self.tabs[self.active_tab] = state;
-    }
-
-    fn load_tab_state(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get(index).cloned() else {
-            return;
-        };
+        }
         self.active_tab = index;
-        self.text = tab.text;
-        self.path = tab.path;
-        self.disk_snapshot = tab.disk_snapshot;
-        self.status = tab.status;
-        self.document = tab.document;
-        self.document_revision = tab.document_revision;
-        self.status_note = tab.status_note;
-        self.conflict = tab.conflict;
-        self.draft_last_write = tab.draft_last_write;
-        self.last_edit_time = tab.last_edit_time;
-        self.prev_editor_ratio = tab.prev_editor_ratio;
-        self.prev_preview_ratio = tab.prev_preview_ratio;
-        self.last_caret_line = tab.last_caret_line;
         self.editor_focused = false;
     }
 
@@ -719,14 +785,12 @@ impl MdEditorApp {
         if self.pending_close.is_some() || index == self.active_tab || index >= self.tabs.len() {
             return;
         }
-        self.persist_active_tab();
-        self.load_tab_state(index);
+        self.activate_tab(index);
     }
 
     fn push_tab(&mut self, tab: DocumentTab) {
-        self.persist_active_tab();
         self.tabs.push(tab);
-        self.load_tab_state(self.tabs.len() - 1);
+        self.activate_tab(self.tabs.len() - 1);
     }
 
     fn new_tab(&mut self) {
@@ -745,9 +809,6 @@ impl MdEditorApp {
     }
 
     fn is_tab_dirty(&self, index: usize) -> bool {
-        if index == self.active_tab {
-            return self.is_active_dirty();
-        }
         let tab = &self.tabs[index];
         document_is_dirty(
             tab.path.as_ref(),
@@ -758,13 +819,8 @@ impl MdEditorApp {
     }
 
     fn tab_title(&self, index: usize) -> String {
-        let (id, path) = if index == self.active_tab {
-            (self.tabs[index].id, &self.path)
-        } else {
-            let tab = &self.tabs[index];
-            (tab.id, &tab.path)
-        };
-        document_label(id, path.as_ref(), false)
+        let tab = &self.tabs[index];
+        document_label(tab.id, tab.path.as_ref(), false)
     }
 
     fn request_close_tab(&mut self, index: usize) {
@@ -789,7 +845,6 @@ impl MdEditorApp {
         if index >= self.tabs.len() {
             return;
         }
-        self.persist_active_tab();
         let old_active = self.active_tab;
         self.tabs.remove(index);
         self.pending_close = None;
@@ -797,7 +852,7 @@ impl MdEditorApp {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
             self.tabs.push(DocumentTab::blank(id));
-            self.load_tab_state(0);
+            self.activate_tab(0);
         } else {
             let new_active = if index < old_active {
                 old_active - 1
@@ -806,8 +861,9 @@ impl MdEditorApp {
             } else {
                 old_active
             };
-            self.load_tab_state(new_active);
+            self.activate_tab(new_active);
         }
+        let _ = self.persist_draft_session();
     }
 
     fn finish_pending_close_if_saved(&mut self) {
@@ -872,6 +928,9 @@ impl MdEditorApp {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn finish_benchmark_probe(&mut self, ready: web_preview::WebViewReady) {
+        let source_bytes = self.text.len();
+        let block_count = self.document.blocks().len();
+        let event_count = self.document.events().len();
         let Some(probe) = &mut self.benchmark_probe else {
             return;
         };
@@ -881,9 +940,9 @@ impl MdEditorApp {
         let report = serde_json::json!({
             "schema_version": 1,
             "pid": std::process::id(),
-            "source_bytes": self.text.len(),
-            "blocks": self.document.blocks().len(),
-            "events": self.document.events().len(),
+            "source_bytes": source_bytes,
+            "blocks": block_count,
+            "events": event_count,
             "startup_to_webview_ready_ms": probe.started.elapsed().as_secs_f64() * 1000.0,
             "content_height_css_px": ready.content_height,
             "viewport_height_css_px": ready.viewport_height,
@@ -1010,20 +1069,17 @@ impl MdEditorApp {
             return;
         }
         self.last_external_poll = now;
+        let mut draft_state_changed = false;
 
         let active_path = self.path.clone();
         if let Some(path) = active_path {
             let snapshot = self.disk_snapshot.clone();
             match self.probe_external_change(&path, &snapshot, now) {
                 ExternalProbe::Stable(bytes) => {
-                    let id = self.tabs[self.active_tab].id;
-                    let mut tab = self.capture_active_tab(id);
-                    match apply_external_bytes(&mut tab, bytes) {
+                    let active_index = self.active_tab;
+                    match apply_external_bytes(&mut self.tabs[active_index], bytes) {
                         Ok(ExternalChangeResult::Unchanged) => {}
-                        Ok(_) => {
-                            self.tabs[self.active_tab] = tab;
-                            self.load_tab_state(self.active_tab);
-                        }
+                        Ok(_) => draft_state_changed = true,
                         Err(error) => {
                             self.status_note = format!(
                                 "检测到外部修改，但无法加载：{}",
@@ -1052,11 +1108,15 @@ impl MdEditorApp {
             let snapshot = self.tabs[index].disk_snapshot.clone();
             match self.probe_external_change(&path, &snapshot, now) {
                 ExternalProbe::Stable(bytes) => {
-                    if let Err(error) = apply_external_bytes(&mut self.tabs[index], bytes) {
-                        self.tabs[index].status_note = format!(
-                            "检测到外部修改，但无法加载：{}",
-                            describe_read_error(&error)
-                        );
+                    match apply_external_bytes(&mut self.tabs[index], bytes) {
+                        Ok(ExternalChangeResult::Unchanged) => {}
+                        Ok(_) => draft_state_changed = true,
+                        Err(error) => {
+                            self.tabs[index].status_note = format!(
+                                "检测到外部修改，但无法加载：{}",
+                                describe_read_error(&error)
+                            );
+                        }
                     }
                 }
                 ExternalProbe::Missing(error) => {
@@ -1065,13 +1125,90 @@ impl MdEditorApp {
                 ExternalProbe::Waiting => {}
             }
         }
+        if draft_state_changed {
+            let _ = self.persist_draft_session();
+        }
+    }
+
+    fn draft_session(&self) -> Option<io::DraftSession> {
+        let drafts = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                document_is_dirty(
+                    tab.path.as_ref(),
+                    &tab.text,
+                    &tab.disk_snapshot,
+                    &tab.status,
+                ) && (!tab.text.is_empty() || tab.path.is_some())
+            })
+            .map(|tab| {
+                io::DraftTab::new(
+                    tab.id,
+                    tab.path.clone(),
+                    tab.text.clone(),
+                    &tab.disk_snapshot,
+                )
+            })
+            .collect::<Vec<_>>();
+        if drafts.is_empty() {
+            return None;
+        }
+        let current_id = self.tabs[self.active_tab].id;
+        let active_tab_id = drafts
+            .iter()
+            .any(|draft| draft.id == current_id)
+            .then_some(current_id)
+            .unwrap_or(drafts[0].id);
+        Some(io::DraftSession::new(active_tab_id, drafts))
+    }
+
+    fn persist_draft_session(&self) -> std::io::Result<()> {
+        if let Some(session) = self.draft_session() {
+            io::save_draft(&session)
+        } else {
+            io::clear_draft();
+            Ok(())
+        }
     }
 
     fn autosave_draft(&mut self, now: f64) {
-        let dirty = !matches!(self.status, DocStatus::Saved) && !self.text.is_empty();
-        if dirty && now - self.last_edit_time > 30.0 && now - self.draft_last_write > 30.0 {
-            if io::save_draft(&self.text).is_ok() {
-                self.draft_last_write = now;
+        let dirty_indices = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                (document_is_dirty(
+                    tab.path.as_ref(),
+                    &tab.text,
+                    &tab.disk_snapshot,
+                    &tab.status,
+                ) && (!tab.text.is_empty() || tab.path.is_some()))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if dirty_indices.is_empty() {
+            return;
+        }
+        let all_idle = dirty_indices.iter().all(|&index| {
+            let edited = self.tabs[index].last_edit_time;
+            edited == f64::NEG_INFINITY || (edited.is_finite() && now - edited > 30.0)
+        });
+        let write_due = dirty_indices
+            .iter()
+            .any(|&index| now - self.tabs[index].draft_last_write > 30.0);
+        if all_idle && write_due {
+            if let Some(session) = self.draft_session() {
+                match io::save_draft(&session) {
+                    Ok(()) => {
+                        for index in dirty_indices {
+                            self.tabs[index].draft_last_write = now;
+                        }
+                    }
+                    Err(error) => {
+                        self.status_note = format!("草稿会话保存失败：{error}");
+                    }
+                }
             }
         }
     }
@@ -1165,21 +1302,43 @@ impl MdEditorApp {
 
         self.status_note = match (opened, ignored) {
             (0, _) => "未找到可打开的 Markdown 或文本文件".to_string(),
-            (opened, 0) => format!("已拖入打开 {opened} 个文件"),
+            (opened, 0) => format!("已打开 {opened} 个文件"),
             (opened, ignored) => {
-                format!("已拖入打开 {opened} 个文件，忽略 {ignored} 个不支持的项目")
+                format!("已打开 {opened} 个文件，忽略 {ignored} 个不支持的项目")
             }
         };
     }
 
+    fn apply_instance_request(&mut self, request: single_instance::OpenRequest) -> bool {
+        self.open_dropped_paths(request.paths);
+        request.focus_window
+    }
+
+    fn handle_instance_requests(&mut self, ctx: &egui::Context) {
+        let requests = self
+            .instance_requests
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if requests.is_empty() {
+            return;
+        }
+        for request in requests {
+            if self.apply_instance_request(request) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+    }
+
     fn open_path(&mut self, path: &PathBuf) {
-        self.persist_active_tab();
         if let Some(index) = self
             .tabs
             .iter()
             .position(|tab| tab.path.as_ref() == Some(path))
         {
-            self.load_tab_state(index);
+            self.activate_tab(index);
             self.status_note = format!("已切换到 {}", path.display());
             return;
         }
@@ -1190,7 +1349,6 @@ impl MdEditorApp {
                 self.next_tab_id += 1;
                 self.push_tab(DocumentTab::from_file(id, path.clone(), text, snapshot));
                 self.status_note = format!("已打开 {}", path.display());
-                io::clear_draft();
             }
             Err(e) => {
                 self.status =
@@ -1211,7 +1369,9 @@ impl MdEditorApp {
                 self.path = Some(path);
                 self.status = DocStatus::Saved;
                 self.status_note = format!("已保存 {}", clock_time());
-                io::clear_draft();
+                if let Err(error) = self.persist_draft_session() {
+                    self.status_note = format!("文档已保存；草稿会话更新失败：{error}");
+                }
             }
             Err(io::SaveError::ExternalModified) => {
                 self.conflict = Some(path);
@@ -1232,8 +1392,11 @@ impl MdEditorApp {
                 self.disk_snapshot = bytes;
                 self.path = Some(path.clone());
                 self.status = DocStatus::Saved;
+                self.conflict = None;
                 self.status_note = format!("已保存 {}", clock_time());
-                io::clear_draft();
+                if let Err(error) = self.persist_draft_session() {
+                    self.status_note = format!("文档已保存；草稿会话更新失败：{error}");
+                }
                 true
             }
             Err(e) => {
@@ -1251,7 +1414,9 @@ impl MdEditorApp {
                     self.path = Some(path);
                     self.status = DocStatus::Saved;
                     self.status_note = "已覆盖保存".to_string();
-                    io::clear_draft();
+                    if let Err(error) = self.persist_draft_session() {
+                        self.status_note = format!("文档已保存；草稿会话更新失败：{error}");
+                    }
                     self.finish_pending_close_if_saved();
                 }
                 Err(e) => self.status = DocStatus::SaveFailed(format!("保存失败：{}", e)),
@@ -1277,7 +1442,9 @@ impl MdEditorApp {
                     self.document_revision = self.document_revision.wrapping_add(1);
                     self.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
-                    io::clear_draft();
+                    if let Err(error) = self.persist_draft_session() {
+                        self.status_note = format!("磁盘内容已载入；草稿会话更新失败：{error}");
+                    }
                     self.finish_pending_close_if_saved();
                 }
                 Err(e) => {
@@ -1881,26 +2048,59 @@ impl MdEditorApp {
             });
     }
 
+    fn restore_draft_session(&mut self, session: io::DraftSession) {
+        let active_tab_id = session.active_tab_id;
+        let restored = session
+            .tabs
+            .into_iter()
+            .map(restore_draft_tab)
+            .collect::<Vec<_>>();
+        if restored.is_empty() {
+            io::clear_draft();
+            return;
+        }
+        let active_index = restored
+            .iter()
+            .position(|tab| tab.id == active_tab_id)
+            .unwrap_or(0);
+        self.next_tab_id = restored
+            .iter()
+            .map(|tab| tab.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.tabs = restored;
+        self.activate_tab(active_index);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            self.browser_document_cache = None;
+        }
+        if let Err(error) = self.persist_draft_session() {
+            self.status_note = format!("草稿已恢复；草稿会话更新失败：{error}");
+        }
+    }
+
     fn recovery_window(&mut self, ctx: &egui::Context) {
         if self.recovery.is_none() {
             return;
         }
+        let draft_count = self
+            .recovery
+            .as_ref()
+            .map_or(0, |session| session.tabs.len());
         egui::Window::new("发现未保存草稿")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("上次退出时存在未保存的内容，是否恢复？");
+                ui.label(format!(
+                    "上次退出时有 {draft_count} 个标签包含未保存内容，是否逐项恢复？"
+                ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("恢复草稿").clicked() {
-                        if let Some(draft) = self.recovery.take() {
-                            self.text = draft;
-                            self.document = markdown::parse_document(&self.text);
-                            self.document_revision = self.document_revision.wrapping_add(1);
-                            self.refresh_status();
-                            self.status_note = "已恢复草稿".to_string();
-                            io::clear_draft();
+                        if let Some(session) = self.recovery.take() {
+                            self.restore_draft_session(session);
                         }
                     }
                     if ui.button("放弃草稿").clicked() {
@@ -1966,6 +2166,7 @@ impl eframe::App for MdEditorApp {
         });
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         dropped_paths.extend(self.browser_preview.take_dropped_paths());
+        self.handle_instance_requests(&ctx);
         self.open_dropped_paths(dropped_paths);
 
         self.poll_external_changes(&ctx, now);
@@ -2028,6 +2229,9 @@ impl eframe::App for MdEditorApp {
 
         match self.view_mode {
             ViewMode::Write => {
+                let active_index = self.active_tab;
+                let body_font_size = self.body_font_size;
+                let (tabs, editor_focused) = (&mut self.tabs, &mut self.editor_focused);
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::new()
@@ -2037,9 +2241,9 @@ impl eframe::App for MdEditorApp {
                     .show(ui, |ui| {
                         show_centered_editor(
                             ui,
-                            &mut self.text,
-                            &mut self.editor_focused,
-                            self.body_font_size,
+                            &mut tabs[active_index].text,
+                            editor_focused,
+                            body_font_size,
                             &doc_theme,
                         );
                     });
@@ -2088,6 +2292,9 @@ impl eframe::App for MdEditorApp {
                     });
             }
             ViewMode::Split => {
+                let active_index = self.active_tab;
+                let body_font_size = self.body_font_size;
+                let (tabs, editor_focused) = (&mut self.tabs, &mut self.editor_focused);
                 let editor_out = egui::Panel::left("editor_panel")
                     .resizable(true)
                     .default_size(600.0)
@@ -2105,9 +2312,9 @@ impl eframe::App for MdEditorApp {
                     .show(ui, |ui| {
                         show_editor_scroll(
                             ui,
-                            &mut self.text,
-                            &mut self.editor_focused,
-                            self.body_font_size,
+                            &mut tabs[active_index].text,
+                            editor_focused,
+                            body_font_size,
                         )
                     });
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2476,6 +2683,35 @@ fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
 mod app_tests {
     use super::*;
 
+    fn app_with_two_tabs() -> MdEditorApp {
+        MdEditorApp {
+            tabs: vec![DocumentTab::blank(1), DocumentTab::blank(2)],
+            active_tab: 0,
+            next_tab_id: 3,
+            pending_close: None,
+            recovery: None,
+            dark: false,
+            editor_focused: false,
+            view_mode: ViewMode::Write,
+            focus_mode: false,
+            show_status: true,
+            body_font_size: 15.0,
+            theme_package: None,
+            theme_revision: 1,
+            auto_reload_external: true,
+            last_external_poll: f64::NEG_INFINITY,
+            observed_file_stamps: HashMap::new(),
+            pending_external_changes: HashMap::new(),
+            instance_requests: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            browser_preview: web_preview::BrowserPreview::default(),
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            benchmark_probe: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            browser_document_cache: None,
+        }
+    }
+
     #[test]
     fn 内置应用图标尺寸与透明通道有效() {
         let icon = app_icon();
@@ -2520,6 +2756,85 @@ mod app_tests {
             &tab.status,
         ));
         assert_eq!(document_label(tab.id, Some(&path), true), "notes.md  •");
+    }
+
+    #[test]
+    fn 界面直接修改活动标签且切换无需写回() {
+        let mut app = app_with_two_tabs();
+        app.text = "第一个标签".to_string();
+        app.activate_tab(1);
+        app.text = "第二个标签".to_string();
+        assert_eq!(app.tabs[0].text, "第一个标签");
+        assert_eq!(app.tabs[1].text, "第二个标签");
+        app.activate_tab(0);
+        assert_eq!(app.text, "第一个标签");
+    }
+
+    #[test]
+    fn 草稿会话收集全部未保存标签并保留活动标签() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].text = "草稿一".to_string();
+        app.tabs[1].text = "草稿二".to_string();
+        let mut cleared = DocumentTab::from_file(
+            3,
+            PathBuf::from("cleared.md"),
+            "原文".to_string(),
+            "原文".as_bytes().to_vec(),
+        );
+        cleared.text.clear();
+        app.tabs.push(cleared);
+        app.activate_tab(1);
+        let session = app.draft_session().expect("全部未保存标签都应进入草稿会话");
+        assert_eq!(session.active_tab_id, 2);
+        assert_eq!(session.tabs.len(), 3);
+        assert_eq!(session.tabs[0].text, "草稿一");
+        assert_eq!(session.tabs[1].text, "草稿二");
+        assert_eq!(session.tabs[2].path, Some(PathBuf::from("cleared.md")));
+        assert!(session.tabs[2].text.is_empty());
+    }
+
+    #[test]
+    fn 恢复草稿时磁盘已变化则保留正文并标记冲突() {
+        let path = std::env::temp_dir().join(format!(
+            "markdown-editor-draft-conflict-test-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, "Agent 新内容").unwrap();
+        let draft = io::DraftTab::new(
+            7,
+            Some(path.clone()),
+            "本地未保存内容".to_string(),
+            "原磁盘内容".as_bytes(),
+        );
+        let tab = restore_draft_tab(draft);
+        assert_eq!(tab.text, "本地未保存内容");
+        assert_eq!(tab.status, DocStatus::Conflict);
+        assert_eq!(tab.conflict, Some(path.clone()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Agent 新内容");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 后续进程传入路径会在现有窗口创建并激活标签() {
+        let path = std::env::temp_dir().join(format!(
+            "markdown-editor-single-instance-test-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, "跨进程打开内容").unwrap();
+        let mut app = app_with_two_tabs();
+
+        let should_focus =
+            app.apply_instance_request(single_instance::OpenRequest::new(vec![path.clone()]));
+
+        assert!(should_focus);
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active_tab, 2);
+        assert_eq!(app.path.as_ref(), Some(&path));
+        assert_eq!(app.text, "跨进程打开内容");
+
+        app.apply_instance_request(single_instance::OpenRequest::new(vec![path.clone()]));
+        assert_eq!(app.tabs.len(), 3, "相同路径应切换标签，不能重复打开");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -6,6 +6,8 @@ use std::{fs::File, io::Read, path::Path};
 use egui::Color32;
 use serde::{Deserialize, Serialize};
 
+use crate::storage;
+
 pub const BUILT_IN_SSPAI_CSS: &str = include_str!("../assets/sspai.css");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -479,22 +481,105 @@ impl ThemeSpec {
     }
 }
 
+const THEME_STATE_LIMIT: u64 = 20 * 1024 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedThemeEnvelope {
+    schema_version: u32,
+    saved_at_unix: u64,
+    package: ThemePackage,
+}
+
 pub fn saved_theme_path() -> PathBuf {
+    storage::config_dir().join("themes").join("current.json")
+}
+
+fn legacy_theme_path() -> PathBuf {
     std::env::temp_dir().join("markdown-editor-theme.json")
 }
 
+fn validate_saved_package(package: ThemePackage) -> Option<ThemePackage> {
+    if package.name.trim().is_empty() || package.spec(false).is_err() || package.spec(true).is_err()
+    {
+        None
+    } else {
+        Some(package)
+    }
+}
+
+fn load_saved_at(path: &Path) -> Option<ThemePackage> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() == 0 || metadata.len() > THEME_STATE_LIMIT {
+        storage::quarantine_corrupt(path);
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let envelope: SavedThemeEnvelope = match serde_json::from_slice(&bytes) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            storage::quarantine_corrupt(path);
+            return None;
+        }
+    };
+    let invalid_version = envelope.schema_version != storage::STORAGE_SCHEMA_VERSION;
+    let invalid_time =
+        envelope.saved_at_unix > storage::unix_timestamp().saturating_add(24 * 60 * 60);
+    if invalid_version || invalid_time {
+        storage::quarantine_corrupt(path);
+        return None;
+    }
+    match validate_saved_package(envelope.package) {
+        Some(package) => Some(package),
+        None => {
+            storage::quarantine_corrupt(path);
+            None
+        }
+    }
+}
+
+fn save_imported_at(path: &Path, package: &ThemePackage) -> Result<(), String> {
+    validate_saved_package(package.clone()).ok_or_else(|| "主题包内容无效".to_string())?;
+    let envelope = SavedThemeEnvelope {
+        schema_version: storage::STORAGE_SCHEMA_VERSION,
+        saved_at_unix: storage::unix_timestamp(),
+        package: package.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&envelope).map_err(|error| error.to_string())?;
+    storage::write_atomic(path, &bytes).map_err(|error| error.to_string())
+}
+
 pub fn load_saved() -> Option<ThemePackage> {
-    let text = std::fs::read_to_string(saved_theme_path()).ok()?;
-    ThemePackage::from_json(&text).ok()
+    let path = saved_theme_path();
+    if let Some(parent) = path.parent() {
+        storage::cleanup_sidecars(parent);
+    }
+    if path.exists() {
+        return load_saved_at(&path);
+    }
+
+    // One-time migration from releases that stored the raw package in the temp directory.
+    let legacy = legacy_theme_path();
+    let text = std::fs::read_to_string(&legacy).ok()?;
+    let package = match ThemePackage::from_json(&text) {
+        Ok(package) => package,
+        Err(_) => {
+            let _ = std::fs::remove_file(legacy);
+            return None;
+        }
+    };
+    if save_imported(&package).is_ok() {
+        let _ = std::fs::remove_file(legacy);
+    }
+    Some(package)
 }
 
 pub fn save_imported(package: &ThemePackage) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(package).map_err(|e| e.to_string())?;
-    std::fs::write(saved_theme_path(), text).map_err(|e| e.to_string())
+    save_imported_at(&saved_theme_path(), package)
 }
 
 pub fn clear_saved() {
     let _ = std::fs::remove_file(saved_theme_path());
+    let _ = std::fs::remove_file(legacy_theme_path());
 }
 
 fn parse_color(value: &str) -> Result<Color32, String> {
@@ -662,5 +747,43 @@ mod tests {
         assert_eq!(package.recommended_body_font_size(), 15.0);
         assert!(package.browser_css().unwrap().contains("padding: 10%"));
         assert_ne!(light.canvas, dark.canvas);
+    }
+
+    #[test]
+    fn 保存主题携带版本并可恢复() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-theme-state-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("current.json");
+        let package = ThemePackage::built_in_sspai();
+        save_imported_at(&path, &package).unwrap();
+        let loaded = load_saved_at(&path).expect("版本有效的主题应可恢复");
+        assert_eq!(loaded.name, package.name);
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"schema_version\": 1"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn 损坏主题被隔离并降级到内置主题() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-theme-corrupt-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("current.json");
+        std::fs::write(&path, b"not-json").unwrap();
+        assert!(load_saved_at(&path).is_none());
+        assert!(!path.exists());
+        assert!(std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("current.json.corrupt-")
+        }));
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
