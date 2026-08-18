@@ -71,6 +71,7 @@ macOS App 声明支持 `md` 与 `markdown` 文档，可在 Finder 的“显示�
 
 - `Ctrl+O`：打开
 - `Ctrl+N`：新建标签
+- `Ctrl+Shift+N`：新建独立窗口
 - `Ctrl+S`：保存
 - `Ctrl+Shift+S`：另存为
 - `Ctrl+W`：关闭当前标签
@@ -83,6 +84,12 @@ macOS App 声明支持 `md` 与 `markdown` 文档，可在 Finder 的“显示�
 - `F8`：专注模式
 
 macOS 使用 `⌘` 代替上述快捷键中的 `Ctrl`。
+
+默认启动和双击 Markdown 文件仍会复用现有主窗口。如需从命令行强制新开窗口，可使用：
+
+```powershell
+markdown-editor --new-window [文件路径]
+```
 
 ## 字体与授权
 

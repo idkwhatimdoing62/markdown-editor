@@ -15,6 +15,7 @@ mod web_preview;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, mpsc::Receiver};
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ const EXTERNAL_STABLE_DELAY: f64 = 0.45;
 
 fn main() -> eframe::Result {
     let launch = LaunchOptions::from_env();
-    let instance_requests = if launch.is_benchmark() {
+    let instance_requests = if !launch.uses_single_instance() {
         None
     } else {
         match single_instance::acquire(launch.open_paths.clone()) {
@@ -57,11 +58,12 @@ fn main() -> eframe::Result {
             .with_title("Markdown 编辑器与预览器"),
         ..Default::default()
     };
+    let draft_window_id = launch.force_new_window.then_some(std::process::id());
     eframe::run_native(
         "markdown-editor",
         options,
         Box::new(move |cc| {
-            let mut app = MdEditorApp::new(cc);
+            let mut app = MdEditorApp::new(cc, draft_window_id);
             app.instance_requests = instance_requests;
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some(report_path) = launch.benchmark_report {
@@ -82,17 +84,27 @@ fn main() -> eframe::Result {
 
 struct LaunchOptions {
     open_paths: Vec<PathBuf>,
+    force_new_window: bool,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     benchmark_report: Option<PathBuf>,
 }
 
 impl LaunchOptions {
     fn from_env() -> Self {
+        Self::from_args(std::env::args().skip(1))
+    }
+
+    fn from_args(arguments: impl IntoIterator<Item = String>) -> Self {
         let mut open_paths = Vec::new();
+        let mut force_new_window = false;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut benchmark_report = None;
-        let mut args = std::env::args().skip(1);
+        let mut args = arguments.into_iter();
         while let Some(argument) = args.next() {
+            if argument == "--new-window" {
+                force_new_window = true;
+                continue;
+            }
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             if argument == "--benchmark-webview-report" {
                 benchmark_report = args.next().map(PathBuf::from);
@@ -112,9 +124,14 @@ impl LaunchOptions {
         }
         Self {
             open_paths,
+            force_new_window,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             benchmark_report,
         }
+    }
+
+    fn uses_single_instance(&self) -> bool {
+        !self.force_new_window && !self.is_benchmark()
     }
 
     fn is_benchmark(&self) -> bool {
@@ -688,6 +705,7 @@ struct MdEditorApp {
     observed_file_stamps: HashMap<PathBuf, io::FileStamp>,
     pending_external_changes: HashMap<PathBuf, PendingExternalChange>,
     instance_requests: Option<Receiver<single_instance::OpenRequest>>,
+    draft_window_id: Option<u32>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_preview: web_preview::BrowserPreview,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -711,7 +729,7 @@ impl std::ops::DerefMut for MdEditorApp {
 }
 
 impl MdEditorApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, draft_window_id: Option<u32>) -> Self {
         setup_fonts(&cc.egui_ctx);
         let theme_package = theme::load_saved();
         let built_in_theme = ThemePackage::built_in_sspai();
@@ -725,7 +743,7 @@ impl MdEditorApp {
             .or_else(|| built_in_theme.spec(false).ok())
             .unwrap_or_else(|| ThemeSpec::fallback(false));
         apply_visuals(&cc.egui_ctx, false, &initial_theme);
-        let recovery = io::load_draft();
+        let recovery = draft_window_id.is_none().then(io::load_draft).flatten();
         let sample = "# Markdown 编辑器与预览器\n\n左栏编辑，右栏实时预览。\n\n- 支持标题、列表、表格、代码块\n- Ctrl+S 保存，Ctrl+O 打开\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n## 功能\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n| 预览 | 可用 |\n"
             .replace("Ctrl", PRIMARY_SHORTCUT);
         let initial_tab = DocumentTab {
@@ -764,6 +782,7 @@ impl MdEditorApp {
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
             instance_requests: None,
+            draft_window_id,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1165,9 +1184,9 @@ impl MdEditorApp {
 
     fn persist_draft_session(&self) -> std::io::Result<()> {
         if let Some(session) = self.draft_session() {
-            io::save_draft(&session)
+            io::save_draft_for_window(self.draft_window_id, &session)
         } else {
-            io::clear_draft();
+            io::clear_draft_for_window(self.draft_window_id);
             Ok(())
         }
     }
@@ -1199,7 +1218,7 @@ impl MdEditorApp {
             .any(|&index| now - self.tabs[index].draft_last_write > 30.0);
         if all_idle && write_due {
             if let Some(session) = self.draft_session() {
-                match io::save_draft(&session) {
+                match io::save_draft_for_window(self.draft_window_id, &session) {
                     Ok(()) => {
                         for index in dirty_indices {
                             self.tabs[index].draft_last_write = now;
@@ -1214,6 +1233,10 @@ impl MdEditorApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let new_window = egui::KeyboardShortcut::new(
+            egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            egui::Key::N,
+        );
         let new_tab = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
         let save = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
@@ -1222,7 +1245,9 @@ impl MdEditorApp {
             egui::Key::S,
         );
         let close_tab = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::W);
-        if ctx.input_mut(|i| i.consume_shortcut(&new_tab)) {
+        if ctx.input_mut(|i| i.consume_shortcut(&new_window)) {
+            self.open_new_window();
+        } else if ctx.input_mut(|i| i.consume_shortcut(&new_tab)) {
             self.new_tab();
         }
         if ctx.input_mut(|i| i.consume_shortcut(&open)) {
@@ -1270,6 +1295,19 @@ impl MdEditorApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num3)) {
             self.view_mode = ViewMode::Split;
         }
+    }
+
+    fn open_new_window(&mut self) {
+        let result = std::env::current_exe().and_then(|executable| {
+            Command::new(executable)
+                .arg("--new-window")
+                .spawn()
+                .map(|_| ())
+        });
+        self.status_note = match result {
+            Ok(()) => "已打开新窗口".to_string(),
+            Err(error) => format!("无法打开新窗口：{error}"),
+        };
     }
 
     fn open_file(&mut self) {
@@ -1646,6 +1684,13 @@ impl MdEditorApp {
                 ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
                 ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                 ui.menu_button(egui::RichText::new("文件").size(CHROME_FONT_SIZE), |ui| {
+                    if ui
+                        .button(format!("新建窗口   {PRIMARY_SHORTCUT}+Shift+N"))
+                        .clicked()
+                    {
+                        ui.close();
+                        self.open_new_window();
+                    }
                     if ui
                         .button(format!("新建标签   {PRIMARY_SHORTCUT}+N"))
                         .clicked()
@@ -2056,7 +2101,7 @@ impl MdEditorApp {
             .map(restore_draft_tab)
             .collect::<Vec<_>>();
         if restored.is_empty() {
-            io::clear_draft();
+            io::clear_draft_for_window(self.draft_window_id);
             return;
         }
         let active_index = restored
@@ -2105,7 +2150,7 @@ impl MdEditorApp {
                     }
                     if ui.button("放弃草稿").clicked() {
                         self.recovery = None;
-                        io::clear_draft();
+                        io::clear_draft_for_window(self.draft_window_id);
                     }
                 });
             });
@@ -2683,6 +2728,19 @@ fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
 mod app_tests {
     use super::*;
 
+    #[test]
+    fn 强制新窗口参数绕过单实例并保留文件路径() {
+        let path = std::env::temp_dir().join("markdown-editor-new-window.md");
+        let launch = LaunchOptions::from_args([
+            "--new-window".to_string(),
+            path.to_string_lossy().into_owned(),
+        ]);
+
+        assert!(launch.force_new_window);
+        assert!(!launch.uses_single_instance());
+        assert_eq!(launch.open_paths, vec![path]);
+    }
+
     fn app_with_two_tabs() -> MdEditorApp {
         MdEditorApp {
             tabs: vec![DocumentTab::blank(1), DocumentTab::blank(2)],
@@ -2703,6 +2761,7 @@ mod app_tests {
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
             instance_requests: None,
+            draft_window_id: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]

@@ -161,7 +161,15 @@ struct LegacyDraftEnvelope {
 }
 
 pub fn draft_path() -> PathBuf {
-    storage::config_dir().join("state").join("draft.json")
+    draft_path_for_window(None)
+}
+
+pub fn draft_path_for_window(window_id: Option<u32>) -> PathBuf {
+    let file_name = window_id.map_or_else(
+        || "draft.json".to_string(),
+        |id| format!("draft-window-{id}.json"),
+    );
+    storage::config_dir().join("state").join(file_name)
 }
 
 fn legacy_draft_path() -> PathBuf {
@@ -280,7 +288,14 @@ fn load_draft_at(path: &Path, now: u64) -> Option<DraftSession> {
 }
 
 pub fn save_draft(session: &DraftSession) -> std::io::Result<()> {
-    save_draft_at(&draft_path(), session)
+    save_draft_for_window(None, session)
+}
+
+pub fn save_draft_for_window(
+    window_id: Option<u32>,
+    session: &DraftSession,
+) -> std::io::Result<()> {
+    save_draft_at(&draft_path_for_window(window_id), session)
 }
 
 pub fn load_draft() -> Option<DraftSession> {
@@ -313,15 +328,27 @@ pub fn load_draft() -> Option<DraftSession> {
     Some(session)
 }
 
-pub fn clear_draft() {
-    let _ = fs::remove_file(draft_path());
-    let _ = fs::remove_file(legacy_draft_path());
+pub fn clear_draft_for_window(window_id: Option<u32>) {
+    let _ = fs::remove_file(draft_path_for_window(window_id));
+    if window_id.is_none() {
+        let _ = fs::remove_file(legacy_draft_path());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn 多窗口草稿使用彼此隔离的文件() {
+        let primary = draft_path_for_window(None);
+        let secondary = draft_path_for_window(Some(42));
+
+        assert_ne!(primary, secondary);
+        assert_eq!(primary.file_name().unwrap(), "draft.json");
+        assert_eq!(secondary.file_name().unwrap(), "draft-window-42.json");
+    }
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
