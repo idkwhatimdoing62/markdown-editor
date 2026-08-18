@@ -95,7 +95,7 @@ pub fn export_pdf(
 fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool) -> String {
     let font_size = options
         .body_font_size
-        .map(|size| format!("body {{ font-size: {size:.2}px !important; }}"))
+        .map(|size| crate::theme::font_size_override_css(options.theme_css, size))
         .unwrap_or_default();
     let mermaid = if include_mermaid && body.contains("language-mermaid") {
         format!(

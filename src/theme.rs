@@ -641,6 +641,125 @@ fn css_property(css: &str, selector: &str, property: &str) -> Option<String> {
     None
 }
 
+/// Builds the final text-size layer for browser preview and export.
+///
+/// A theme can use relative sizes (`em`, `%`) for most text while keeping a few
+/// elements, commonly fenced code blocks, at an absolute `px` size. Changing
+/// only `body` would leave those elements behind. Re-emit absolute font sizes
+/// with the same theme ratio, then set the requested body size last.
+pub fn font_size_override_css(css: &str, target_body_size: f32) -> String {
+    let base_body_size = css_property(css, "body", "font-size")
+        .as_deref()
+        .and_then(absolute_px)
+        .unwrap_or(15.0);
+    let scale = target_body_size / base_body_size.max(1.0);
+    let mut scaled_rules = String::new();
+    append_scaled_font_rules(css, scale, &mut scaled_rules);
+    scaled_rules.push_str(&format!(
+        "body {{ font-size: {target_body_size:.2}px !important; }}"
+    ));
+    scaled_rules
+}
+
+fn append_scaled_font_rules(css: &str, scale: f32, output: &mut String) {
+    let mut cursor = 0usize;
+    while let Some(relative_open) = css[cursor..].find('{') {
+        let open = cursor + relative_open;
+        let raw_prelude = css[cursor..open].trim();
+        let prelude = raw_prelude
+            .rsplit_once(';')
+            .map_or(raw_prelude, |(_, tail)| tail)
+            .trim();
+        let Some(close) = matching_brace(css, open) else {
+            break;
+        };
+        let declarations = &css[open + 1..close];
+
+        if prelude.starts_with("@media")
+            || prelude.starts_with("@supports")
+            || prelude.starts_with("@container")
+            || prelude.starts_with("@layer")
+        {
+            let mut nested = String::new();
+            append_scaled_font_rules(declarations, scale, &mut nested);
+            if !nested.is_empty() {
+                output.push_str(prelude);
+                output.push('{');
+                output.push_str(&nested);
+                output.push('}');
+            }
+        } else if !prelude.is_empty()
+            && !prelude.starts_with('@')
+            && let Some(size) = declaration_value(declarations, "font-size")
+                .as_deref()
+                .and_then(absolute_px)
+        {
+            output.push_str(prelude);
+            output.push_str(" { font-size: ");
+            output.push_str(&format!("{:.2}px", size * scale));
+            output.push_str(" !important; }");
+        }
+
+        cursor = close + 1;
+    }
+}
+
+fn matching_brace(css: &str, open: usize) -> Option<usize> {
+    let bytes = css.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(open) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && quote.is_some() {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if byte == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            continue;
+        }
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn declaration_value(declarations: &str, property: &str) -> Option<String> {
+    declarations.split(';').find_map(|declaration| {
+        let (name, value) = declaration.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(property)
+            .then(|| value.trim().to_string())
+    })
+}
+
+fn absolute_px(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let value = value.strip_suffix("!important").unwrap_or(value).trim();
+    if value.len() < 3 || !value[value.len() - 2..].eq_ignore_ascii_case("px") {
+        return None;
+    }
+    value[..value.len() - 2].trim().parse().ok()
+}
+
 fn css_color(css: &str, selector: &str, property: &str) -> Option<Color32> {
     let value = css_property(css, selector, property)?;
     if let Some(start) = value.find('#') {

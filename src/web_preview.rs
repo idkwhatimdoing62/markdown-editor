@@ -874,7 +874,7 @@ pub fn document(
         .map(|url| format!(r#"<base href="{}">"#, escape_attribute(url.as_str())))
         .unwrap_or_default();
     let font_override = font_size_override
-        .map(|size| format!("body {{ font-size: {size:.2}px !important; }}"))
+        .map(|size| crate::theme::font_size_override_css(css, size))
         .unwrap_or_default();
     let editor_font = editor_font_css();
     let asset_origin = custom_protocol_script_source("mdfont");
@@ -1741,6 +1741,18 @@ mod tests {
         let theme = html.find("font-size: 15px").unwrap();
         let override_rule = html.find("font-size: 18.00px !important").unwrap();
         assert!(override_rule > theme);
+    }
+
+    #[test]
+    fn fixed_theme_font_sizes_scale_with_the_user_body_size() {
+        let html = render_document(
+            "正文\n\n```text\n代码\n```",
+            crate::theme::BUILT_IN_SSPAI_CSS,
+            None,
+            Some(18.0),
+        );
+
+        assert!(html.contains("pre { font-size: 15.60px !important; }"));
     }
 
     #[test]
