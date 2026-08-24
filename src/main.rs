@@ -7,13 +7,16 @@ mod html_image;
 mod io;
 mod markdown;
 mod preview;
+mod search;
 mod single_instance;
 mod storage;
 mod theme;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod web_preview;
+mod window_session;
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc::Receiver};
@@ -34,6 +37,7 @@ const EXTERNAL_STABLE_DELAY: f64 = 0.45;
 
 fn main() -> eframe::Result {
     let launch = LaunchOptions::from_env();
+    let restore_previous_window = launch.should_restore_window();
     let instance_requests = if !launch.uses_single_instance() {
         None
     } else {
@@ -59,11 +63,14 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     let draft_window_id = launch.force_new_window.then_some(std::process::id());
+    let previous_window = restore_previous_window
+        .then(|| window_session::load(draft_window_id))
+        .flatten();
     eframe::run_native(
         "markdown-editor",
         options,
         Box::new(move |cc| {
-            let mut app = MdEditorApp::new(cc, draft_window_id);
+            let mut app = MdEditorApp::new(cc, draft_window_id, restore_previous_window);
             app.instance_requests = instance_requests;
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             if let Some(report_path) = launch.benchmark_report {
@@ -73,6 +80,9 @@ fn main() -> eframe::Result {
                     report_path,
                     completed: false,
                 });
+            }
+            if let Some(session) = previous_window {
+                app.restore_window_session(session);
             }
             for path in launch.open_paths {
                 app.open_path(&path);
@@ -132,6 +142,10 @@ impl LaunchOptions {
 
     fn uses_single_instance(&self) -> bool {
         !self.force_new_window && !self.is_benchmark()
+    }
+
+    fn should_restore_window(&self) -> bool {
+        self.open_paths.is_empty() && !self.force_new_window && !self.is_benchmark()
     }
 
     fn is_benchmark(&self) -> bool {
@@ -690,6 +704,14 @@ struct MdEditorApp {
     tabs: Vec<DocumentTab>,
     active_tab: usize,
     next_tab_id: u64,
+    workspace_empty: bool,
+    search_open: bool,
+    search_query: String,
+    search_results: search::SearchResults,
+    search_tab_id: Option<u64>,
+    search_document_revision: u64,
+    search_focus_requested: bool,
+    search_scroll_requested: bool,
     pending_close: Option<usize>,
     recovery: Option<io::DraftSession>,
     dark: bool,
@@ -706,6 +728,8 @@ struct MdEditorApp {
     pending_external_changes: HashMap<PathBuf, PendingExternalChange>,
     instance_requests: Option<Receiver<single_instance::OpenRequest>>,
     draft_window_id: Option<u32>,
+    persisted_window_session: Option<window_session::WindowSession>,
+    window_session_initialized: bool,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_preview: web_preview::BrowserPreview,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -729,7 +753,11 @@ impl std::ops::DerefMut for MdEditorApp {
 }
 
 impl MdEditorApp {
-    fn new(cc: &eframe::CreationContext<'_>, draft_window_id: Option<u32>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        draft_window_id: Option<u32>,
+        restore_previous_window: bool,
+    ) -> Self {
         setup_fonts(&cc.egui_ctx);
         let theme_package = theme::load_saved();
         let built_in_theme = ThemePackage::built_in_sspai();
@@ -743,30 +771,20 @@ impl MdEditorApp {
             .or_else(|| built_in_theme.spec(false).ok())
             .unwrap_or_else(|| ThemeSpec::fallback(false));
         apply_visuals(&cc.egui_ctx, false, &initial_theme);
-        let recovery = draft_window_id.is_none().then(io::load_draft).flatten();
-        let sample = "# Markdown 编辑器与预览器\n\n左栏编辑，右栏实时预览。\n\n- 支持标题、列表、表格、代码块\n- Ctrl+S 保存，Ctrl+O 打开\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n## 功能\n\n| 功能 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n| 预览 | 可用 |\n"
-            .replace("Ctrl", PRIMARY_SHORTCUT);
-        let initial_tab = DocumentTab {
-            id: 1,
-            text: sample.to_string(),
-            path: None,
-            disk_snapshot: Vec::new(),
-            status: DocStatus::Modified,
-            document: markdown::parse_document(&sample),
-            document_revision: 1,
-            status_note: String::new(),
-            conflict: None,
-            draft_last_write: 0.0,
-            last_edit_time: f64::INFINITY,
-            prev_editor_ratio: 0.0,
-            prev_preview_ratio: 0.0,
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            last_caret_line: 0,
-        };
+        let recovery = restore_previous_window.then(io::load_draft).flatten();
+        let initial_tab = DocumentTab::blank(1);
         Self {
             tabs: vec![initial_tab],
             active_tab: 0,
             next_tab_id: 2,
+            workspace_empty: true,
+            search_open: false,
+            search_query: String::new(),
+            search_results: search::SearchResults::default(),
+            search_tab_id: None,
+            search_document_revision: 0,
+            search_focus_requested: false,
+            search_scroll_requested: false,
             pending_close: None,
             recovery,
             dark: false,
@@ -783,6 +801,8 @@ impl MdEditorApp {
             pending_external_changes: HashMap::new(),
             instance_requests: None,
             draft_window_id,
+            persisted_window_session: None,
+            window_session_initialized: false,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -813,9 +833,75 @@ impl MdEditorApp {
     }
 
     fn new_tab(&mut self) {
+        if self.workspace_empty {
+            self.workspace_empty = false;
+            self.view_mode = ViewMode::Write;
+            self.editor_focused = true;
+            return;
+        }
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.push_tab(DocumentTab::blank(id));
+    }
+
+    fn has_open_document(&self) -> bool {
+        !self.workspace_empty
+    }
+
+    fn visible_tab_count(&self) -> usize {
+        if self.workspace_empty {
+            0
+        } else {
+            self.tabs.len()
+        }
+    }
+
+    fn open_search(&mut self) {
+        if !self.has_open_document() {
+            return;
+        }
+        self.search_open = true;
+        self.search_focus_requested = true;
+        self.refresh_search();
+    }
+
+    fn close_search(&mut self) {
+        self.search_open = false;
+        self.search_focus_requested = false;
+        self.search_scroll_requested = false;
+    }
+
+    fn refresh_search(&mut self) {
+        if !self.has_open_document() {
+            self.search_results = search::SearchResults::default();
+            self.search_tab_id = None;
+            return;
+        }
+        self.search_results = search::SearchResults::new(&self.text, &self.search_query);
+        self.search_tab_id = Some(self.id);
+        self.search_document_revision = self.document_revision;
+        self.search_scroll_requested = self.search_results.current_range().is_some();
+    }
+
+    fn refresh_search_if_needed(&mut self) {
+        if self.search_open
+            && (self.search_tab_id != Some(self.id)
+                || self.search_document_revision != self.document_revision)
+        {
+            self.refresh_search();
+        }
+    }
+
+    fn search_next(&mut self) {
+        if self.search_results.next().is_some() {
+            self.search_scroll_requested = true;
+        }
+    }
+
+    fn search_previous(&mut self) {
+        if self.search_results.previous().is_some() {
+            self.search_scroll_requested = true;
+        }
     }
 
     fn is_active_dirty(&self) -> bool {
@@ -871,7 +957,11 @@ impl MdEditorApp {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
             self.tabs.push(DocumentTab::blank(id));
-            self.activate_tab(0);
+            self.active_tab = 0;
+            self.editor_focused = false;
+            self.workspace_empty = true;
+            self.focus_mode = false;
+            self.close_search();
         } else {
             let new_active = if index < old_active {
                 old_active - 1
@@ -1182,6 +1272,50 @@ impl MdEditorApp {
         Some(io::DraftSession::new(active_tab_id, drafts))
     }
 
+    fn window_session(&self) -> Option<window_session::WindowSession> {
+        let paths = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.path.clone())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return None;
+        }
+        let active_path = self.tabs[self.active_tab].path.clone();
+        Some(window_session::WindowSession::new(paths, active_path))
+    }
+
+    fn persist_window_session_if_changed(&mut self) {
+        // Explicit secondary windows use a process-scoped draft. They are intentionally
+        // excluded from the single "last main window" restored on ordinary startup.
+        if self.draft_window_id.is_some() {
+            return;
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if self.benchmark_probe.is_some() {
+            return;
+        }
+
+        let current = self.window_session();
+        if self.window_session_initialized && current == self.persisted_window_session {
+            return;
+        }
+        let result = match current.as_ref() {
+            Some(session) => window_session::save(None, session),
+            None => {
+                window_session::clear(None);
+                Ok(())
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.persisted_window_session = current;
+                self.window_session_initialized = true;
+            }
+            Err(error) => self.status_note = format!("窗口会话保存失败：{error}"),
+        }
+    }
+
     fn persist_draft_session(&self) -> std::io::Result<()> {
         if let Some(session) = self.draft_session() {
             io::save_draft_for_window(self.draft_window_id, &session)
@@ -1233,12 +1367,14 @@ impl MdEditorApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let has_open_document = self.has_open_document();
         let new_window = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
             egui::Key::N,
         );
         let new_tab = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::N);
         let open = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::O);
+        let find = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::F);
         let save = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
         let save_as = egui::KeyboardShortcut::new(
             egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
@@ -1253,13 +1389,21 @@ impl MdEditorApp {
         if ctx.input_mut(|i| i.consume_shortcut(&open)) {
             self.open_file();
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&save)) {
+        if has_open_document && ctx.input_mut(|i| i.consume_shortcut(&find)) {
+            self.open_search();
+        }
+        if self.search_open
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.close_search();
+        }
+        if has_open_document && ctx.input_mut(|i| i.consume_shortcut(&save)) {
             self.save();
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&save_as)) {
+        if has_open_document && ctx.input_mut(|i| i.consume_shortcut(&save_as)) {
             self.save_as();
         }
-        if ctx.input_mut(|i| i.consume_shortcut(&close_tab)) {
+        if has_open_document && ctx.input_mut(|i| i.consume_shortcut(&close_tab)) {
             self.request_close_tab(self.active_tab);
         }
         if ctx.input_mut(|i| {
@@ -1383,9 +1527,21 @@ impl MdEditorApp {
         match io::read_markdown(path) {
             Ok(text) => {
                 let snapshot = io::read_snapshot(path).unwrap_or_default();
-                let id = self.next_tab_id;
-                self.next_tab_id += 1;
-                self.push_tab(DocumentTab::from_file(id, path.clone(), text, snapshot));
+                let replace_blank = self.tabs.len() == 1
+                    && self.tabs[0].path.is_none()
+                    && self.tabs[0].text.is_empty()
+                    && self.tabs[0].disk_snapshot.is_empty()
+                    && matches!(self.tabs[0].status, DocStatus::Unsaved);
+                if replace_blank {
+                    let id = self.tabs[0].id;
+                    self.tabs[0] = DocumentTab::from_file(id, path.clone(), text, snapshot);
+                    self.activate_tab(0);
+                } else {
+                    let id = self.next_tab_id;
+                    self.next_tab_id += 1;
+                    self.push_tab(DocumentTab::from_file(id, path.clone(), text, snapshot));
+                }
+                self.workspace_empty = false;
                 self.status_note = format!("已打开 {}", path.display());
             }
             Err(e) => {
@@ -1675,6 +1831,7 @@ impl MdEditorApp {
     }
 
     fn title_bar(&mut self, ui: &mut egui::Ui) {
+        let has_open_document = self.has_open_document();
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), CHROME_BAR_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -1706,32 +1863,47 @@ impl MdEditorApp {
                         self.open_file();
                     }
                     if ui
-                        .button(format!("保存       {PRIMARY_SHORTCUT}+S"))
+                        .add_enabled(
+                            has_open_document,
+                            egui::Button::new(format!("保存       {PRIMARY_SHORTCUT}+S")),
+                        )
                         .clicked()
                     {
                         ui.close();
                         self.save();
                     }
                     if ui
-                        .button(format!("另存为…   {PRIMARY_SHORTCUT}+Shift+S"))
+                        .add_enabled(
+                            has_open_document,
+                            egui::Button::new(format!("另存为…   {PRIMARY_SHORTCUT}+Shift+S")),
+                        )
                         .clicked()
                     {
                         ui.close();
                         self.save_as();
                     }
                     if ui
-                        .button(format!("关闭标签   {PRIMARY_SHORTCUT}+W"))
+                        .add_enabled(
+                            has_open_document,
+                            egui::Button::new(format!("关闭标签   {PRIMARY_SHORTCUT}+W")),
+                        )
                         .clicked()
                     {
                         ui.close();
                         self.request_close_tab(self.active_tab);
                     }
                     ui.separator();
-                    if ui.button("导出 HTML…").clicked() {
+                    if ui
+                        .add_enabled(has_open_document, egui::Button::new("导出 HTML…"))
+                        .clicked()
+                    {
                         ui.close();
                         self.export_html();
                     }
-                    if ui.button("导出 PDF…").clicked() {
+                    if ui
+                        .add_enabled(has_open_document, egui::Button::new("导出 PDF…"))
+                        .clicked()
+                    {
                         ui.close();
                         self.export_pdf();
                     }
@@ -1754,12 +1926,29 @@ impl MdEditorApp {
                     }
                 });
                 ui.menu_button(egui::RichText::new("编辑").size(CHROME_FONT_SIZE), |ui| {
-                    if ui.button("复制渲染内容").clicked() {
+                    if ui
+                        .add_enabled(
+                            has_open_document,
+                            egui::Button::new(format!("查找…       {PRIMARY_SHORTCUT}+F")),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.open_search();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(has_open_document, egui::Button::new("复制渲染内容"))
+                        .clicked()
+                    {
                         ui.close();
                         ui.ctx()
                             .copy_text(markdown::plain_text(self.document.blocks()));
                     }
-                    if ui.button("复制 HTML").clicked() {
+                    if ui
+                        .add_enabled(has_open_document, egui::Button::new("复制 HTML"))
+                        .clicked()
+                    {
                         ui.close();
                         ui.ctx().copy_text(export::render_html(&self.document));
                     }
@@ -1846,7 +2035,7 @@ impl MdEditorApp {
                             )
                             .show(ui, |ui| {
                                 ui.horizontal_centered(|ui| {
-                                    for index in 0..self.tabs.len() {
+                                    for index in 0..self.visible_tab_count() {
                                         let id = self.tabs[index].id;
                                         let title = self.tab_title(index);
                                         let dirty = self.is_tab_dirty(index);
@@ -1885,25 +2074,42 @@ impl MdEditorApp {
                     self.new_tab();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if chrome_nav_button(ui, "专注", self.focus_mode)
-                        .on_hover_text("专注模式 · F8")
+                    ui.add_enabled_ui(has_open_document, |ui| {
+                        if chrome_nav_button(ui, "专注", has_open_document && self.focus_mode)
+                            .on_hover_text("专注模式 · F8")
+                            .clicked()
+                        {
+                            self.focus_mode = !self.focus_mode;
+                        }
+                        ui.add_space(4.0);
+                        if chrome_nav_button(
+                            ui,
+                            "分栏",
+                            has_open_document && self.view_mode == ViewMode::Split,
+                        )
                         .clicked()
-                    {
-                        self.focus_mode = !self.focus_mode;
-                    }
-                    ui.add_space(4.0);
-                    if chrome_nav_button(ui, "分栏", self.view_mode == ViewMode::Split).clicked()
-                    {
-                        self.view_mode = ViewMode::Split;
-                    }
-                    if chrome_nav_button(ui, "阅读", self.view_mode == ViewMode::Preview).clicked()
-                    {
-                        self.view_mode = ViewMode::Preview;
-                    }
-                    if chrome_nav_button(ui, "写作", self.view_mode == ViewMode::Write).clicked()
-                    {
-                        self.view_mode = ViewMode::Write;
-                    }
+                        {
+                            self.view_mode = ViewMode::Split;
+                        }
+                        if chrome_nav_button(
+                            ui,
+                            "阅读",
+                            has_open_document && self.view_mode == ViewMode::Preview,
+                        )
+                        .clicked()
+                        {
+                            self.view_mode = ViewMode::Preview;
+                        }
+                        if chrome_nav_button(
+                            ui,
+                            "写作",
+                            has_open_document && self.view_mode == ViewMode::Write,
+                        )
+                        .clicked()
+                        {
+                            self.view_mode = ViewMode::Write;
+                        }
+                    });
                 });
             },
         );
@@ -1911,6 +2117,22 @@ impl MdEditorApp {
 
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if self.workspace_empty {
+                ui.label(egui::RichText::new("没有打开的文档").weak());
+                ui.separator();
+                ui.label(egui::RichText::new("可新建、打开或拖入 Markdown 文件").weak());
+                if !self.status_note.is_empty() {
+                    ui.separator();
+                    ui.label(&self.status_note);
+                } else if let DocStatus::SaveFailed(message) = &self.status {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
+                        format!("出错：{message}"),
+                    );
+                }
+                return;
+            }
             let (label, color) = match &self.status {
                 DocStatus::Unsaved => ("未保存".to_string(), ui.visuals().weak_text_color()),
                 DocStatus::Saved => (
@@ -1950,6 +2172,117 @@ impl MdEditorApp {
             if !self.status_note.is_empty() {
                 ui.separator();
                 ui.label(&self.status_note);
+            }
+        });
+    }
+
+    fn search_bar(&mut self, ui: &mut egui::Ui) {
+        let mut query_changed = false;
+        let mut go_previous = false;
+        let mut go_next = false;
+        let mut close = false;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 32.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                close = chrome_icon_button(ui, "×")
+                    .on_hover_text("关闭查找 · Esc")
+                    .clicked();
+                ui.add_enabled_ui(!self.search_results.ranges().is_empty(), |ui| {
+                    go_next = chrome_icon_button(ui, "↓")
+                        .on_hover_text("下一项 · Enter")
+                        .clicked();
+                    go_previous = chrome_icon_button(ui, "↑")
+                        .on_hover_text("上一项 · Shift+Enter")
+                        .clicked();
+                });
+                let count = self.search_results.position().map_or_else(
+                    || "无结果".to_string(),
+                    |(current, total)| format!("{current} / {total}"),
+                );
+                ui.label(egui::RichText::new(count).weak().size(12.0));
+                let response = ui.add_sized(
+                    [260.0, 26.0],
+                    egui::TextEdit::singleline(&mut self.search_query)
+                        .id_salt("document_search_input")
+                        .hint_text("查找当前文档")
+                        .font(egui::FontId::new(
+                            CHROME_FONT_SIZE,
+                            egui::FontFamily::Proportional,
+                        )),
+                );
+                if self.search_focus_requested {
+                    response.request_focus();
+                    self.search_focus_requested = false;
+                }
+                query_changed = response.changed();
+                if response.has_focus() {
+                    go_previous |= ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter)
+                    });
+                    go_next |= ui.input_mut(|input| {
+                        input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                    });
+                }
+            },
+        );
+        if query_changed {
+            self.refresh_search();
+        }
+        if go_previous {
+            self.search_previous();
+        } else if go_next {
+            self.search_next();
+        }
+        if close {
+            self.close_search();
+        }
+    }
+
+    fn empty_workspace(&mut self, ui: &mut egui::Ui) {
+        let top_space = (ui.available_height() * 0.28).clamp(72.0, 220.0);
+        ui.add_space(top_space);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                egui::RichText::new("开始写作")
+                    .size(26.0)
+                    .strong()
+                    .color(ui.visuals().strong_text_color()),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("新建文档，或打开已有的 Markdown 文件")
+                    .size(14.0)
+                    .weak(),
+            );
+            ui.add_space(22.0);
+            let mut create = false;
+            let mut open = false;
+            ui.horizontal_centered(|ui| {
+                create = ui
+                    .add_sized([116.0, 34.0], egui::Button::new("新建文档"))
+                    .clicked();
+                ui.add_space(8.0);
+                let accent = ui.visuals().selection.bg_fill;
+                let accent_text = ui.visuals().selection.stroke.color;
+                open = ui
+                    .add_sized(
+                        [116.0, 34.0],
+                        egui::Button::new(egui::RichText::new("打开文件…").color(accent_text))
+                            .fill(accent),
+                    )
+                    .clicked();
+            });
+            ui.add_space(18.0);
+            ui.label(
+                egui::RichText::new("也可以将 .md、.markdown 或 .txt 文件拖到这里")
+                    .size(12.0)
+                    .weak(),
+            );
+            if create {
+                self.new_tab();
+            } else if open {
+                self.open_file();
             }
         });
     }
@@ -2093,6 +2426,32 @@ impl MdEditorApp {
             });
     }
 
+    fn restore_window_session(&mut self, session: window_session::WindowSession) {
+        let requested = session.paths.len();
+        let active_path = session.active_path;
+        let mut restored = 0usize;
+        for path in session.paths {
+            if path.is_file() && has_supported_text_extension(&path) {
+                self.open_path(&path);
+                restored += 1;
+            }
+        }
+        if let Some(active_path) = active_path
+            && let Some(index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.path.as_ref() == Some(&active_path))
+        {
+            self.activate_tab(index);
+        }
+        let skipped = requested.saturating_sub(restored);
+        self.status_note = if skipped == 0 {
+            format!("已恢复上次窗口，共 {restored} 个文件")
+        } else {
+            format!("已恢复 {restored} 个文件，跳过 {skipped} 个缺失或不支持的文件")
+        };
+    }
+
     fn restore_draft_session(&mut self, session: io::DraftSession) {
         let active_tab_id = session.active_tab_id;
         let restored = session
@@ -2116,6 +2475,7 @@ impl MdEditorApp {
             .saturating_add(1);
         self.tabs = restored;
         self.activate_tab(active_index);
+        self.workspace_empty = false;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             self.browser_document_cache = None;
@@ -2225,6 +2585,7 @@ impl eframe::App for MdEditorApp {
 
         self.autosave_draft(now);
         self.handle_shortcuts(&ctx);
+        self.refresh_search_if_needed();
 
         if !self.focus_mode {
             egui::Panel::top("menu_panel")
@@ -2238,6 +2599,20 @@ impl eframe::App for MdEditorApp {
                 });
         }
 
+        if self.search_open {
+            egui::Panel::top("search_panel")
+                .frame(
+                    egui::Frame::new()
+                        .fill(ui.visuals().panel_fill)
+                        .inner_margin(egui::Margin::symmetric(12, 3))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                        )),
+                )
+                .show(ui, |ui| self.search_bar(ui));
+        }
+
         if self.show_status && !self.focus_mode {
             egui::Panel::bottom("status_panel")
                 .frame(
@@ -2246,6 +2621,17 @@ impl eframe::App for MdEditorApp {
                         .inner_margin(egui::Margin::symmetric(12, 5)),
                 )
                 .show(ui, |ui| self.status_bar(ui));
+        }
+
+        if self.workspace_empty {
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            self.browser_preview.close();
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(ui.visuals().window_fill))
+                .show(ui, |ui| self.empty_workspace(ui));
+            self.recovery_window(&ctx);
+            self.persist_window_session_if_changed();
+            return;
         }
 
         let doc_theme = self.theme_spec();
@@ -2271,6 +2657,19 @@ impl eframe::App for MdEditorApp {
                 !modal_open && !ctx.any_popup_open()
             }
         };
+        let search_range = self
+            .search_open
+            .then(|| self.search_results.current_range())
+            .flatten();
+        let scroll_to_search = std::mem::take(&mut self.search_scroll_requested);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let mut search_preview_target = (self.view_mode == ViewMode::Preview && scroll_to_search)
+            .then(|| {
+                search_range
+                    .as_ref()
+                    .map(|range| source_position_from_char(&self.text, range.start))
+            })
+            .flatten();
 
         match self.view_mode {
             ViewMode::Write => {
@@ -2290,6 +2689,8 @@ impl eframe::App for MdEditorApp {
                             editor_focused,
                             body_font_size,
                             &doc_theme,
+                            search_range.as_ref(),
+                            scroll_to_search,
                         );
                     });
             }
@@ -2360,6 +2761,8 @@ impl eframe::App for MdEditorApp {
                             &mut tabs[active_index].text,
                             editor_focused,
                             body_font_size,
+                            search_range.as_ref(),
+                            scroll_to_search,
                         )
                     });
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2443,6 +2846,13 @@ impl eframe::App for MdEditorApp {
                     {
                         self.status_note = error;
                     }
+                    if let Some(source_position) = search_preview_target.take()
+                        && let Err(error) = self
+                            .browser_preview
+                            .scroll_to_source_position(source_position, true)
+                    {
+                        self.status_note = error;
+                    }
                     if let Some(ready) = self.browser_preview.take_ready() {
                         self.finish_benchmark_probe(ready);
                     }
@@ -2455,6 +2865,7 @@ impl eframe::App for MdEditorApp {
         self.conflict_window(&ctx);
         self.recovery_window(&ctx);
         self.close_tab_window(&ctx);
+        self.persist_window_session_if_changed();
     }
 }
 
@@ -2470,16 +2881,43 @@ fn editor_widget(
     text: &mut String,
     focused: &mut bool,
     font_size: f32,
+    search_range: Option<&Range<usize>>,
 ) -> EditorWidgetOutput {
     let id = ui.id().with("md_text");
-    let output = egui::TextEdit::multiline(text)
+    let font_id = egui::FontId::new(font_size, egui::FontFamily::Monospace);
+    let edit = egui::TextEdit::multiline(text)
         .id(id)
-        .font(egui::FontId::new(font_size, egui::FontFamily::Monospace))
+        .font(font_id.clone())
         .frame(egui::Frame::NONE)
         .margin(egui::Margin::same(0))
         .desired_width(f32::INFINITY)
-        .desired_rows(40)
-        .show(ui);
+        .desired_rows(40);
+    let output = if let Some(range) = search_range {
+        let range = range.clone();
+        let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+            let mut job = egui::text::LayoutJob::simple(
+                buffer.as_str().to_owned(),
+                font_id.clone(),
+                ui.visuals().widgets.inactive.text_color(),
+                wrap_width,
+            );
+            job.keep_trailing_whitespace = true;
+            let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+            egui::text_selection::visuals::paint_text_selection(
+                &mut galley,
+                ui.visuals(),
+                &egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(range.start),
+                    egui::text::CCursor::new(range.end),
+                ),
+                None,
+            );
+            galley
+        };
+        edit.layouter(&mut layouter).show(ui)
+    } else {
+        edit.show(ui)
+    };
     *focused = output.response.has_focus();
     EditorWidgetOutput {
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -2494,6 +2932,8 @@ fn show_editor_scroll(
     text: &mut String,
     focused: &mut bool,
     font_size: f32,
+    search_range: Option<&Range<usize>>,
+    scroll_to_search: bool,
 ) -> ScrollAreaOutput<EditorWidgetOutput> {
     egui::ScrollArea::vertical()
         .id_salt("editor_scroll")
@@ -2501,8 +2941,24 @@ fn show_editor_scroll(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(28.0);
-            editor_widget(ui, text, focused, font_size)
+            let output = editor_widget(ui, text, focused, font_size, search_range);
+            if scroll_to_search && let Some(range) = search_range {
+                scroll_editor_to_search(ui, &output, range);
+            }
+            output
         })
+}
+
+fn scroll_editor_to_search(ui: &egui::Ui, output: &EditorWidgetOutput, range: &Range<usize>) {
+    let local = output
+        .galley
+        .pos_from_cursor(egui::text::CCursor::new(range.start));
+    let screen =
+        local.translate(output.galley_pos.to_vec2() - egui::vec2(output.galley.rect.left(), 0.0));
+    ui.scroll_to_rect(
+        screen.expand2(egui::vec2(24.0, 16.0)),
+        Some(egui::Align::Center),
+    );
 }
 
 fn show_preview_scroll(
@@ -2527,6 +2983,8 @@ fn show_centered_editor(
     focused: &mut bool,
     font_size: f32,
     theme: &ThemeSpec,
+    search_range: Option<&Range<usize>>,
+    scroll_to_search: bool,
 ) {
     egui::ScrollArea::vertical()
         .id_salt("editor_scroll_solo")
@@ -2541,7 +2999,10 @@ fn show_centered_editor(
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.add_space(54.0);
-                        editor_widget(ui, text, focused, font_size);
+                        let output = editor_widget(ui, text, focused, font_size, search_range);
+                        if scroll_to_search && let Some(range) = search_range {
+                            scroll_editor_to_search(ui, &output, range);
+                        }
                         ui.add_space(160.0);
                     },
                 );
@@ -2741,11 +3202,30 @@ mod app_tests {
         assert_eq!(launch.open_paths, vec![path]);
     }
 
+    #[test]
+    fn 仅无参数主窗口恢复上次窗口() {
+        let plain = LaunchOptions::from_args(Vec::<String>::new());
+        let file = LaunchOptions::from_args(["C:/notes/opened.md".to_string()]);
+        let secondary = LaunchOptions::from_args(["--new-window".to_string()]);
+
+        assert!(plain.should_restore_window());
+        assert!(!file.should_restore_window());
+        assert!(!secondary.should_restore_window());
+    }
+
     fn app_with_two_tabs() -> MdEditorApp {
         MdEditorApp {
             tabs: vec![DocumentTab::blank(1), DocumentTab::blank(2)],
             active_tab: 0,
             next_tab_id: 3,
+            workspace_empty: false,
+            search_open: false,
+            search_query: String::new(),
+            search_results: search::SearchResults::default(),
+            search_tab_id: None,
+            search_document_revision: 0,
+            search_focus_requested: false,
+            search_scroll_requested: false,
             pending_close: None,
             recovery: None,
             dark: false,
@@ -2762,6 +3242,8 @@ mod app_tests {
             pending_external_changes: HashMap::new(),
             instance_requests: None,
             draft_window_id: None,
+            persisted_window_session: None,
+            window_session_initialized: false,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2790,6 +3272,18 @@ mod app_tests {
             &tab.status,
         ));
         assert_eq!(document_label(tab.id, tab.path.as_ref(), false), "未命名 7");
+    }
+
+    #[test]
+    fn 关闭最后一个标签后进入空工作区而不创建新标签() {
+        let mut app = app_with_two_tabs();
+        app.tabs.truncate(1);
+        app.next_tab_id = 2;
+
+        app.close_tab_now(0);
+
+        assert!(!app.has_open_document());
+        assert_eq!(app.visible_tab_count(), 0);
     }
 
     #[test]
@@ -2853,6 +3347,31 @@ mod app_tests {
     }
 
     #[test]
+    fn 窗口会话只记录文件标签和当前活动文件() {
+        let mut app = app_with_two_tabs();
+        let first = PathBuf::from("C:/notes/first.md");
+        let second = PathBuf::from("C:/notes/second.md");
+        app.tabs[0] = DocumentTab::from_file(
+            1,
+            first.clone(),
+            "第一份".to_string(),
+            "第一份".as_bytes().to_vec(),
+        );
+        app.tabs.push(DocumentTab::from_file(
+            3,
+            second.clone(),
+            "第二份".to_string(),
+            "第二份".as_bytes().to_vec(),
+        ));
+        app.activate_tab(2);
+
+        let session = app.window_session().unwrap();
+
+        assert_eq!(session.paths, vec![first, second.clone()]);
+        assert_eq!(session.active_path, Some(second));
+    }
+
+    #[test]
     fn 恢复草稿时磁盘已变化则保留正文并标记冲突() {
         let path = std::env::temp_dir().join(format!(
             "markdown-editor-draft-conflict-test-{}.md",
@@ -2894,6 +3413,55 @@ mod app_tests {
         app.apply_instance_request(single_instance::OpenRequest::new(vec![path.clone()]));
         assert_eq!(app.tabs.len(), 3, "相同路径应切换标签，不能重复打开");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 启动文件替换空白占位标签而不是留下未命名标签() {
+        let path = std::env::temp_dir().join(format!(
+            "markdown-editor-startup-file-test-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&path, "启动文件内容").unwrap();
+        let mut app = app_with_two_tabs();
+        app.tabs.truncate(1);
+        app.next_tab_id = 2;
+
+        app.open_path(&path);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.path.as_ref(), Some(&path));
+        assert_eq!(app.text, "启动文件内容");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn 无参数启动恢复上次文件标签和活动标签() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-window-restore-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.md");
+        let second = directory.join("second.md");
+        std::fs::write(&first, "第一份").unwrap();
+        std::fs::write(&second, "第二份").unwrap();
+        let session = window_session::WindowSession::new(
+            vec![first.clone(), second.clone()],
+            Some(second.clone()),
+        );
+        let mut app = app_with_two_tabs();
+        app.tabs = vec![DocumentTab::blank(1)];
+        app.active_tab = 0;
+        app.next_tab_id = 2;
+
+        app.restore_window_session(session);
+
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.tabs[0].path.as_ref(), Some(&first));
+        assert_eq!(app.tabs[1].path.as_ref(), Some(&second));
+        assert_eq!(app.active_tab, 1);
+        assert!(app.tabs.iter().all(|tab| tab.path.is_some()));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
