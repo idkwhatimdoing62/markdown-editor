@@ -437,6 +437,7 @@ impl BrowserPreview {
         let document_hash = document.hash;
 
         if self.webview.is_none() {
+            self.reset_scroll_bridge_for_document();
             self.store_document(document);
             let window = frame
                 .winit_window()
@@ -510,6 +511,7 @@ impl BrowserPreview {
         }
 
         if source_changed {
+            self.reset_scroll_bridge_for_document();
             self.store_document(document);
         }
 
@@ -540,6 +542,14 @@ impl BrowserPreview {
     fn store_document(&self, document: &Arc<PreviewDocument>) {
         if let Ok(mut payload) = self.document_payload.lock() {
             *payload = Some(Arc::clone(document));
+        }
+    }
+
+    fn reset_scroll_bridge_for_document(&self) {
+        if let Ok(mut bridge) = self.scroll_bridge.lock() {
+            bridge.source_position = None;
+            bridge.user_source_position = None;
+            bridge.ready = None;
         }
     }
 
@@ -1517,6 +1527,22 @@ mod tests {
     ) -> String {
         let parsed = crate::markdown::parse_document(markdown);
         document(&parsed, css, base_directory, font_size_override)
+    }
+
+    #[test]
+    fn changing_documents_discards_stale_scroll_messages() {
+        let preview = super::BrowserPreview::default();
+        {
+            let mut bridge = preview.scroll_bridge.lock().expect("scroll bridge");
+            bridge.source_position = Some(18.0);
+            bridge.user_source_position = Some(18.0);
+        }
+
+        preview.reset_scroll_bridge_for_document();
+
+        let bridge = preview.scroll_bridge.lock().expect("scroll bridge");
+        assert_eq!(bridge.source_position, None);
+        assert_eq!(bridge.user_source_position, None);
     }
 
     #[test]

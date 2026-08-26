@@ -203,6 +203,7 @@ struct DocumentTab {
     last_edit_time: f64,
     prev_editor_ratio: f32,
     prev_preview_ratio: f32,
+    preview_source_position: f32,
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     last_caret_line: usize,
 }
@@ -266,6 +267,7 @@ impl DocumentTab {
             last_edit_time: f64::INFINITY,
             prev_editor_ratio: 0.0,
             prev_preview_ratio: 0.0,
+            preview_source_position: 0.0,
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             last_caret_line: 0,
         }
@@ -287,6 +289,7 @@ impl DocumentTab {
             last_edit_time: f64::INFINITY,
             prev_editor_ratio: 0.0,
             prev_preview_ratio: 0.0,
+            preview_source_position: 0.0,
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             last_caret_line: 0,
         }
@@ -399,6 +402,7 @@ fn restore_draft_tab(draft: io::DraftTab) -> DocumentTab {
         last_edit_time: f64::NEG_INFINITY,
         prev_editor_ratio: 0.0,
         prev_preview_ratio: 0.0,
+        preview_source_position: 0.0,
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         last_caret_line: 0,
     }
@@ -730,6 +734,7 @@ struct MdEditorApp {
     draft_window_id: Option<u32>,
     persisted_window_session: Option<window_session::WindowSession>,
     window_session_initialized: bool,
+    pending_preview_restore: Option<(u64, f32)>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_preview: web_preview::BrowserPreview,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -803,6 +808,7 @@ impl MdEditorApp {
             draft_window_id,
             persisted_window_session: None,
             window_session_initialized: false,
+            pending_preview_restore: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -816,6 +822,12 @@ impl MdEditorApp {
         if index >= self.tabs.len() {
             return;
         }
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(source_position) = self.browser_preview.source_position() {
+            self.tabs[self.active_tab].preview_source_position = source_position;
+        }
+        let tab = &self.tabs[index];
+        self.pending_preview_restore = Some((tab.id, tab.preview_source_position));
         self.active_tab = index;
         self.editor_focused = false;
     }
@@ -961,6 +973,7 @@ impl MdEditorApp {
             self.editor_focused = false;
             self.workspace_empty = true;
             self.focus_mode = false;
+            self.pending_preview_restore = None;
             self.close_search();
         } else {
             let new_active = if index < old_active {
@@ -2373,6 +2386,7 @@ impl MdEditorApp {
         // Page reloads and scrollTo calls also emit browser scroll events; treating
         // those as input would make both panes repeatedly pull each other around.
         if let Some(source_position) = self.browser_preview.take_user_source_position() {
+            self.preview_source_position = source_position;
             let mut state = editor.state;
             state.offset.y = editor_offset_for_source_position(editor, &self.text, source_position);
             state.store(ctx, editor.id);
@@ -2396,6 +2410,7 @@ impl MdEditorApp {
             self.browser_preview
                 .scroll_to_source_position(source_position, !force_preview)?;
         }
+        self.preview_source_position = source_position;
         self.prev_editor_ratio = editor_ratio;
         self.prev_preview_ratio = editor_ratio;
         Ok(())
@@ -2674,6 +2689,7 @@ impl eframe::App for MdEditorApp {
         match self.view_mode {
             ViewMode::Write => {
                 let active_index = self.active_tab;
+                let active_tab_id = self.tabs[active_index].id;
                 let body_font_size = self.body_font_size;
                 let (tabs, editor_focused) = (&mut self.tabs, &mut self.editor_focused);
                 egui::CentralPanel::default()
@@ -2685,6 +2701,7 @@ impl eframe::App for MdEditorApp {
                     .show(ui, |ui| {
                         show_centered_editor(
                             ui,
+                            active_tab_id,
                             &mut tabs[active_index].text,
                             editor_focused,
                             body_font_size,
@@ -2695,6 +2712,7 @@ impl eframe::App for MdEditorApp {
                     });
             }
             ViewMode::Preview => {
+                let active_tab_id = self.id;
                 egui::Panel::left("reading_toc_panel")
                     .resizable(false)
                     .exact_size(228.0)
@@ -2722,6 +2740,7 @@ impl eframe::App for MdEditorApp {
                             } else {
                                 show_centered_preview(
                                     ui,
+                                    active_tab_id,
                                     self.document.blocks(),
                                     self.body_font_size,
                                     &doc_theme,
@@ -2731,6 +2750,7 @@ impl eframe::App for MdEditorApp {
                         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
                         show_centered_preview(
                             ui,
+                            active_tab_id,
                             self.document.blocks(),
                             self.body_font_size,
                             &doc_theme,
@@ -2739,6 +2759,7 @@ impl eframe::App for MdEditorApp {
             }
             ViewMode::Split => {
                 let active_index = self.active_tab;
+                let active_tab_id = self.tabs[active_index].id;
                 let body_font_size = self.body_font_size;
                 let (tabs, editor_focused) = (&mut self.tabs, &mut self.editor_focused);
                 let editor_out = egui::Panel::left("editor_panel")
@@ -2758,6 +2779,7 @@ impl eframe::App for MdEditorApp {
                     .show(ui, |ui| {
                         show_editor_scroll(
                             ui,
+                            active_tab_id,
                             &mut tabs[active_index].text,
                             editor_focused,
                             body_font_size,
@@ -2776,6 +2798,7 @@ impl eframe::App for MdEditorApp {
                         } else {
                             let _ = show_preview_scroll(
                                 ui,
+                                active_tab_id,
                                 self.document.blocks(),
                                 self.body_font_size,
                                 &doc_theme,
@@ -2798,6 +2821,7 @@ impl eframe::App for MdEditorApp {
                         .show(ui, |ui| {
                             show_preview_scroll(
                                 ui,
+                                active_tab_id,
                                 self.document.blocks(),
                                 self.body_font_size,
                                 &doc_theme,
@@ -2841,19 +2865,47 @@ impl eframe::App for MdEditorApp {
                     {
                         self.status_note = error;
                     }
-                    if let Some(index) = preview_heading_target.take()
-                        && let Err(error) = self.browser_preview.scroll_to_heading(index)
-                    {
-                        self.status_note = error;
+                    if document_changed {
+                        self.pending_preview_restore =
+                            Some((self.id, self.preview_source_position));
                     }
-                    if let Some(source_position) = search_preview_target.take()
-                        && let Err(error) = self
+                    if self.view_mode == ViewMode::Preview
+                        && let Some(source_position) =
+                            self.browser_preview.take_user_source_position()
+                    {
+                        self.preview_source_position = source_position;
+                        self.pending_preview_restore = None;
+                    }
+                    if let Some(index) = preview_heading_target.take() {
+                        match self.browser_preview.scroll_to_heading(index) {
+                            Ok(()) => self.pending_preview_restore = None,
+                            Err(error) => self.status_note = error,
+                        }
+                    }
+                    if let Some(source_position) = search_preview_target.take() {
+                        match self
                             .browser_preview
                             .scroll_to_source_position(source_position, true)
-                    {
-                        self.status_note = error;
+                        {
+                            Ok(()) => {
+                                self.preview_source_position = source_position;
+                                self.pending_preview_restore = None;
+                            }
+                            Err(error) => self.status_note = error,
+                        }
                     }
                     if let Some(ready) = self.browser_preview.take_ready() {
+                        if let Some((tab_id, source_position)) = self.pending_preview_restore
+                            && tab_id == self.id
+                        {
+                            match self
+                                .browser_preview
+                                .scroll_to_source_position(source_position, false)
+                            {
+                                Ok(()) => self.pending_preview_restore = None,
+                                Err(error) => self.status_note = error,
+                            }
+                        }
                         self.finish_benchmark_probe(ready);
                     }
                 }
@@ -2927,8 +2979,13 @@ fn editor_widget(
     }
 }
 
+fn document_scroll_id(scope: &'static str, tab_id: u64) -> egui::Id {
+    egui::Id::new((scope, tab_id))
+}
+
 fn show_editor_scroll(
     ui: &mut egui::Ui,
+    tab_id: u64,
     text: &mut String,
     focused: &mut bool,
     font_size: f32,
@@ -2936,7 +2993,7 @@ fn show_editor_scroll(
     scroll_to_search: bool,
 ) -> ScrollAreaOutput<EditorWidgetOutput> {
     egui::ScrollArea::vertical()
-        .id_salt("editor_scroll")
+        .id_salt(document_scroll_id("editor_scroll", tab_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -2963,12 +3020,13 @@ fn scroll_editor_to_search(ui: &egui::Ui, output: &EditorWidgetOutput, range: &R
 
 fn show_preview_scroll(
     ui: &mut egui::Ui,
+    tab_id: u64,
     blocks: &[Block],
     body_font_size: f32,
     theme: &ThemeSpec,
 ) -> ScrollAreaOutput<()> {
     egui::ScrollArea::vertical()
-        .id_salt("preview_scroll")
+        .id_salt(document_scroll_id("preview_scroll", tab_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -2979,6 +3037,7 @@ fn show_preview_scroll(
 
 fn show_centered_editor(
     ui: &mut egui::Ui,
+    tab_id: u64,
     text: &mut String,
     focused: &mut bool,
     font_size: f32,
@@ -2987,7 +3046,7 @@ fn show_centered_editor(
     scroll_to_search: bool,
 ) {
     egui::ScrollArea::vertical()
-        .id_salt("editor_scroll_solo")
+        .id_salt(document_scroll_id("editor_scroll_solo", tab_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -3012,12 +3071,13 @@ fn show_centered_editor(
 
 fn show_centered_preview(
     ui: &mut egui::Ui,
+    tab_id: u64,
     blocks: &[Block],
     body_font_size: f32,
     theme: &ThemeSpec,
 ) {
     egui::ScrollArea::vertical()
-        .id_salt("preview_scroll_solo")
+        .id_salt(document_scroll_id("preview_scroll_solo", tab_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -3190,6 +3250,42 @@ mod app_tests {
     use super::*;
 
     #[test]
+    fn scroll_state_ids_are_isolated_per_document_tab() {
+        assert_ne!(
+            document_scroll_id("editor_scroll", 1),
+            document_scroll_id("editor_scroll", 2)
+        );
+        assert_ne!(
+            document_scroll_id("preview_scroll", 1),
+            document_scroll_id("preview_scroll", 2)
+        );
+    }
+
+    #[test]
+    fn switching_tabs_queues_each_documents_own_preview_position() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].preview_source_position = 12.5;
+        app.tabs[1].preview_source_position = 84.25;
+
+        app.activate_tab(1);
+        assert_eq!(app.pending_preview_restore, Some((2, 84.25)));
+
+        app.activate_tab(0);
+        assert_eq!(app.pending_preview_restore, Some((1, 12.5)));
+    }
+
+    #[test]
+    fn closing_active_tab_restores_the_next_documents_position() {
+        let mut app = app_with_two_tabs();
+        app.tabs[1].preview_source_position = 42.0;
+
+        app.close_tab_now(0);
+
+        assert_eq!(app.id, 2);
+        assert_eq!(app.pending_preview_restore, Some((2, 42.0)));
+    }
+
+    #[test]
     fn 强制新窗口参数绕过单实例并保留文件路径() {
         let path = std::env::temp_dir().join("markdown-editor-new-window.md");
         let launch = LaunchOptions::from_args([
@@ -3244,6 +3340,7 @@ mod app_tests {
             draft_window_id: None,
             persisted_window_session: None,
             window_session_initialized: false,
+            pending_preview_restore: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_preview: web_preview::BrowserPreview::default(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
