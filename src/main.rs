@@ -13,6 +13,7 @@ mod storage;
 mod theme;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod web_preview;
+mod window_close;
 mod window_session;
 
 use std::collections::HashMap;
@@ -717,6 +718,7 @@ struct MdEditorApp {
     search_focus_requested: bool,
     search_scroll_requested: bool,
     pending_close: Option<usize>,
+    window_close_guard: window_close::CloseGuard,
     recovery: Option<io::DraftSession>,
     dark: bool,
     editor_focused: bool,
@@ -791,6 +793,7 @@ impl MdEditorApp {
             search_focus_requested: false,
             search_scroll_requested: false,
             pending_close: None,
+            window_close_guard: window_close::CloseGuard::default(),
             recovery,
             dark: false,
             editor_focused: false,
@@ -955,6 +958,58 @@ impl MdEditorApp {
             self.pending_close = Some(self.active_tab);
         } else {
             self.close_tab_now(self.active_tab);
+        }
+    }
+
+    fn prepare_window_close(&mut self) -> window_close::CloseAction {
+        let unsaved_documents = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.is_tab_dirty(*index))
+            .map(|(index, tab)| window_close::UnsavedDocument {
+                tab_id: window_close::TabId::from(tab.id),
+                title: self.tab_title(index),
+            })
+            .collect();
+        self.window_close_guard.request_close(unsaved_documents)
+    }
+
+    fn save_all_for_window_close(&mut self) -> Result<(), window_close::TabId> {
+        let tab_ids = self
+            .window_close_guard
+            .unsaved_documents()
+            .iter()
+            .map(|document| document.tab_id)
+            .collect::<Vec<_>>();
+        for tab_id in tab_ids {
+            let tab_id_value = u64::from(tab_id);
+            let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id_value) else {
+                return Err(tab_id);
+            };
+            self.activate_tab(index);
+            self.save();
+            if self.is_tab_dirty(index) {
+                return Err(tab_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_window_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+        match self.prepare_window_close() {
+            window_close::CloseAction::Allow => {
+                if self.recovery.is_none() {
+                    io::clear_draft_for_window(self.draft_window_id);
+                }
+            }
+            window_close::CloseAction::Confirm | window_close::CloseAction::KeepOpen => {
+                self.pending_close = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
         }
     }
 
@@ -2563,6 +2618,80 @@ impl MdEditorApp {
                 });
             });
     }
+
+    fn window_close_window(&mut self, ctx: &egui::Context) {
+        if !self.window_close_guard.is_confirmation_open()
+            || self.conflict.is_some()
+            || self.recovery.is_some()
+            || self.pending_close.is_some()
+        {
+            return;
+        }
+        let documents = self.window_close_guard.unsaved_documents().to_vec();
+        let failed_tab_id = self.window_close_guard.failed_tab_id();
+        egui::Modal::new(egui::Id::new("window-close-confirmation")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading("关闭窗口");
+            ui.add_space(6.0);
+            ui.label(format!(
+                "有 {} 个标签包含未保存的修改。关闭窗口前要保存吗？",
+                documents.len()
+            ));
+            ui.add_space(10.0);
+            egui::Frame::new()
+                .fill(ui.visuals().faint_bg_color)
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("window-close-unsaved-documents")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            for document in &documents {
+                                ui.horizontal(|ui| {
+                                    ui.label("•");
+                                    ui.label(&document.title);
+                                    if failed_tab_id == Some(document.tab_id) {
+                                        ui.colored_label(ui.visuals().error_fg_color, "保存失败");
+                                    }
+                                });
+                            }
+                        });
+                });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui.button("全部保存并关闭").clicked() {
+                    let request_id = self
+                        .window_close_guard
+                        .confirmation_id()
+                        .expect("确认窗口只在待确认状态显示");
+                    let result = self.save_all_for_window_close();
+                    if let Err(tab_id) = result
+                        && let Some(index) =
+                            self.tabs.iter().position(|tab| tab.id == u64::from(tab_id))
+                    {
+                        let title = self.tab_title(index);
+                        self.status_note = format!("未能保存“{title}”，窗口保持打开");
+                    }
+                    if self.window_close_guard.finish_save_all(request_id, result)
+                        == window_close::CloseAction::Allow
+                    {
+                        io::clear_draft_for_window(self.draft_window_id);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                if ui.button("放弃全部修改").clicked() {
+                    self.window_close_guard.discard_all();
+                    io::clear_draft_for_window(self.draft_window_id);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                if ui.button("取消").clicked() {
+                    self.window_close_guard.cancel();
+                }
+            });
+        });
+    }
 }
 
 impl eframe::App for MdEditorApp {
@@ -2599,6 +2728,7 @@ impl eframe::App for MdEditorApp {
         }
 
         self.autosave_draft(now);
+        self.handle_window_close_request(&ctx);
         self.handle_shortcuts(&ctx);
         self.refresh_search_if_needed();
 
@@ -2652,8 +2782,10 @@ impl eframe::App for MdEditorApp {
         let doc_theme = self.theme_spec();
         let editor_fill = doc_theme.editor_canvas;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let modal_open =
-            self.conflict.is_some() || self.recovery.is_some() || self.pending_close.is_some();
+        let modal_open = self.conflict.is_some()
+            || self.recovery.is_some()
+            || self.pending_close.is_some()
+            || self.window_close_guard.is_confirmation_open();
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         if modal_open {
             // A native child WebView is always above egui's paint surface on Windows.
@@ -2917,6 +3049,7 @@ impl eframe::App for MdEditorApp {
         self.conflict_window(&ctx);
         self.recovery_window(&ctx);
         self.close_tab_window(&ctx);
+        self.window_close_window(&ctx);
         self.persist_window_session_if_changed();
     }
 }
@@ -3323,6 +3456,7 @@ mod app_tests {
             search_focus_requested: false,
             search_scroll_requested: false,
             pending_close: None,
+            window_close_guard: window_close::CloseGuard::default(),
             recovery: None,
             dark: false,
             editor_focused: false,
@@ -3348,6 +3482,111 @@ mod app_tests {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_document_cache: None,
         }
+    }
+
+    #[test]
+    fn window_close_collects_every_unsaved_tab_not_only_the_active_one() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].text = "first draft".to_string();
+        app.tabs[1].text = "second draft".to_string();
+
+        assert_eq!(
+            app.prepare_window_close(),
+            window_close::CloseAction::Confirm
+        );
+        assert_eq!(
+            app.window_close_guard
+                .unsaved_documents()
+                .iter()
+                .map(|document| document.tab_id)
+                .map(u64::from)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn save_all_before_window_close_writes_every_named_document() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-window-close-save-all-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let first = directory.join("first.md");
+        let second = directory.join("second.md");
+        std::fs::write(&first, "old first").unwrap();
+        std::fs::write(&second, "old second").unwrap();
+        let mut app = app_with_two_tabs();
+        app.tabs = vec![
+            DocumentTab::from_file(
+                1,
+                first.clone(),
+                "new first".to_string(),
+                b"old first".to_vec(),
+            ),
+            DocumentTab::from_file(
+                2,
+                second.clone(),
+                "new second".to_string(),
+                b"old second".to_vec(),
+            ),
+        ];
+        app.prepare_window_close();
+
+        assert_eq!(app.save_all_for_window_close(), Ok(()));
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "new first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "new second");
+        assert!(app.tabs.iter().all(|tab| !document_is_dirty(
+            tab.path.as_ref(),
+            &tab.text,
+            &tab.disk_snapshot,
+            &tab.status
+        )));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn save_all_before_window_close_stops_when_one_document_cannot_be_saved() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-window-close-save-failure-{}",
+            std::process::id()
+        ));
+        let missing_directory = directory.join("missing");
+        let second = directory.join("second.md");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(&second, "old second").unwrap();
+        let mut app = app_with_two_tabs();
+        app.tabs = vec![
+            DocumentTab::from_file(
+                1,
+                missing_directory.join("first.md"),
+                "new first".to_string(),
+                b"old first".to_vec(),
+            ),
+            DocumentTab::from_file(
+                2,
+                second.clone(),
+                "new second".to_string(),
+                b"old second".to_vec(),
+            ),
+        ];
+        app.prepare_window_close();
+
+        let result = app.save_all_for_window_close();
+        let request_id = app.window_close_guard.confirmation_id().unwrap();
+
+        assert_eq!(result, Err(window_close::TabId::from(1)));
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "old second");
+        assert_eq!(
+            app.window_close_guard.finish_save_all(request_id, result),
+            window_close::CloseAction::KeepOpen
+        );
+        assert_eq!(
+            app.window_close_guard.failed_tab_id(),
+            Some(window_close::TabId::from(1))
+        );
+        assert!(app.window_close_guard.is_confirmation_open());
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
