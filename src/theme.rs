@@ -481,13 +481,59 @@ impl ThemeSpec {
     }
 }
 
+/// 追加到原始主题 CSS 末尾的深色外观覆盖层。
+///
+/// 主题包的原始 CSS 仍然保持原样执行；这一层只负责把应用的深色契约
+///（画布、正文、代码块、引用、表格和链接）传递给浏览器预览与导出。
+pub fn dark_mode_css(spec: &ThemeSpec) -> String {
+    let color = |value: Color32| color_hex(value);
+    format!(
+        ":root{{color-scheme:dark;}}\
+         html,body,.markdown-body{{background-color:{}!important;color:{}!important;}}\
+         body{{border-color:{}!important;}}\
+         p,li,td,th,dt,dd,figcaption,summary{{color:{}!important;}}\
+         h1,h2,h3,h4,h5,h6{{color:{}!important;}}\
+         a{{color:{}!important;}}\
+         blockquote{{background-color:{}!important;border-color:{}!important;color:{}!important;}}\
+         pre,code,pre code{{background-color:{}!important;color:{}!important;border-color:{}!important;}}\
+         table,th,td{{background-color:{}!important;border-color:{}!important;}}\
+         tbody tr:nth-child(even){{background-color:{}!important;}}\
+         hr{{border-color:{}!important;}}",
+        color(spec.canvas),
+        color(spec.text),
+        color(spec.border),
+        color(spec.text),
+        color(spec.heading),
+        color(spec.accent),
+        color(spec.quote_bg),
+        color(spec.accent),
+        color(spec.muted),
+        color(spec.code_bg),
+        color(spec.text),
+        color(spec.border),
+        color(spec.panel),
+        color(spec.border),
+        color(spec.table_alt),
+        color(spec.border),
+    )
+}
+
 const THEME_STATE_LIMIT: u64 = 20 * 1024 * 1024;
+
+const APPEARANCE_STATE_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedThemeEnvelope {
     schema_version: u32,
     saved_at_unix: u64,
     package: ThemePackage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SavedAppearanceEnvelope {
+    schema_version: u32,
+    saved_at_unix: u64,
+    dark: bool,
 }
 
 pub fn saved_theme_path() -> PathBuf {
@@ -580,6 +626,57 @@ pub fn save_imported(package: &ThemePackage) -> Result<(), String> {
 pub fn clear_saved() {
     let _ = std::fs::remove_file(saved_theme_path());
     let _ = std::fs::remove_file(legacy_theme_path());
+}
+
+fn appearance_path() -> PathBuf {
+    storage::config_dir().join("appearance.json")
+}
+
+fn load_dark_at(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.len() == 0 || metadata.len() > APPEARANCE_STATE_LIMIT {
+        storage::quarantine_corrupt(path);
+        return false;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(envelope) = serde_json::from_slice::<SavedAppearanceEnvelope>(&bytes) else {
+        storage::quarantine_corrupt(path);
+        return false;
+    };
+    let invalid_version = envelope.schema_version != storage::STORAGE_SCHEMA_VERSION;
+    let invalid_time =
+        envelope.saved_at_unix > storage::unix_timestamp().saturating_add(24 * 60 * 60);
+    if invalid_version || invalid_time {
+        storage::quarantine_corrupt(path);
+        return false;
+    }
+    envelope.dark
+}
+
+pub fn load_dark_mode() -> bool {
+    let path = appearance_path();
+    if let Some(parent) = path.parent() {
+        storage::cleanup_sidecars(parent);
+    }
+    load_dark_at(&path)
+}
+
+fn save_dark_at(path: &Path, dark: bool) -> Result<(), String> {
+    let envelope = SavedAppearanceEnvelope {
+        schema_version: storage::STORAGE_SCHEMA_VERSION,
+        saved_at_unix: storage::unix_timestamp(),
+        dark,
+    };
+    let bytes = serde_json::to_vec_pretty(&envelope).map_err(|error| error.to_string())?;
+    storage::write_atomic(path, &bytes).map_err(|error| error.to_string())
+}
+
+pub fn save_dark_mode(dark: bool) -> Result<(), String> {
+    save_dark_at(&appearance_path(), dark)
 }
 
 fn parse_color(value: &str) -> Result<Color32, String> {
@@ -869,6 +966,17 @@ mod tests {
     }
 
     #[test]
+    fn 深色覆盖层包含主题的关键颜色契约() {
+        let spec = ThemePackage::built_in_sspai().spec(true).unwrap();
+        let css = dark_mode_css(&spec);
+        assert!(css.contains(":root{color-scheme:dark;}"));
+        assert!(css.contains("background-color:#1C1D1F!important"));
+        assert!(css.contains("color:#E8E9EB!important"));
+        assert!(css.contains("pre,code"));
+        assert!(css.contains("tbody tr:nth-child(even)"));
+    }
+
+    #[test]
     fn 保存主题携带版本并可恢复() {
         let directory = std::env::temp_dir().join(format!(
             "markdown-editor-theme-state-test-{}",
@@ -903,6 +1011,63 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("current.json.corrupt-")
         }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn 外观偏好携带版本并可恢复() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-appearance-state-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("appearance.json");
+        save_dark_at(&path, true).unwrap();
+        assert!(load_dark_at(&path));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"schema_version\": 1"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn 损坏外观偏好降级为亮色并隔离() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-appearance-corrupt-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("appearance.json");
+        std::fs::write(&path, b"not-json").unwrap();
+        assert!(!load_dark_at(&path));
+        assert!(!path.exists());
+        assert!(std::fs::read_dir(&directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("appearance.json.corrupt-")
+        }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn 缺少外观字段的版本化配置会被隔离() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-appearance-incomplete-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("appearance.json");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"schema_version\":1,\"saved_at_unix\":{}}}",
+                storage::unix_timestamp()
+            ),
+        )
+        .unwrap();
+        assert!(!load_dark_at(&path));
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 }

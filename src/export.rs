@@ -17,6 +17,8 @@ use crate::markdown::ParsedDocument;
 pub struct ExportOptions<'a> {
     pub title: &'a str,
     pub theme_css: &'a str,
+    pub dark_mode: bool,
+    pub theme_spec: crate::theme::ThemeSpec,
     pub base_directory: Option<&'a Path>,
     pub body_font_size: Option<f32>,
 }
@@ -111,8 +113,13 @@ fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool
     } else {
         PDF_FONT_CSS.to_string()
     };
+    let dark_css = if options.dark_mode {
+        crate::theme::dark_mode_css(&options.theme_spec)
+    } else {
+        String::new()
+    };
     format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{STRUCTURAL_FALLBACK}</style><style>{}</style><style>{}{}{font_size}</style>{mermaid}</head><body>{body}</body></html>",
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{STRUCTURAL_FALLBACK}</style><style>{}</style><style>{}{}{font_size}{dark_css}</style>{mermaid}</head><body>{body}</body></html>",
         escape_html(options.title),
         options.theme_css,
         font_css,
@@ -523,6 +530,8 @@ mod tests {
         ExportOptions {
             title: "测试文档",
             theme_css: "body { color: #123456; } h2 { border-left: 6px solid #ff7e79; }",
+            dark_mode: false,
+            theme_spec: crate::theme::ThemeSpec::fallback(false),
             base_directory,
             body_font_size: Some(17.0),
         }
@@ -580,6 +589,30 @@ mod tests {
         assert!(html.contains("language-mermaid"));
         assert!(html.contains("mermaid.initialize"));
         assert!(html.contains("mermaid-diagram"));
+    }
+
+    #[test]
+    fn html导出深色模式复用主题深色颜色() {
+        let mut options = test_options(None);
+        options.dark_mode = true;
+        options.theme_spec = crate::theme::ThemePackage::built_in_sspai()
+            .spec(true)
+            .unwrap();
+        let html = render_styled_html(&parsed("# 深色\n\n正文\n"), options);
+        assert!(html.contains(":root{color-scheme:dark;}"));
+        assert!(html.contains("background-color:#1C1D1F!important"));
+    }
+
+    #[test]
+    fn pdf导出使用深色覆盖层() {
+        let mut options = test_options(None);
+        options.dark_mode = true;
+        options.theme_spec = crate::theme::ThemePackage::built_in_sspai()
+            .spec(true)
+            .unwrap();
+        let html = styled_document("<h1>深色</h1>", options, false);
+        assert!(html.contains(":root{color-scheme:dark;}"));
+        assert!(html.contains("background-color:#1C1D1F!important"));
     }
 
     #[cfg(target_os = "windows")]

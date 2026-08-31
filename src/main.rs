@@ -823,12 +823,13 @@ impl MdEditorApp {
             .as_ref()
             .map(ThemePackage::recommended_body_font_size)
             .unwrap_or_else(|| built_in_theme.recommended_body_font_size());
+        let initial_dark = theme::load_dark_mode();
         let initial_theme = theme_package
             .as_ref()
-            .and_then(|t| t.spec(false).ok())
-            .or_else(|| built_in_theme.spec(false).ok())
-            .unwrap_or_else(|| ThemeSpec::fallback(false));
-        apply_visuals(&cc.egui_ctx, false, &initial_theme);
+            .and_then(|t| t.spec(initial_dark).ok())
+            .or_else(|| built_in_theme.spec(initial_dark).ok())
+            .unwrap_or_else(|| ThemeSpec::fallback(initial_dark));
+        apply_visuals(&cc.egui_ctx, initial_dark, &initial_theme);
         let recovery = restore_previous_window.then(io::load_draft).flatten();
         let initial_tab = DocumentTab::blank(1);
         Self {
@@ -847,7 +848,7 @@ impl MdEditorApp {
             pending_close: None,
             window_close_guard: window_close::CloseGuard::default(),
             recovery,
-            dark: false,
+            dark: initial_dark,
             editor_focused: false,
             view_mode: ViewMode::Write,
             focus_mode: false,
@@ -1082,6 +1083,11 @@ impl MdEditorApp {
         if !ctx.input(|input| input.viewport().close_requested()) {
             return;
         }
+        // Persist the last visible appearance as a final guard for window-manager close
+        // requests. The toggle writes eagerly, while this covers an immediate shutdown.
+        if let Err(error) = theme::save_dark_mode(self.dark) {
+            self.status_note = format!("外观偏好保存失败：{error}");
+        }
         match self.prepare_window_close() {
             window_close::CloseAction::Allow => {
                 if self.recovery.is_none() {
@@ -1150,6 +1156,15 @@ impl MdEditorApp {
         apply_visuals(ctx, self.dark, &self.theme_spec());
     }
 
+    fn toggle_dark_mode(&mut self, ctx: &egui::Context) {
+        self.dark = !self.dark;
+        self.theme_revision = self.theme_revision.wrapping_add(1);
+        self.apply_current_theme(ctx);
+        if let Err(error) = theme::save_dark_mode(self.dark) {
+            self.status_note = format!("外观偏好保存失败：{error}");
+        }
+    }
+
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn browser_document(&mut self) -> Arc<web_preview::PreviewDocument> {
         let base_directory = self
@@ -1172,15 +1187,17 @@ impl MdEditorApp {
 
         let built_in = ThemePackage::built_in_sspai();
         let package = self.theme_package.as_ref().unwrap_or(&built_in);
-        let css = package.browser_css().unwrap_or(theme::BUILT_IN_SSPAI_CSS);
+        let base_css = package.browser_css().unwrap_or(theme::BUILT_IN_SSPAI_CSS);
+        let dark_css = self.dark.then(|| theme::dark_mode_css(&self.theme_spec()));
         let default_size = package.recommended_body_font_size();
         let font_override =
             ((self.body_font_size - default_size).abs() > 0.01).then_some(self.body_font_size);
         let document = Arc::new(web_preview::preview_document(
             &self.document,
-            css,
+            base_css,
             base_directory.as_deref(),
             font_override,
+            dark_css.as_deref(),
         ));
         self.browser_document_cache = Some(BrowserDocumentCache {
             key,
@@ -1876,6 +1893,8 @@ impl MdEditorApp {
         export::ExportOptions {
             title,
             theme_css,
+            dark_mode: self.dark,
+            theme_spec: self.theme_spec(),
             base_directory: self.path.as_deref().and_then(Path::parent),
             body_font_size: ((self.body_font_size - default_size).abs() > 0.01)
                 .then_some(self.body_font_size),
@@ -1965,8 +1984,7 @@ impl MdEditorApp {
                     "深色外观"
                 };
                 if ui.button(theme).clicked() {
-                    self.dark = !self.dark;
-                    self.apply_current_theme(ui.ctx());
+                    self.toggle_dark_mode(ui.ctx());
                     ui.close();
                 }
             });
@@ -1996,8 +2014,7 @@ impl MdEditorApp {
                     "切换到暗色主题"
                 };
                 if ui.button(label).clicked() {
-                    self.dark = !self.dark;
-                    self.apply_current_theme(ctx);
+                    self.toggle_dark_mode(ctx);
                     ui.close();
                 }
             });
@@ -2188,8 +2205,7 @@ impl MdEditorApp {
                         "深色外观"
                     };
                     if ui.button(theme).clicked() {
-                        self.dark = !self.dark;
-                        self.apply_current_theme(ui.ctx());
+                        self.toggle_dark_mode(ui.ctx());
                         ui.close();
                     }
                 });
@@ -2422,50 +2438,67 @@ impl MdEditorApp {
 
     fn empty_workspace(&mut self, ui: &mut egui::Ui) {
         let top_space = (ui.available_height() * 0.28).clamp(72.0, 220.0);
-        ui.add_space(top_space);
-        ui.vertical_centered(|ui| {
-            ui.label(
-                egui::RichText::new("开始写作")
-                    .size(26.0)
-                    .strong()
-                    .color(ui.visuals().strong_text_color()),
-            );
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("新建文档，或打开已有的 Markdown 文件")
-                    .size(14.0)
-                    .weak(),
-            );
-            ui.add_space(22.0);
-            let mut create = false;
-            let mut open = false;
-            ui.horizontal_centered(|ui| {
-                create = ui
-                    .add_sized([116.0, 34.0], egui::Button::new("新建文档"))
-                    .clicked();
+        let panel_size = ui.available_size();
+        let panel_width = panel_size.x;
+        ui.allocate_ui_with_layout(
+            panel_size,
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.add_space(top_space);
+                ui.label(
+                    egui::RichText::new("开始写作")
+                        .size(26.0)
+                        .strong()
+                        .color(ui.visuals().strong_text_color()),
+                );
                 ui.add_space(8.0);
-                let accent = ui.visuals().selection.bg_fill;
-                let accent_text = ui.visuals().selection.stroke.color;
-                open = ui
-                    .add_sized(
-                        [116.0, 34.0],
-                        egui::Button::new(egui::RichText::new("打开文件…").color(accent_text))
-                            .fill(accent),
-                    )
-                    .clicked();
-            });
-            ui.add_space(18.0);
-            ui.label(
-                egui::RichText::new("也可以将 .md、.markdown 或 .txt 文件拖到这里")
-                    .size(12.0)
-                    .weak(),
-            );
-            if create {
-                self.new_tab();
-            } else if open {
-                self.open_file();
-            }
-        });
+                ui.label(
+                    egui::RichText::new("新建文档，或打开已有的 Markdown 文件")
+                        .size(14.0)
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("也可以将 .md、.markdown 或 .txt 文件拖到这里")
+                        .size(14.0)
+                        .weak(),
+                );
+                ui.add_space(18.0);
+                let mut create = false;
+                let mut open = false;
+                // Allocate the full row width explicitly: `vertical_centered` otherwise shrinks
+                // nested containers to their content width, leaving the actions at the left edge.
+                let row_width = panel_width;
+                let action_width = 116.0 * 2.0 + 8.0;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(row_width, 34.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(((row_width - action_width) * 0.5).max(0.0));
+                        create = ui
+                            .add_sized([116.0, 34.0], egui::Button::new("新建文档"))
+                            .clicked();
+                        ui.add_space(8.0);
+                        let accent = ui.visuals().selection.bg_fill;
+                        let accent_text = ui.visuals().selection.stroke.color;
+                        open = ui
+                            .add_sized(
+                                [116.0, 34.0],
+                                egui::Button::new(
+                                    egui::RichText::new("打开文件…").color(accent_text),
+                                )
+                                .fill(accent),
+                            )
+                            .clicked();
+                    },
+                );
+                if create {
+                    self.new_tab();
+                } else if open {
+                    self.open_file();
+                }
+            },
+        );
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -2818,6 +2851,11 @@ impl MdEditorApp {
 impl eframe::App for MdEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Keep the rendered egui palette in lockstep with the persisted appearance state.
+        // This also repairs the first frame after startup/window restoration if another
+        // egui component has reinstalled its default visuals.
+        let current_theme = self.theme_spec();
+        apply_visuals(&ctx, self.dark, &current_theme);
         let now = ctx.input(|i| i.time);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut browser_rect = None;
@@ -3406,7 +3444,26 @@ fn apply_visuals(ctx: &egui::Context, dark: bool, spec: &ThemeSpec) {
     visuals.faint_bg_color = spec.quote_bg;
     visuals.hyperlink_color = spec.accent;
     visuals.override_text_color = Some(spec.text);
-    visuals.widgets.noninteractive.bg_stroke.color = spec.border;
+    let text_stroke = egui::Stroke::new(1.0, spec.text);
+    let border_stroke = egui::Stroke::new(1.0, spec.border);
+    visuals.widgets.noninteractive.fg_stroke = text_stroke;
+    visuals.widgets.inactive.fg_stroke = text_stroke;
+    visuals.widgets.hovered.fg_stroke = text_stroke;
+    visuals.widgets.active.fg_stroke = text_stroke;
+    visuals.widgets.noninteractive.bg_stroke = border_stroke;
+    visuals.widgets.inactive.bg_stroke = border_stroke;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, spec.accent);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, spec.accent);
+    visuals.widgets.noninteractive.bg_fill = spec.panel;
+    visuals.widgets.inactive.bg_fill = spec.panel;
+    visuals.widgets.hovered.bg_fill = spec.code_bg;
+    visuals.widgets.active.bg_fill = spec.accent.gamma_multiply(if dark { 0.32 } else { 0.16 });
+    visuals.widgets.noninteractive.weak_bg_fill = spec.panel;
+    visuals.widgets.inactive.weak_bg_fill = spec.panel;
+    visuals.widgets.hovered.weak_bg_fill =
+        spec.accent.gamma_multiply(if dark { 0.22 } else { 0.08 });
+    visuals.widgets.active.weak_bg_fill =
+        spec.accent.gamma_multiply(if dark { 0.32 } else { 0.16 });
     visuals.selection.bg_fill = spec.accent.gamma_multiply(if dark { 0.42 } else { 0.20 });
     if !dark {
         visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;

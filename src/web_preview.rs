@@ -904,6 +904,7 @@ pub fn document(
     css: &str,
     base_directory: Option<&Path>,
     font_size_override: Option<f32>,
+    dark_mode_css: Option<&str>,
 ) -> String {
     let markdown = document.normalized_source();
     let line_starts = source_line_starts(markdown);
@@ -952,6 +953,7 @@ pub fn document(
         .map(|size| crate::theme::font_size_override_css(css, size))
         .unwrap_or_default();
     let editor_font = editor_font_css();
+    let dark_mode_css = dark_mode_css.unwrap_or_default();
     let asset_origin = custom_protocol_script_source("mdfont");
     let mermaid_scripts = if has_mermaid {
         format!(
@@ -964,7 +966,7 @@ pub fn document(
     };
 
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src {asset_origin}; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}</style>{mermaid_scripts}</head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src {asset_origin}; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{dark_mode_css}</style>{mermaid_scripts}</head><body>{body}</body></html>"
     )
 }
 
@@ -973,8 +975,15 @@ pub fn preview_document(
     css: &str,
     base_directory: Option<&Path>,
     font_size_override: Option<f32>,
+    dark_mode_css: Option<&str>,
 ) -> PreviewDocument {
-    let html = self::document(document, css, base_directory, font_size_override);
+    let html = self::document(
+        document,
+        css,
+        base_directory,
+        font_size_override,
+        dark_mode_css,
+    );
     virtualize_document(html)
 }
 
@@ -1598,7 +1607,7 @@ mod tests {
         font_size_override: Option<f32>,
     ) -> String {
         let parsed = crate::markdown::parse_document(markdown);
-        document(&parsed, css, base_directory, font_size_override)
+        document(&parsed, css, base_directory, font_size_override, None)
     }
 
     #[test]
@@ -1632,7 +1641,8 @@ mod tests {
     fn large_preview_is_split_into_virtual_chunks_without_wrapping_theme_nodes() {
         let markdown = "## 章节\n\n正文段落。\n\n".repeat(30_000);
         let parsed = crate::markdown::parse_document(&markdown);
-        let preview = super::preview_document(&parsed, "body > h2 { color: red; }", None, None);
+        let preview =
+            super::preview_document(&parsed, "body > h2 { color: red; }", None, None, None);
         assert!(preview.chunks.len() > 2);
         assert!(preview.shell.contains("md-virtual-manifest"));
         assert!(preview.shell.contains("virtual-preview.js"));
@@ -1971,6 +1981,22 @@ mod tests {
         let html = render_document("## 小结", crate::theme::BUILT_IN_SSPAI_CSS, None, None);
         assert!(html.contains("<h2 id=\"md-heading-0\">小结</h2>"));
         assert!(html.contains("border-left: 6px solid #ff7e79"));
+    }
+
+    #[test]
+    fn 深色覆盖层位于浏览器兼容层之后() {
+        let parsed = crate::markdown::parse_document("# 深色\n\n正文");
+        let html = document(
+            &parsed,
+            "body { color: white; }",
+            None,
+            None,
+            Some(":root{color-scheme:dark;}"),
+        );
+        let raw_theme = html.find("body { color: white; }").unwrap();
+        let compatibility = html.find("body,pre,code").unwrap();
+        let dark = html.find(":root{color-scheme:dark;}").unwrap();
+        assert!(raw_theme < compatibility && compatibility < dark);
     }
 
     #[test]

@@ -220,6 +220,8 @@ fn benchmark_case(label: &str, path: &Path) -> Result<BenchmarkReport, String> {
     let export_options = export::ExportOptions {
         title: "长文档性能基准",
         theme_css: include_str!("../../assets/sspai.css"),
+        dark_mode: false,
+        theme_spec: theme::ThemeSpec::fallback(false),
         base_directory: path.parent(),
         body_font_size: None,
     };
@@ -261,7 +263,13 @@ fn benchmark_case(label: &str, path: &Path) -> Result<BenchmarkReport, String> {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn browser_document(document: &markdown::ParsedDocument) -> web_preview::PreviewDocument {
-    web_preview::preview_document(document, include_str!("../../assets/sspai.css"), None, None)
+    web_preview::preview_document(
+        document,
+        include_str!("../../assets/sspai.css"),
+        None,
+        None,
+        None,
+    )
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
