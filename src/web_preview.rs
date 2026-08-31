@@ -1314,16 +1314,16 @@ fn local_image_url(destination: &str, base_directory: Option<&Path>) -> Option<S
 
 fn editor_font_css() -> String {
     format!(
-        "@font-face{{font-family:'Markdown Editor Mono';src:url('{}') format('truetype');font-style:normal;font-weight:400;font-display:block;}}\
-         @font-face{{font-family:'Markdown Editor Mono';src:url('{}') format('truetype');font-style:normal;font-weight:700;font-display:block;}}\
-         @font-face{{font-family:'LXGW WenKai Lite';src:url('{}') format('truetype');font-style:normal;font-weight:400;font-display:block;}}\
-         @font-face{{font-family:'LXGW WenKai Lite';src:url('{}') format('truetype');font-style:normal;font-weight:500;font-display:block;}}\
+        "@font-face{{font-family:'Markdown Editor Mono';src:url('{}') format('woff');font-style:normal;font-weight:400;font-display:block;}}\
+         @font-face{{font-family:'Markdown Editor Mono';src:url('{}') format('woff');font-style:normal;font-weight:700;font-display:block;}}\
+         @font-face{{font-family:'LXGW WenKai Lite';src:url('{}') format('woff');font-style:normal;font-weight:400;font-display:block;}}\
+         @font-face{{font-family:'LXGW WenKai Lite';src:url('{}') format('woff');font-style:normal;font-weight:500;font-display:block;}}\
          body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono','LXGW WenKai Lite','SimHei','DengXian','SimSun','Microsoft YaHei',monospace!important;font-synthesis:weight;}}\
          strong,b{{font-weight:800!important;}}",
-        custom_protocol_url("mdfont", "jetbrains-regular.ttf"),
-        custom_protocol_url("mdfont", "jetbrains-bold.ttf"),
-        custom_protocol_url("mdfont", "lxgw-regular.ttf"),
-        custom_protocol_url("mdfont", "lxgw-medium.ttf")
+        custom_protocol_url("mdfont", "jetbrains-regular.woff"),
+        custom_protocol_url("mdfont", "jetbrains-bold.woff"),
+        custom_protocol_url("mdfont", "lxgw-regular.woff"),
+        custom_protocol_url("mdfont", "lxgw-medium.woff")
     )
 }
 
@@ -1369,24 +1369,24 @@ fn preview_document_response(
 fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
     let (bytes, content_type, cache_control): (&'static [u8], &str, &str) =
         match request.uri().path() {
-            "/jetbrains-regular.ttf" => (
-                crate::export::jetbrains_mono_regular_bytes(),
-                "font/ttf",
+            "/jetbrains-regular.woff" => (
+                JB_MONO_REGULAR_WOFF,
+                "font/woff",
                 "public, max-age=31536000, immutable",
             ),
-            "/jetbrains-bold.ttf" => (
-                crate::export::jetbrains_mono_bold_bytes(),
-                "font/ttf",
+            "/jetbrains-bold.woff" => (
+                JB_MONO_BOLD_WOFF,
+                "font/woff",
                 "public, max-age=31536000, immutable",
             ),
-            "/lxgw-regular.ttf" => (
-                crate::export::lxgw_wenkai_regular_bytes(),
-                "font/ttf",
+            "/lxgw-regular.woff" => (
+                LXGW_WENKAI_REGULAR_WOFF,
+                "font/woff",
                 "public, max-age=31536000, immutable",
             ),
-            "/lxgw-medium.ttf" => (
-                crate::export::lxgw_wenkai_medium_bytes(),
-                "font/ttf",
+            "/lxgw-medium.woff" => (
+                LXGW_WENKAI_MEDIUM_WOFF,
+                "font/woff",
                 "public, max-age=31536000, immutable",
             ),
             "/mermaid.min.js" => (
@@ -1422,22 +1422,27 @@ fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u
 
 fn preview_font_asset_index(path: &str) -> Option<usize> {
     match path {
-        "/jetbrains-regular.ttf" => Some(0),
-        "/jetbrains-bold.ttf" => Some(1),
-        "/lxgw-regular.ttf" => Some(2),
-        "/lxgw-medium.ttf" => Some(3),
+        "/jetbrains-regular.woff" => Some(0),
+        "/jetbrains-bold.woff" => Some(1),
+        "/lxgw-regular.woff" => Some(2),
+        "/lxgw-medium.woff" => Some(3),
         _ => None,
     }
 }
 
 fn preview_font_asset_sizes() -> [usize; 4] {
     [
-        crate::export::jetbrains_mono_regular_bytes().len(),
-        crate::export::jetbrains_mono_bold_bytes().len(),
-        crate::export::lxgw_wenkai_regular_bytes().len(),
-        crate::export::lxgw_wenkai_medium_bytes().len(),
+        JB_MONO_REGULAR_WOFF.len(),
+        JB_MONO_BOLD_WOFF.len(),
+        LXGW_WENKAI_REGULAR_WOFF.len(),
+        LXGW_WENKAI_MEDIUM_WOFF.len(),
     ]
 }
+
+const JB_MONO_REGULAR_WOFF: &[u8] = include_bytes!("../fonts/web/JetBrainsMono-Regular.woff");
+const JB_MONO_BOLD_WOFF: &[u8] = include_bytes!("../fonts/web/JetBrainsMono-Bold.woff");
+const LXGW_WENKAI_REGULAR_WOFF: &[u8] = include_bytes!("../fonts/web/LXGWWenKaiLite-Regular.woff");
+const LXGW_WENKAI_MEDIUM_WOFF: &[u8] = include_bytes!("../fonts/web/LXGWWenKaiLite-Medium.woff");
 
 fn local_image_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
     let result = request
@@ -1724,6 +1729,7 @@ fn normalize_footnote_dom(body: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
+        JB_MONO_BOLD_WOFF, JB_MONO_REGULAR_WOFF, LXGW_WENKAI_MEDIUM_WOFF, LXGW_WENKAI_REGULAR_WOFF,
         MERMAID_BOOTSTRAP, SCROLL_SYNC_SCRIPT, VIRTUAL_PREVIEW_SCRIPT,
         custom_protocol_script_source, custom_protocol_url, document, local_image_response,
         local_image_url, parse_ready_message, parse_source_message, preview_asset_response,
@@ -2114,7 +2120,8 @@ mod tests {
         );
         assert!(html.contains("@font-face{font-family:'Markdown Editor Mono'"));
         assert!(html.contains("font-family:'LXGW WenKai Lite'"));
-        assert!(html.contains(&custom_protocol_url("mdfont", "lxgw-regular.ttf")));
+        assert!(html.contains(&custom_protocol_url("mdfont", "lxgw-regular.woff")));
+        assert!(html.contains("format('woff')"));
         assert!(html.contains(
             "body,pre,code,blockquote::before,blockquote::after{font-family:'Markdown Editor Mono','LXGW WenKai Lite'"
         ));
@@ -2122,18 +2129,29 @@ mod tests {
     }
 
     #[test]
-    fn 本地协议提供内置霞鹜文楷字体() {
-        let request = Request::builder()
-            .uri("mdfont://localhost/lxgw-regular.ttf")
-            .body(Vec::new())
-            .unwrap();
-        let response = preview_asset_response(request);
-        assert_eq!(response.status(), 200);
-        assert_eq!(response.headers()["content-type"], "font/ttf");
-        assert_eq!(
-            response.body().len(),
-            crate::export::lxgw_wenkai_regular_bytes().len()
-        );
+    fn 本地协议提供四种_webview_专用字体() {
+        for (path, expected) in [
+            ("jetbrains-regular.woff", JB_MONO_REGULAR_WOFF),
+            ("jetbrains-bold.woff", JB_MONO_BOLD_WOFF),
+            ("lxgw-regular.woff", LXGW_WENKAI_REGULAR_WOFF),
+            ("lxgw-medium.woff", LXGW_WENKAI_MEDIUM_WOFF),
+        ] {
+            let request = Request::builder()
+                .uri(format!("mdfont://localhost/{path}"))
+                .body(Vec::new())
+                .unwrap();
+            let response = preview_asset_response(request);
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["content-type"], "font/woff");
+            assert_eq!(response.body().len(), expected.len());
+        }
+
+        let web_font_bytes = super::preview_font_asset_sizes().into_iter().sum::<usize>();
+        let source_font_bytes = crate::export::jetbrains_mono_regular_bytes().len()
+            + crate::export::jetbrains_mono_bold_bytes().len()
+            + crate::export::lxgw_wenkai_regular_bytes().len()
+            + crate::export::lxgw_wenkai_medium_bytes().len();
+        assert!(web_font_bytes < source_font_bytes);
     }
 
     #[test]
