@@ -35,6 +35,7 @@ const PRIMARY_SHORTCUT: &str = "⌘";
 const PRIMARY_SHORTCUT: &str = "Ctrl";
 
 const EXTERNAL_POLL_INTERVAL: f64 = 0.35;
+const PREVIEW_REFRESH_DEBOUNCE_SECONDS: f64 = 0.2;
 const EXTERNAL_STABLE_DELAY: f64 = 0.45;
 
 fn main() -> eframe::Result {
@@ -279,6 +280,16 @@ struct BrowserDocumentKey {
     theme_revision: u64,
     body_font_size_bits: u32,
     base_directory: Option<PathBuf>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl BrowserDocumentKey {
+    fn same_render_context(&self, other: &Self) -> bool {
+        self.tab_id == other.tab_id
+            && self.theme_revision == other.theme_revision
+            && self.body_font_size_bits == other.body_font_size_bits
+            && self.base_directory == other.base_directory
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1166,7 +1177,10 @@ impl MdEditorApp {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn browser_document(&mut self) -> Arc<web_preview::PreviewDocument> {
+    fn browser_document(
+        &mut self,
+        defer_document_refresh: bool,
+    ) -> Arc<web_preview::PreviewDocument> {
         let base_directory = self
             .path
             .as_deref()
@@ -1181,6 +1195,12 @@ impl MdEditorApp {
         };
         if let Some(cache) = &self.browser_document_cache
             && cache.key == key
+        {
+            return Arc::clone(&cache.document);
+        }
+        if defer_document_refresh
+            && let Some(cache) = &self.browser_document_cache
+            && cache.key.same_render_context(&key)
         {
             return Arc::clone(&cache.document);
         }
@@ -3156,7 +3176,14 @@ impl eframe::App for MdEditorApp {
                 self.release_browser_preview();
             } else if let Some(rect) = browser_rect {
                 self.browser_preview.discard_frozen_frame();
-                let document = self.browser_document();
+                let preview_refresh_remaining = (self.view_mode == ViewMode::Split
+                    && self.last_edit_time.is_finite())
+                .then(|| PREVIEW_REFRESH_DEBOUNCE_SECONDS - (now - self.last_edit_time))
+                .filter(|remaining| *remaining > 0.0);
+                if let Some(remaining) = preview_refresh_remaining {
+                    ctx.request_repaint_after(Duration::from_secs_f64(remaining));
+                }
+                let document = self.browser_document(preview_refresh_remaining.is_some());
                 if let Err(error) =
                     self.browser_preview
                         .show(frame, &ctx, rect, ctx.pixels_per_point(), &document)
@@ -3625,7 +3652,7 @@ mod app_tests {
     #[test]
     fn leaving_preview_releases_the_rendered_document_cache() {
         let mut app = app_with_two_tabs();
-        let document = app.browser_document();
+        let document = app.browser_document(false);
         assert!(app.browser_document_cache.is_some());
         assert!(std::sync::Arc::strong_count(&document) > 1);
 
@@ -3633,6 +3660,34 @@ mod app_tests {
 
         assert!(app.browser_document_cache.is_none());
         assert_eq!(std::sync::Arc::strong_count(&document), 1);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn split_editing_reuses_the_previous_preview_during_debounce() {
+        let mut app = app_with_two_tabs();
+        let initial = app.browser_document(false);
+        app.text = "# 已更新\n".to_string();
+        app.document = markdown::parse_document(&app.text);
+        app.document_revision = app.document_revision.wrapping_add(1);
+
+        let deferred = app.browser_document(true);
+        assert!(std::sync::Arc::ptr_eq(&initial, &deferred));
+
+        let refreshed = app.browser_document(false);
+        assert!(!std::sync::Arc::ptr_eq(&initial, &refreshed));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn debounce_never_reuses_another_tabs_preview() {
+        let mut app = app_with_two_tabs();
+        let first = app.browser_document(false);
+
+        app.activate_tab(1);
+        let second = app.browser_document(true);
+
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
     }
 
     #[test]
