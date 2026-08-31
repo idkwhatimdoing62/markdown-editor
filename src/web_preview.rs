@@ -28,6 +28,7 @@ pub struct BrowserPreview {
     scroll_bridge: Arc<Mutex<ScrollBridge>>,
     document_payload: Arc<Mutex<Option<Arc<PreviewDocument>>>>,
     local_image_requests: Arc<AtomicUsize>,
+    mermaid_runtime_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -463,6 +464,7 @@ impl Default for BrowserPreview {
             scroll_bridge: Arc::new(Mutex::new(ScrollBridge::default())),
             document_payload: Arc::new(Mutex::new(None)),
             local_image_requests: Arc::new(AtomicUsize::new(0)),
+            mermaid_runtime_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -501,11 +503,15 @@ impl BrowserPreview {
             let drop_repaint_ctx = ctx.clone();
             let document_payload = Arc::clone(&self.document_payload);
             let local_image_requests = Arc::clone(&self.local_image_requests);
+            let mermaid_runtime_requests = Arc::clone(&self.mermaid_runtime_requests);
             let webview = builder
                 .with_custom_protocol("mdpreview".into(), move |_webview_id, request| {
                     preview_document_response(request, &document_payload)
                 })
-                .with_custom_protocol("mdfont".into(), |_webview_id, request| {
+                .with_custom_protocol("mdfont".into(), move |_webview_id, request| {
+                    if request.uri().path() == "/mermaid.min.js" {
+                        mermaid_runtime_requests.fetch_add(1, Ordering::Relaxed);
+                    }
                     preview_asset_response(request)
                 })
                 .with_custom_protocol("mdfile".into(), move |_webview_id, request| {
@@ -596,6 +602,7 @@ impl BrowserPreview {
 
     fn reset_scroll_bridge_for_document(&self) {
         self.local_image_requests.store(0, Ordering::Relaxed);
+        self.mermaid_runtime_requests.store(0, Ordering::Relaxed);
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             bridge.source_position = None;
             bridge.user_source_position = None;
@@ -709,6 +716,10 @@ impl BrowserPreview {
 
     pub fn local_image_request_count(&self) -> usize {
         self.local_image_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn mermaid_runtime_request_count(&self) -> usize {
+        self.mermaid_runtime_requests.load(Ordering::Relaxed)
     }
 
     pub fn source_position(&self) -> Option<f32> {
@@ -1700,6 +1711,18 @@ mod tests {
         preview.reset_scroll_bridge_for_document();
 
         assert_eq!(preview.local_image_request_count(), 0);
+    }
+
+    #[test]
+    fn changing_documents_resets_the_mermaid_runtime_request_counter() {
+        let preview = super::BrowserPreview::default();
+        preview
+            .mermaid_runtime_requests
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        preview.reset_scroll_bridge_for_document();
+
+        assert_eq!(preview.mermaid_runtime_request_count(), 0);
     }
 
     #[test]
