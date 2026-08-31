@@ -77,6 +77,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   let targetSource = 0;
   let anchorCache = null;
   let navigationRevision = 0;
+  let searchRevision = 0;
 
   const beginNavigation = () => {
     navigationRevision += 1;
@@ -196,6 +197,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   };
 
   window.__mdEditorFindText = async (query, sourcePosition, backwards = false) => {
+    const requestRevision = ++searchRevision;
     const needle = String(query || '');
     if (!needle) {
       window.getSelection()?.removeAllRanges();
@@ -208,6 +210,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
       window.__mdEditorSetSourcePosition(sourcePosition, true);
     }
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (requestRevision !== searchRevision) return;
     if (typeof window.find === 'function') {
       window.find(needle, false, !!backwards, true, false, false, false);
     }
@@ -1623,6 +1626,7 @@ mod tests {
     fn preview_search_loads_virtual_chunk_and_uses_browser_find() {
         assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorFindText"));
         assert!(SCROLL_SYNC_SCRIPT.contains("loadSource(sourcePosition)"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("requestRevision !== searchRevision"));
         assert!(SCROLL_SYNC_SCRIPT.contains("window.find(needle"));
     }
 
