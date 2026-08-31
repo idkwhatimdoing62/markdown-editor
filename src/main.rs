@@ -1253,6 +1253,7 @@ impl MdEditorApp {
             "content_height_css_px": ready.content_height,
             "viewport_height_css_px": ready.viewport_height,
             "dom_element_count": ready.element_count,
+            "local_image_requests_before_ready": self.browser_preview.local_image_request_count(),
             "error": ready.error,
         });
         let result = (|| -> Result<(), String> {

@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pulldown_cmark::{CowStr, Event, Tag, TagEnd, html};
@@ -26,6 +27,7 @@ pub struct BrowserPreview {
     frozen_frame: Option<egui::TextureHandle>,
     scroll_bridge: Arc<Mutex<ScrollBridge>>,
     document_payload: Arc<Mutex<Option<Arc<PreviewDocument>>>>,
+    local_image_requests: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -460,6 +462,7 @@ impl Default for BrowserPreview {
             frozen_frame: None,
             scroll_bridge: Arc::new(Mutex::new(ScrollBridge::default())),
             document_payload: Arc::new(Mutex::new(None)),
+            local_image_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -497,6 +500,7 @@ impl BrowserPreview {
             let drop_bridge = Arc::clone(&self.scroll_bridge);
             let drop_repaint_ctx = ctx.clone();
             let document_payload = Arc::clone(&self.document_payload);
+            let local_image_requests = Arc::clone(&self.local_image_requests);
             let webview = builder
                 .with_custom_protocol("mdpreview".into(), move |_webview_id, request| {
                     preview_document_response(request, &document_payload)
@@ -504,7 +508,8 @@ impl BrowserPreview {
                 .with_custom_protocol("mdfont".into(), |_webview_id, request| {
                     preview_asset_response(request)
                 })
-                .with_custom_protocol("mdfile".into(), |_webview_id, request| {
+                .with_custom_protocol("mdfile".into(), move |_webview_id, request| {
+                    local_image_requests.fetch_add(1, Ordering::Relaxed);
                     local_image_response(request)
                 })
                 .with_initialization_script(SCROLL_SYNC_SCRIPT)
@@ -590,6 +595,7 @@ impl BrowserPreview {
     }
 
     fn reset_scroll_bridge_for_document(&self) {
+        self.local_image_requests.store(0, Ordering::Relaxed);
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             bridge.source_position = None;
             bridge.user_source_position = None;
@@ -699,6 +705,10 @@ impl BrowserPreview {
             .lock()
             .ok()
             .and_then(|mut bridge| bridge.ready.take())
+    }
+
+    pub fn local_image_request_count(&self) -> usize {
+        self.local_image_requests.load(Ordering::Relaxed)
     }
 
     pub fn source_position(&self) -> Option<f32> {
@@ -1644,6 +1654,18 @@ mod tests {
         let bridge = preview.scroll_bridge.lock().expect("scroll bridge");
         assert_eq!(bridge.source_position, None);
         assert_eq!(bridge.user_source_position, None);
+    }
+
+    #[test]
+    fn changing_documents_resets_the_local_image_request_counter() {
+        let preview = super::BrowserPreview::default();
+        preview
+            .local_image_requests
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+
+        preview.reset_scroll_bridge_for_document();
+
+        assert_eq!(preview.local_image_request_count(), 0);
     }
 
     #[test]
