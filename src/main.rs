@@ -16,16 +16,17 @@ mod web_preview;
 mod window_close;
 mod window_session;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc::Receiver};
+use std::sync::{Arc, mpsc, mpsc::Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use egui::containers::scroll_area::ScrollAreaOutput;
 use markdown::{Block, ParsedDocument};
+use notify::Watcher;
 use theme::{ThemePackage, ThemeSpec};
 
 #[cfg(target_os = "macos")]
@@ -213,6 +214,54 @@ struct PendingExternalChange {
     stamp: io::FileStamp,
     bytes: Vec<u8>,
     first_seen: f64,
+}
+
+struct ExternalFileWatcher {
+    watcher: notify::RecommendedWatcher,
+    receiver: Receiver<notify::Result<notify::Event>>,
+    watched: HashSet<PathBuf>,
+}
+
+impl ExternalFileWatcher {
+    fn new() -> Option<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let watcher = notify::recommended_watcher(move |result| {
+            let _ = sender.send(result);
+        })
+        .ok()?;
+        Some(Self {
+            watcher,
+            receiver,
+            watched: HashSet::new(),
+        })
+    }
+
+    fn watch(&mut self, path: &Path) {
+        if self.watched.contains(path) {
+            return;
+        }
+        if self
+            .watcher
+            .watch(path, notify::RecursiveMode::NonRecursive)
+            .is_ok()
+        {
+            self.watched.insert(path.to_path_buf());
+        }
+    }
+
+    fn unwatch(&mut self, path: &Path) {
+        if self.watched.remove(path) {
+            let _ = self.watcher.unwatch(path);
+        }
+    }
+
+    fn drain_changed_paths(&self) -> HashSet<PathBuf> {
+        self.receiver
+            .try_iter()
+            .filter_map(Result::ok)
+            .flat_map(|event| event.paths)
+            .collect()
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -730,6 +779,7 @@ struct MdEditorApp {
     theme_revision: u64,
     auto_reload_external: bool,
     last_external_poll: f64,
+    external_watcher: Option<ExternalFileWatcher>,
     observed_file_stamps: HashMap<PathBuf, io::FileStamp>,
     pending_external_changes: HashMap<PathBuf, PendingExternalChange>,
     instance_requests: Option<Receiver<single_instance::OpenRequest>>,
@@ -805,6 +855,7 @@ impl MdEditorApp {
             theme_revision: 1,
             auto_reload_external: true,
             last_external_poll: f64::NEG_INFINITY,
+            external_watcher: ExternalFileWatcher::new(),
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
             instance_requests: None,
@@ -843,8 +894,24 @@ impl MdEditorApp {
     }
 
     fn push_tab(&mut self, tab: DocumentTab) {
+        let path = tab.path.clone();
         self.tabs.push(tab);
+        if let Some(path) = path {
+            self.watch_external_path(&path);
+        }
         self.activate_tab(self.tabs.len() - 1);
+    }
+
+    fn watch_external_path(&mut self, path: &Path) {
+        if let Some(watcher) = &mut self.external_watcher {
+            watcher.watch(path);
+        }
+    }
+
+    fn unwatch_external_path(&mut self, path: &Path) {
+        if let Some(watcher) = &mut self.external_watcher {
+            watcher.unwatch(path);
+        }
     }
 
     fn new_tab(&mut self) {
@@ -1018,7 +1085,11 @@ impl MdEditorApp {
             return;
         }
         let old_active = self.active_tab;
+        let removed_path = self.tabs[index].path.clone();
         self.tabs.remove(index);
+        if let Some(path) = removed_path {
+            self.unwatch_external_path(&path);
+        }
         self.pending_close = None;
         if self.tabs.is_empty() {
             let id = self.next_tab_id;
@@ -1192,7 +1263,13 @@ impl MdEditorApp {
         };
     }
 
-    fn probe_external_change(&mut self, path: &Path, snapshot: &[u8], now: f64) -> ExternalProbe {
+    fn probe_external_change(
+        &mut self,
+        path: &Path,
+        snapshot: &[u8],
+        now: f64,
+        force_read: bool,
+    ) -> ExternalProbe {
         let stamp = match io::file_stamp(path) {
             Ok(stamp) => stamp,
             Err(error) => {
@@ -1203,7 +1280,7 @@ impl MdEditorApp {
         };
 
         let stamp_changed = self.observed_file_stamps.get(path) != Some(&stamp);
-        if stamp_changed {
+        if stamp_changed || force_read {
             self.observed_file_stamps
                 .insert(path.to_path_buf(), stamp.clone());
             match io::read_snapshot_checked(path) {
@@ -1211,14 +1288,20 @@ impl MdEditorApp {
                     self.pending_external_changes.remove(path);
                 }
                 Ok(bytes) => {
-                    self.pending_external_changes.insert(
-                        path.to_path_buf(),
-                        PendingExternalChange {
-                            stamp,
-                            bytes,
-                            first_seen: now,
-                        },
-                    );
+                    let changed = self
+                        .pending_external_changes
+                        .get(path)
+                        .is_none_or(|pending| pending.stamp != stamp || pending.bytes != bytes);
+                    if changed {
+                        self.pending_external_changes.insert(
+                            path.to_path_buf(),
+                            PendingExternalChange {
+                                stamp,
+                                bytes,
+                                first_seen: now,
+                            },
+                        );
+                    }
                 }
                 Err(error) => return ExternalProbe::Missing(describe_read_error(&error)),
             }
@@ -1247,11 +1330,16 @@ impl MdEditorApp {
         }
         self.last_external_poll = now;
         let mut draft_state_changed = false;
+        let changed_paths = self
+            .external_watcher
+            .as_ref()
+            .map(ExternalFileWatcher::drain_changed_paths)
+            .unwrap_or_default();
 
         let active_path = self.path.clone();
         if let Some(path) = active_path {
             let snapshot = self.disk_snapshot.clone();
-            match self.probe_external_change(&path, &snapshot, now) {
+            match self.probe_external_change(&path, &snapshot, now, changed_paths.contains(&path)) {
                 ExternalProbe::Stable(bytes) => {
                     let active_index = self.active_tab;
                     match apply_external_bytes(&mut self.tabs[active_index], bytes) {
@@ -1283,7 +1371,7 @@ impl MdEditorApp {
                 continue;
             };
             let snapshot = self.tabs[index].disk_snapshot.clone();
-            match self.probe_external_change(&path, &snapshot, now) {
+            match self.probe_external_change(&path, &snapshot, now, changed_paths.contains(&path)) {
                 ExternalProbe::Stable(bytes) => {
                     match apply_external_bytes(&mut self.tabs[index], bytes) {
                         Ok(ExternalChangeResult::Unchanged) => {}
@@ -1604,6 +1692,7 @@ impl MdEditorApp {
                 if replace_blank {
                     let id = self.tabs[0].id;
                     self.tabs[0] = DocumentTab::from_file(id, path.clone(), text, snapshot);
+                    self.watch_external_path(path);
                     self.activate_tab(0);
                 } else {
                     let id = self.next_tab_id;
@@ -1654,6 +1743,7 @@ impl MdEditorApp {
             Ok(bytes) => {
                 self.disk_snapshot = bytes;
                 self.path = Some(path.clone());
+                self.watch_external_path(&path);
                 self.status = DocStatus::Saved;
                 self.conflict = None;
                 self.status_note = format!("已保存 {}", clock_time());
@@ -3477,6 +3567,7 @@ mod app_tests {
             theme_revision: 1,
             auto_reload_external: true,
             last_external_poll: f64::NEG_INFINITY,
+            external_watcher: None,
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
             instance_requests: None,
@@ -3911,6 +4002,32 @@ mod app_tests {
         assert_eq!(result, ExternalChangeResult::Reconciled);
         assert_eq!(tab.status, DocStatus::Saved);
         assert_eq!(tab.disk_snapshot, "共同的新内容".as_bytes());
+    }
+
+    #[test]
+    fn 文件通知可在时间戳和大小不变时触发读取() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-external-notify-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("notes.md");
+        std::fs::write(&path, "base").unwrap();
+        let mut app = app_with_two_tabs();
+        app.tabs[0] = DocumentTab::from_file(1, path.clone(), "base".to_string(), b"base".to_vec());
+        app.observed_file_stamps
+            .insert(path.clone(), io::file_stamp(&path).unwrap());
+        std::fs::write(&path, "next").unwrap();
+
+        assert!(matches!(
+            app.probe_external_change(&path, b"base", 0.0, true),
+            ExternalProbe::Waiting
+        ));
+        assert!(matches!(
+            app.probe_external_change(&path, b"base", EXTERNAL_STABLE_DELAY, false),
+            ExternalProbe::Stable(bytes) if bytes == b"next"
+        ));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
