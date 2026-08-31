@@ -766,6 +766,7 @@ struct MdEditorApp {
     search_document_revision: u64,
     search_focus_requested: bool,
     search_scroll_requested: bool,
+    search_backwards: bool,
     pending_close: Option<usize>,
     window_close_guard: window_close::CloseGuard,
     recovery: Option<io::DraftSession>,
@@ -842,6 +843,7 @@ impl MdEditorApp {
             search_document_revision: 0,
             search_focus_requested: false,
             search_scroll_requested: false,
+            search_backwards: false,
             pending_close: None,
             window_close_guard: window_close::CloseGuard::default(),
             recovery,
@@ -962,7 +964,8 @@ impl MdEditorApp {
         self.search_results = search::SearchResults::new(&self.text, &self.search_query);
         self.search_tab_id = Some(self.id);
         self.search_document_revision = self.document_revision;
-        self.search_scroll_requested = self.search_results.current_range().is_some();
+        self.search_scroll_requested = self.search_open;
+        self.search_backwards = false;
     }
 
     fn refresh_search_if_needed(&mut self) {
@@ -976,12 +979,14 @@ impl MdEditorApp {
 
     fn search_next(&mut self) {
         if self.search_results.next().is_some() {
+            self.search_backwards = false;
             self.search_scroll_requested = true;
         }
     }
 
     fn search_previous(&mut self) {
         if self.search_results.previous().is_some() {
+            self.search_backwards = true;
             self.search_scroll_requested = true;
         }
     }
@@ -2901,13 +2906,17 @@ impl eframe::App for MdEditorApp {
             .flatten();
         let scroll_to_search = std::mem::take(&mut self.search_scroll_requested);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let mut search_preview_target = (self.view_mode == ViewMode::Preview && scroll_to_search)
-            .then(|| {
-                search_range
-                    .as_ref()
-                    .map(|range| source_position_from_char(&self.text, range.start))
-            })
-            .flatten();
+        let mut search_preview_target =
+            (matches!(self.view_mode, ViewMode::Preview | ViewMode::Split) && scroll_to_search)
+                .then(|| {
+                    search_range
+                        .as_ref()
+                        .map(|range| source_position_from_char(&self.text, range.start))
+                })
+                .flatten();
+        let search_preview_clear = matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
+            && scroll_to_search
+            && search_range.is_none();
 
         match self.view_mode {
             ViewMode::Write => {
@@ -3108,16 +3117,21 @@ impl eframe::App for MdEditorApp {
                         }
                     }
                     if let Some(source_position) = search_preview_target.take() {
-                        match self
-                            .browser_preview
-                            .scroll_to_source_position(source_position, true)
-                        {
+                        match self.browser_preview.find_text(
+                            &self.search_query,
+                            source_position,
+                            self.search_backwards,
+                        ) {
                             Ok(()) => {
                                 self.preview_source_position = source_position;
                                 self.pending_preview_restore = None;
                             }
                             Err(error) => self.status_note = error,
                         }
+                    } else if search_preview_clear
+                        && let Err(error) = self.browser_preview.find_text("", 0.0, false)
+                    {
+                        self.status_note = error;
                     }
                     if let Some(ready) = self.browser_preview.take_ready() {
                         if let Some((tab_id, source_position)) = self.pending_preview_restore
@@ -3554,6 +3568,7 @@ mod app_tests {
             search_document_revision: 0,
             search_focus_requested: false,
             search_scroll_requested: false,
+            search_backwards: false,
             pending_close: None,
             window_close_guard: window_close::CloseGuard::default(),
             recovery: None,

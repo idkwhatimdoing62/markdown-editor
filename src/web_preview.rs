@@ -195,6 +195,24 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     }
   };
 
+  window.__mdEditorFindText = async (query, sourcePosition, backwards = false) => {
+    const needle = String(query || '');
+    if (!needle) {
+      window.getSelection()?.removeAllRanges();
+      return;
+    }
+    if (window.__mdVirtualPreview && Number.isFinite(sourcePosition)) {
+      await window.__mdVirtualPreview.loadSource(sourcePosition);
+    }
+    if (Number.isFinite(sourcePosition)) {
+      window.__mdEditorSetSourcePosition(sourcePosition, true);
+    }
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (typeof window.find === 'function') {
+      window.find(needle, false, !!backwards, true, false, false, false);
+    }
+  };
+
   window.addEventListener('scroll', () => {
     if (!scheduled) {
       scheduled = true;
@@ -685,6 +703,27 @@ impl BrowserPreview {
         webview
             .evaluate_script(&format!("window.__mdEditorScrollHeading?.({index});"))
             .map_err(|error| format!("无法定位章节：{error}"))
+    }
+
+    pub fn find_text(
+        &self,
+        query: &str,
+        source_position: f32,
+        backwards: bool,
+    ) -> Result<(), String> {
+        let Some(webview) = &self.webview else {
+            return Err("浏览器预览尚未就绪".to_string());
+        };
+        let query =
+            serde_json::to_string(query).map_err(|error| format!("无法编码查找文本：{error}"))?;
+        webview
+            .evaluate_script(&format!(
+                "window.__mdEditorFindText?.({}, {:.8}, {});",
+                query,
+                source_position.max(0.0),
+                if backwards { "true" } else { "false" }
+            ))
+            .map_err(|error| format!("无法查找预览文本：{error}"))
     }
 }
 
@@ -1578,6 +1617,13 @@ mod tests {
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("scrollHeading"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("window.__mdRenderMermaid"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("unload(chunk)"));
+    }
+
+    #[test]
+    fn preview_search_loads_virtual_chunk_and_uses_browser_find() {
+        assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorFindText"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("loadSource(sourcePosition)"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("window.find(needle"));
     }
 
     #[test]
