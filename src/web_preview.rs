@@ -981,8 +981,7 @@ pub fn document(
     let asset_origin = custom_protocol_script_source("mdfont");
     let mermaid_scripts = if has_mermaid {
         format!(
-            "<script defer src=\"{}\"></script><script defer src=\"{}\"></script>",
-            custom_protocol_url("mdfont", "mermaid.min.js"),
+            "<script defer src=\"{}\"></script>",
             custom_protocol_url("mdfont", "mermaid-init.js")
         )
     } else {
@@ -1448,12 +1447,38 @@ fn image_content_type(path: &Path) -> Option<&'static str> {
 }
 
 const MERMAID_BOOTSTRAP: &str = r#"
-(async () => {
+(() => {
+    const bootstrapUrl = document.currentScript?.src;
+    const runtimeUrl = bootstrapUrl ? new URL('mermaid.min.js', bootstrapUrl).href : null;
+    let runtimePromise = null;
     let initialized = false;
     let nextId = 0;
-    window.__mdRenderMermaid = async (root = document) => {
+    let renderQueue = Promise.resolve();
+
+    const loadRuntime = () => {
+      if (window.mermaid) return Promise.resolve(window.mermaid);
+      if (runtimePromise) return runtimePromise;
+      if (!runtimeUrl) return Promise.reject(new Error('Missing Mermaid runtime URL'));
+
+      runtimePromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = runtimeUrl;
+        script.addEventListener('load', () => {
+          if (window.mermaid) resolve(window.mermaid);
+          else reject(new Error('Mermaid runtime did not initialize'));
+        }, { once: true });
+        script.addEventListener('error', () => {
+          reject(new Error('Unable to load Mermaid runtime'));
+        }, { once: true });
+        document.head.append(script);
+      });
+      return runtimePromise;
+    };
+
+    const renderMermaid = async (root) => {
       const blocks = Array.from(root.querySelectorAll('pre > code.language-mermaid'));
       if (blocks.length === 0) return;
+      const mermaid = await loadRuntime();
       if (!initialized) {
         mermaid.initialize({
           startOnLoad: false,
@@ -1486,7 +1511,12 @@ const MERMAID_BOOTSTRAP: &str = r#"
         }
       }
     };
-    await window.__mdRenderMermaid(document);
+
+    window.__mdRenderMermaid = (root = document) => {
+      renderQueue = renderQueue.catch(() => {}).then(() => renderMermaid(root));
+      return renderQueue;
+    };
+    window.__mdRenderMermaid(document).catch((error) => console.error(error));
 })();
 "#;
 
@@ -1652,9 +1682,10 @@ fn normalize_footnote_dom(body: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCROLL_SYNC_SCRIPT, VIRTUAL_PREVIEW_SCRIPT, custom_protocol_script_source,
-        custom_protocol_url, document, local_image_response, local_image_url, parse_ready_message,
-        parse_source_message, preview_asset_response, source_line_at_byte, source_line_starts,
+        MERMAID_BOOTSTRAP, SCROLL_SYNC_SCRIPT, VIRTUAL_PREVIEW_SCRIPT,
+        custom_protocol_script_source, custom_protocol_url, document, local_image_response,
+        local_image_url, parse_ready_message, parse_source_message, preview_asset_response,
+        source_line_at_byte, source_line_starts,
     };
     use wry::http::Request;
 
@@ -2067,13 +2098,22 @@ mod tests {
             None,
         );
         assert!(html.contains("<pre data-language=\"mermaid\"><code class=\"language-mermaid\">"));
-        assert!(html.contains(&custom_protocol_url("mdfont", "mermaid.min.js")));
         assert!(html.contains(&custom_protocol_url("mdfont", "mermaid-init.js")));
+        assert!(!html.contains(&custom_protocol_url("mdfont", "mermaid.min.js")));
         assert!(html.contains(&format!(
             "script-src {}",
             custom_protocol_script_source("mdfont")
         )));
         assert!(!html.contains("script-src 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn mermaid_启动脚本按需加载运行库并串行渲染() {
+        assert!(MERMAID_BOOTSTRAP.contains("document.createElement('script')"));
+        assert!(MERMAID_BOOTSTRAP.contains("new URL('mermaid.min.js', bootstrapUrl)"));
+        assert!(MERMAID_BOOTSTRAP.contains("let runtimePromise = null"));
+        assert!(MERMAID_BOOTSTRAP.contains("let renderQueue = Promise.resolve()"));
+        assert!(MERMAID_BOOTSTRAP.contains("if (blocks.length === 0) return"));
     }
 
     #[test]
