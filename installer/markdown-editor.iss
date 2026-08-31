@@ -1,5 +1,5 @@
 #define MyAppName "Markdown 编辑器与预览器"
-#define MyAppVersion "0.1.21"
+#define MyAppVersion "0.1.22"
 #define MyAppPublisher "idkwhatimdoing62"
 #define MyAppURL "https://github.com/idkwhatimdoing62/markdown-editor"
 #define MyAppExeName "markdown-editor.exe"
