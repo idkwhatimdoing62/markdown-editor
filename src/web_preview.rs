@@ -29,6 +29,7 @@ pub struct BrowserPreview {
     document_payload: Arc<Mutex<Option<Arc<PreviewDocument>>>>,
     local_image_requests: Arc<AtomicUsize>,
     mermaid_runtime_requests: Arc<AtomicUsize>,
+    font_asset_requests: Arc<[AtomicUsize; 4]>,
 }
 
 #[derive(Clone)]
@@ -465,6 +466,7 @@ impl Default for BrowserPreview {
             document_payload: Arc::new(Mutex::new(None)),
             local_image_requests: Arc::new(AtomicUsize::new(0)),
             mermaid_runtime_requests: Arc::new(AtomicUsize::new(0)),
+            font_asset_requests: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
         }
     }
 }
@@ -504,13 +506,18 @@ impl BrowserPreview {
             let document_payload = Arc::clone(&self.document_payload);
             let local_image_requests = Arc::clone(&self.local_image_requests);
             let mermaid_runtime_requests = Arc::clone(&self.mermaid_runtime_requests);
+            let font_asset_requests = Arc::clone(&self.font_asset_requests);
             let webview = builder
                 .with_custom_protocol("mdpreview".into(), move |_webview_id, request| {
                     preview_document_response(request, &document_payload)
                 })
                 .with_custom_protocol("mdfont".into(), move |_webview_id, request| {
-                    if request.uri().path() == "/mermaid.min.js" {
+                    let path = request.uri().path();
+                    if path == "/mermaid.min.js" {
                         mermaid_runtime_requests.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if let Some(index) = preview_font_asset_index(path) {
+                        font_asset_requests[index].fetch_add(1, Ordering::Relaxed);
                     }
                     preview_asset_response(request)
                 })
@@ -603,6 +610,9 @@ impl BrowserPreview {
     fn reset_scroll_bridge_for_document(&self) {
         self.local_image_requests.store(0, Ordering::Relaxed);
         self.mermaid_runtime_requests.store(0, Ordering::Relaxed);
+        for requests in self.font_asset_requests.iter() {
+            requests.store(0, Ordering::Relaxed);
+        }
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             bridge.source_position = None;
             bridge.user_source_position = None;
@@ -720,6 +730,19 @@ impl BrowserPreview {
 
     pub fn mermaid_runtime_request_count(&self) -> usize {
         self.mermaid_runtime_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn font_asset_request_counts(&self) -> [usize; 4] {
+        std::array::from_fn(|index| self.font_asset_requests[index].load(Ordering::Relaxed))
+    }
+
+    pub fn font_asset_requested_bytes(&self) -> usize {
+        let counts = self.font_asset_request_counts();
+        counts
+            .into_iter()
+            .zip(preview_font_asset_sizes())
+            .map(|(count, size)| count.saturating_mul(size))
+            .sum()
     }
 
     pub fn source_position(&self) -> Option<f32> {
@@ -1397,6 +1420,25 @@ fn preview_asset_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u
         .expect("有效的预览资源响应")
 }
 
+fn preview_font_asset_index(path: &str) -> Option<usize> {
+    match path {
+        "/jetbrains-regular.ttf" => Some(0),
+        "/jetbrains-bold.ttf" => Some(1),
+        "/lxgw-regular.ttf" => Some(2),
+        "/lxgw-medium.ttf" => Some(3),
+        _ => None,
+    }
+}
+
+fn preview_font_asset_sizes() -> [usize; 4] {
+    [
+        crate::export::jetbrains_mono_regular_bytes().len(),
+        crate::export::jetbrains_mono_bold_bytes().len(),
+        crate::export::lxgw_wenkai_regular_bytes().len(),
+        crate::export::lxgw_wenkai_medium_bytes().len(),
+    ]
+}
+
 fn local_image_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
     let result = request
         .uri()
@@ -1754,6 +1796,19 @@ mod tests {
         preview.reset_scroll_bridge_for_document();
 
         assert_eq!(preview.mermaid_runtime_request_count(), 0);
+    }
+
+    #[test]
+    fn changing_documents_resets_font_asset_request_counters() {
+        let preview = super::BrowserPreview::default();
+        for requests in preview.font_asset_requests.iter() {
+            requests.store(2, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        preview.reset_scroll_bridge_for_document();
+
+        assert_eq!(preview.font_asset_request_counts(), [0; 4]);
+        assert_eq!(preview.font_asset_requested_bytes(), 0);
     }
 
     #[test]

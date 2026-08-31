@@ -1237,6 +1237,7 @@ impl MdEditorApp {
         let source_bytes = self.text.len();
         let block_count = self.document.blocks().len();
         let event_count = self.document.events().len();
+        let font_requests = self.browser_preview.font_asset_request_counts();
         let Some(probe) = &mut self.benchmark_probe else {
             return;
         };
@@ -1255,6 +1256,13 @@ impl MdEditorApp {
             "dom_element_count": ready.element_count,
             "local_image_requests_before_ready": self.browser_preview.local_image_request_count(),
             "mermaid_runtime_requests_before_ready": self.browser_preview.mermaid_runtime_request_count(),
+            "font_asset_requests_before_ready": {
+                "jetbrains_regular": font_requests[0],
+                "jetbrains_bold": font_requests[1],
+                "lxgw_regular": font_requests[2],
+                "lxgw_medium": font_requests[3],
+            },
+            "font_asset_bytes_before_ready": self.browser_preview.font_asset_requested_bytes(),
             "error": ready.error,
         });
         let result = (|| -> Result<(), String> {
