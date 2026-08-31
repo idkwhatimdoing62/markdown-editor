@@ -1002,18 +1002,12 @@ pub fn preview_document(
 
 fn virtualize_document(html: String) -> PreviewDocument {
     const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
+    const VIRTUALIZE_AT_IMAGES: usize = 8;
     const TARGET_CHUNK_BYTES: usize = 96 * 1024;
+    const TARGET_CHUNK_IMAGES: usize = 4;
+    const ESTIMATED_IMAGE_HEIGHT: f32 = 480.0;
     let hash = hash(&html);
     let total_bytes = html.len();
-    if total_bytes < VIRTUALIZE_AT_BYTES {
-        return PreviewDocument {
-            shell: html.into(),
-            chunks: Arc::from([]),
-            hash,
-            total_bytes,
-        };
-    }
-
     let Some(body_start_tag) = html.find("<body>") else {
         return PreviewDocument {
             shell: html.into(),
@@ -1032,14 +1026,34 @@ fn virtualize_document(html: String) -> PreviewDocument {
         };
     };
     let body = &html[body_start..body_end];
+    let image_positions = image_tag_positions(body);
+    if total_bytes < VIRTUALIZE_AT_BYTES && image_positions.len() <= VIRTUALIZE_AT_IMAGES {
+        return PreviewDocument {
+            shell: html.into(),
+            chunks: Arc::from([]),
+            hash,
+            total_bytes,
+        };
+    }
     let mut boundaries = vec![0usize];
     let mut search_from = 1usize;
     let mut chunk_start = 0usize;
+    let mut image_cursor = 0usize;
+    let mut chunk_image_start = 0usize;
     while let Some(relative) = body[search_from..].find("<!--md-source:") {
         let position = search_from + relative;
-        if position.saturating_sub(chunk_start) >= TARGET_CHUNK_BYTES {
+        while image_positions
+            .get(image_cursor)
+            .is_some_and(|image_position| *image_position < position)
+        {
+            image_cursor += 1;
+        }
+        if position.saturating_sub(chunk_start) >= TARGET_CHUNK_BYTES
+            || image_cursor.saturating_sub(chunk_image_start) >= TARGET_CHUNK_IMAGES
+        {
             boundaries.push(position);
             chunk_start = position;
+            chunk_image_start = image_cursor;
         }
         search_from = position + "<!--md-source:".len();
     }
@@ -1053,7 +1067,11 @@ fn virtualize_document(html: String) -> PreviewDocument {
         let end = pair[1];
         let source_start = source_marker_at(body, start).unwrap_or(0.0);
         let source_end_for_chunk = source_marker_at(body, end).unwrap_or(source_end);
-        let estimated_height = ((source_end_for_chunk - source_start).max(1.0) * 34.0).max(96.0);
+        let image_count = image_positions.partition_point(|position| *position < end)
+            - image_positions.partition_point(|position| *position < start);
+        let estimated_height = ((source_end_for_chunk - source_start).max(1.0) * 34.0)
+            .max(image_count as f32 * ESTIMATED_IMAGE_HEIGHT)
+            .max(96.0);
         let heading_bounds = heading_bounds(&body[start..end]);
         chunks.push(PreviewChunk {
             html: Arc::from(&body[start..end]),
@@ -1094,6 +1112,22 @@ fn virtualize_document(html: String) -> PreviewDocument {
         hash,
         total_bytes,
     }
+}
+
+fn image_tag_positions(html: &str) -> Vec<usize> {
+    let bytes = html.as_bytes();
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter_map(|(index, window)| {
+            (window[0] == b'<'
+                && window[1..].eq_ignore_ascii_case(b"img")
+                && bytes
+                    .get(index + 4)
+                    .is_some_and(|next| next.is_ascii_whitespace() || matches!(*next, b'/' | b'>')))
+            .then_some(index)
+        })
+        .collect()
 }
 
 fn source_marker_at(body: &str, position: usize) -> Option<f32> {
@@ -1695,6 +1729,31 @@ mod tests {
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("scrollHeading"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("window.__mdRenderMermaid"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("unload(chunk)"));
+    }
+
+    #[test]
+    fn image_dense_preview_is_virtualized_even_when_markdown_is_small() {
+        let markdown = (1..=20)
+            .map(|index| format!("![图片 {index}](images/{index}.png)\n\n"))
+            .collect::<String>();
+        let parsed = crate::markdown::parse_document(&markdown);
+        let preview = super::preview_document(&parsed, "", None, None, None);
+
+        assert!(preview.total_bytes < 512 * 1024);
+        assert!(preview.chunks.len() > 1);
+        assert!(preview.shell.contains("md-virtual-manifest"));
+        assert!(preview.chunks[0].html.matches("<img").count() <= 4);
+        assert!(preview.chunks[0].estimated_height >= 4.0 * 480.0);
+    }
+
+    #[test]
+    fn a_few_images_keep_the_direct_preview_path() {
+        let parsed =
+            crate::markdown::parse_document("![图片 1](images/1.png)\n\n![图片 2](images/2.png)\n");
+        let preview = super::preview_document(&parsed, "", None, None, None);
+
+        assert!(preview.chunks.is_empty());
+        assert!(!preview.shell.contains("md-virtual-manifest"));
     }
 
     #[test]
