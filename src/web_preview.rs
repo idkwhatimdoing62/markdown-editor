@@ -147,6 +147,28 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     return interpolate(y, anchorY(a), anchorY(b), a.source, b.source);
   };
 
+  const placeSearchAnchor = (sourcePosition, backwards) => {
+    const selection = window.getSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    if (!Number.isFinite(sourcePosition)) return;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
+    let candidate = null;
+    while (walker.nextNode()) {
+      const match = /^md-source:([0-9.]+)$/.exec(walker.currentNode.nodeValue || '');
+      if (!match || Number(match[1]) > sourcePosition) break;
+      candidate = walker.currentNode;
+    }
+    if (!candidate) return;
+    let element = candidate.nextSibling;
+    while (element && element.nodeType !== Node.ELEMENT_NODE) element = element.nextSibling;
+    if (!element) return;
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(!backwards);
+    selection.addRange(range);
+  };
+
   const report = () => {
     scheduled = false;
     const sourcePosition = sourceForY(window.scrollY);
@@ -206,6 +228,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     if (window.__mdVirtualPreview && Number.isFinite(sourcePosition)) {
       await window.__mdVirtualPreview.loadSource(sourcePosition);
     }
+    placeSearchAnchor(sourcePosition, backwards);
     if (Number.isFinite(sourcePosition)) {
       window.__mdEditorSetSourcePosition(sourcePosition, true);
     }
@@ -1626,6 +1649,7 @@ mod tests {
     fn preview_search_loads_virtual_chunk_and_uses_browser_find() {
         assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorFindText"));
         assert!(SCROLL_SYNC_SCRIPT.contains("loadSource(sourcePosition)"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("placeSearchAnchor(sourcePosition, backwards)"));
         assert!(SCROLL_SYNC_SCRIPT.contains("requestRevision !== searchRevision"));
         assert!(SCROLL_SYNC_SCRIPT.contains("window.find(needle"));
     }

@@ -977,6 +977,16 @@ impl MdEditorApp {
         }
     }
 
+    fn preview_search_has_match(&self) -> bool {
+        self.search_query.is_empty()
+            || !search::SearchResults::new(
+                &markdown::plain_text(self.document.blocks()),
+                &self.search_query,
+            )
+            .ranges()
+            .is_empty()
+    }
+
     fn search_next(&mut self) {
         if self.search_results.next().is_some() {
             self.search_backwards = false;
@@ -1330,16 +1340,16 @@ impl MdEditorApp {
             return;
         }
         ctx.request_repaint_after(Duration::from_secs_f64(EXTERNAL_POLL_INTERVAL));
-        if now - self.last_external_poll < EXTERNAL_POLL_INTERVAL {
-            return;
-        }
-        self.last_external_poll = now;
-        let mut draft_state_changed = false;
         let changed_paths = self
             .external_watcher
             .as_ref()
             .map(ExternalFileWatcher::drain_changed_paths)
             .unwrap_or_default();
+        if now - self.last_external_poll < EXTERNAL_POLL_INTERVAL && changed_paths.is_empty() {
+            return;
+        }
+        self.last_external_poll = now;
+        let mut draft_state_changed = false;
 
         let active_path = self.path.clone();
         if let Some(path) = active_path {
@@ -2360,10 +2370,17 @@ impl MdEditorApp {
                         .on_hover_text("上一项 · Shift+Enter")
                         .clicked();
                 });
-                let count = self.search_results.position().map_or_else(
-                    || "无结果".to_string(),
-                    |(current, total)| format!("{current} / {total}"),
-                );
+                let preview_has_match =
+                    !matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
+                        || self.preview_search_has_match();
+                let count = if !preview_has_match {
+                    "预览无结果".to_string()
+                } else {
+                    self.search_results.position().map_or_else(
+                        || "无结果".to_string(),
+                        |(current, total)| format!("{current} / {total}"),
+                    )
+                };
                 ui.label(egui::RichText::new(count).weak().size(12.0));
                 let response = ui.add_sized(
                     [260.0, 26.0],
@@ -2640,6 +2657,14 @@ impl MdEditorApp {
             .unwrap_or(0)
             .saturating_add(1);
         self.tabs = restored;
+        let watched_paths = self
+            .tabs
+            .iter()
+            .filter_map(|tab| tab.path.clone())
+            .collect::<Vec<_>>();
+        for path in watched_paths {
+            self.watch_external_path(&path);
+        }
         self.activate_tab(active_index);
         self.workspace_empty = false;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -2907,13 +2932,15 @@ impl eframe::App for MdEditorApp {
         let scroll_to_search = std::mem::take(&mut self.search_scroll_requested);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut search_preview_target =
-            (matches!(self.view_mode, ViewMode::Preview | ViewMode::Split) && scroll_to_search)
-                .then(|| {
-                    search_range
-                        .as_ref()
-                        .map(|range| source_position_from_char(&self.text, range.start))
-                })
-                .flatten();
+            (matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
+                && scroll_to_search
+                && self.preview_search_has_match())
+            .then(|| {
+                search_range
+                    .as_ref()
+                    .map(|range| source_position_from_char(&self.text, range.start))
+            })
+            .flatten();
         let search_preview_clear = matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
             && scroll_to_search
             && search_range.is_none();
@@ -4043,6 +4070,47 @@ mod app_tests {
             ExternalProbe::Stable(bytes) if bytes == b"next"
         ));
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn 恢复带路径的草稿标签会重新注册文件通知() {
+        let directory = std::env::temp_dir().join(format!(
+            "markdown-editor-restored-watch-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("restored.md");
+        std::fs::write(&path, "磁盘内容").unwrap();
+        let mut app = app_with_two_tabs();
+        app.external_watcher = ExternalFileWatcher::new();
+        let session = io::DraftSession::new(
+            7,
+            vec![io::DraftTab::new(
+                7,
+                Some(path.clone()),
+                "草稿内容".to_string(),
+                "磁盘内容".as_bytes(),
+            )],
+        );
+
+        app.restore_draft_session(session);
+
+        assert!(
+            app.external_watcher
+                .as_ref()
+                .is_some_and(|watcher| watcher.watched.contains(&path))
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn 预览搜索只把渲染后的可见文字视为匹配() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].document = markdown::parse_document("**可见文字** [链接](https://example.com)");
+        app.search_query = "可见文字".to_string();
+        assert!(app.preview_search_has_match());
+        app.search_query = "https://example.com".to_string();
+        assert!(!app.preview_search_has_match());
     }
 
     #[test]
