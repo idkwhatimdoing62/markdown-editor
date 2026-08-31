@@ -620,6 +620,9 @@ impl BrowserPreview {
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             *bridge = ScrollBridge::default();
         }
+        if let Ok(mut payload) = self.document_payload.lock() {
+            *payload = None;
+        }
     }
 
     /// Native child WebViews always sit above egui's render surface on Windows.
@@ -1599,6 +1602,23 @@ mod tests {
         parse_source_message, preview_asset_response, source_line_at_byte, source_line_starts,
     };
     use wry::http::Request;
+
+    #[test]
+    fn closing_preview_releases_retained_document_payload() {
+        let parsed = crate::markdown::parse_document("# 标题\n\n正文\n");
+        let document = std::sync::Arc::new(super::preview_document(&parsed, "", None, None, None));
+        let mut preview = super::BrowserPreview {
+            document_source: Some(std::sync::Arc::clone(&document)),
+            ..Default::default()
+        };
+        *preview.document_payload.lock().expect("document payload") =
+            Some(std::sync::Arc::clone(&document));
+
+        assert_eq!(std::sync::Arc::strong_count(&document), 3);
+        preview.close();
+
+        assert_eq!(std::sync::Arc::strong_count(&document), 1);
+    }
 
     fn render_document(
         markdown: &str,

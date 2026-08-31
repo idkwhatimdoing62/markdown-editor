@@ -1207,6 +1207,12 @@ impl MdEditorApp {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn release_browser_preview(&mut self) {
+        self.browser_preview.close();
+        self.browser_document_cache = None;
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn finish_benchmark_probe(&mut self, ready: web_preview::WebViewReady) {
         let source_bytes = self.text.len();
         let block_count = self.document.blocks().len();
@@ -2929,7 +2935,7 @@ impl eframe::App for MdEditorApp {
 
         if self.workspace_empty {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
-            self.browser_preview.close();
+            self.release_browser_preview();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(ui.visuals().window_fill))
                 .show(ui, |ui| self.empty_workspace(ui));
@@ -3147,7 +3153,7 @@ impl eframe::App for MdEditorApp {
                     ctx.pixels_per_point(),
                 );
             } else if browser_rect.is_none() {
-                self.browser_preview.close();
+                self.release_browser_preview();
             } else if let Some(rect) = browser_rect {
                 self.browser_preview.discard_frozen_frame();
                 let document = self.browser_document();
@@ -3613,6 +3619,20 @@ mod app_tests {
 
         assert_eq!(app.id, 2);
         assert_eq!(app.pending_preview_restore, Some((2, 42.0)));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn leaving_preview_releases_the_rendered_document_cache() {
+        let mut app = app_with_two_tabs();
+        let document = app.browser_document();
+        assert!(app.browser_document_cache.is_some());
+        assert!(std::sync::Arc::strong_count(&document) > 1);
+
+        app.release_browser_preview();
+
+        assert!(app.browser_document_cache.is_none());
+        assert_eq!(std::sync::Arc::strong_count(&document), 1);
     }
 
     #[test]
