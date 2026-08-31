@@ -497,10 +497,10 @@ impl Builder {
     fn end(&mut self, tag_end: TagEnd) {
         match tag_end {
             TagEnd::Paragraph => {
-                if let Some(Frame::Paragraph { inlines }) = self.stack.pop() {
-                    if !inlines.is_empty() {
-                        self.block(Block::Paragraph(inlines));
-                    }
+                if let Some(Frame::Paragraph { inlines }) = self.stack.pop()
+                    && !inlines.is_empty()
+                {
+                    self.block(Block::Paragraph(inlines));
                 }
             }
             TagEnd::Heading(_) => {
@@ -542,10 +542,10 @@ impl Builder {
             }
             TagEnd::Item => {
                 self.close_open_paragraph();
-                if let Some(Frame::List { cur, items, .. }) = self.stack.last_mut() {
-                    if !cur.is_empty() {
-                        items.push(std::mem::take(cur));
-                    }
+                if let Some(Frame::List { cur, items, .. }) = self.stack.last_mut()
+                    && !cur.is_empty()
+                {
+                    items.push(std::mem::take(cur));
                 }
             }
             TagEnd::Table => {

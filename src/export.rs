@@ -86,8 +86,8 @@ pub fn export_pdf(
         ..Default::default()
     };
     let mut warnings = Vec::new();
-    let doc = printpdf::PdfDocument::from_html(&html_doc, &images, &fonts, &options, &mut warnings)
-        .map_err(|e| e)?;
+    let doc =
+        printpdf::PdfDocument::from_html(&html_doc, &images, &fonts, &options, &mut warnings)?;
     let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
     std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
@@ -278,23 +278,31 @@ fn escape_html(value: &str) -> String {
 
 fn annotate_code_languages(body: &mut String) {
     const OPEN: &str = "<pre><code class=\"language-";
+    let source = body.as_str();
+    let mut output = String::with_capacity(source.len() + source.len() / 64);
     let mut search_from = 0;
-    while let Some(relative_start) = body[search_from..].find(OPEN) {
+    while let Some(relative_start) = source[search_from..].find(OPEN) {
         let pre_start = search_from + relative_start;
+        output.push_str(&source[search_from..pre_start]);
         let language_start = pre_start + OPEN.len();
-        let Some(language_end_relative) = body[language_start..].find('"') else {
+        let Some(language_end_relative) = source[language_start..].find('"') else {
+            output.push_str(&source[pre_start..]);
+            search_from = source.len();
             break;
         };
         let language_end = language_start + language_end_relative;
-        let language = body[language_start..language_end].trim().to_string();
+        let language = source[language_start..language_end].trim();
+        output.push_str("<pre");
         if !language.is_empty() {
-            let attribute = format!(" data-language=\"{language}\"");
-            body.insert_str(pre_start + "<pre".len(), &attribute);
-            search_from = language_end + attribute.len() + 1;
-        } else {
-            search_from = language_end + 1;
+            output.push_str(" data-language=\"");
+            output.push_str(language);
+            output.push('"');
         }
+        output.push_str(&source[pre_start + "<pre".len()..language_end + 1]);
+        search_from = language_end + 1;
     }
+    output.push_str(&source[search_from..]);
+    *body = output;
 }
 
 fn normalize_footnote_dom(body: &mut String) {

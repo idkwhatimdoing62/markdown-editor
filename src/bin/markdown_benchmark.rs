@@ -10,6 +10,10 @@ mod export;
 mod html_image;
 #[path = "../markdown.rs"]
 mod markdown;
+#[path = "../storage.rs"]
+mod storage;
+#[path = "../theme.rs"]
+mod theme;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 #[path = "../web_preview.rs"]
 mod web_preview;

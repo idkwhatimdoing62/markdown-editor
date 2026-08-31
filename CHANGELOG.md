@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- 清理全部 11 条 Clippy 警告，保持 `cargo clippy --all-targets -- -D warnings` 通过。
+- 修复长文档基准程序缺少主题和存储模块依赖的问题，恢复三档 WebView 与进程树内存预算检查。
+
+### Performance
+
+- 10 MiB 文档发布前复测：WebView 就绪 4.35 秒，进程树峰值工作集 1002 MiB，满足 5 秒 / 2 GiB 预算。
+
 ## [0.1.21] - 2026-08-31
 
 ### Added

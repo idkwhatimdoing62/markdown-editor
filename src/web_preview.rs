@@ -841,7 +841,7 @@ pub fn document(
     font_size_override: Option<f32>,
 ) -> String {
     let markdown = document.normalized_source();
-    let line_starts = source_line_starts(&markdown);
+    let line_starts = source_line_starts(markdown);
     let has_mermaid = document.has_mermaid();
     let mut heading_index = 0usize;
     let mut block_depth = 0usize;
@@ -1448,24 +1448,31 @@ fn escape_attribute(value: &str) -> String {
 /// 把围栏代码的 `language-*` 类同步到 `<pre data-language>`，供右上角标签显示。
 fn annotate_code_languages(body: &mut String) {
     const OPEN: &str = "<pre><code class=\"language-";
+    let source = body.as_str();
+    let mut output = String::with_capacity(source.len() + source.len() / 64);
     let mut search_from = 0;
-    while let Some(relative_start) = body[search_from..].find(OPEN) {
+    while let Some(relative_start) = source[search_from..].find(OPEN) {
         let pre_start = search_from + relative_start;
+        output.push_str(&source[search_from..pre_start]);
         let language_start = pre_start + OPEN.len();
-        let Some(language_end_relative) = body[language_start..].find('"') else {
+        let Some(language_end_relative) = source[language_start..].find('"') else {
+            output.push_str(&source[pre_start..]);
+            search_from = source.len();
             break;
         };
         let language_end = language_start + language_end_relative;
-        let language = body[language_start..language_end].trim().to_string();
-        if language.is_empty() {
-            search_from = language_end + 1;
-            continue;
+        let language = source[language_start..language_end].trim();
+        output.push_str("<pre");
+        if !language.is_empty() {
+            output.push_str(" data-language=\"");
+            output.push_str(language);
+            output.push('"');
         }
-        let attribute = format!(" data-language=\"{language}\"");
-        let insertion = pre_start + "<pre".len();
-        body.insert_str(insertion, &attribute);
-        search_from = language_end + attribute.len() + 1;
+        output.push_str(&source[pre_start + "<pre".len()..language_end + 1]);
+        search_from = language_end + 1;
     }
+    output.push_str(&source[search_from..]);
+    *body = output;
 }
 
 /// pulldown-cmark 输出 `.footnote-definition`，而传统 Markdown Web 主题通常

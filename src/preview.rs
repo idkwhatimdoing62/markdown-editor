@@ -264,13 +264,13 @@ fn show_inlines_block(
         label = label.sense(egui::Sense::click());
     }
     let resp = ui.add(label);
-    if resp.clicked() {
-        if let Some(url) = links.first() {
-            ui.ctx().open_url(egui::OpenUrl {
-                url: url.clone(),
-                new_tab: true,
-            });
-        }
+    if resp.clicked()
+        && let Some(url) = links.first()
+    {
+        ui.ctx().open_url(egui::OpenUrl {
+            url: url.clone(),
+            new_tab: true,
+        });
     }
 }
 
@@ -336,23 +336,23 @@ fn push_inlines(
 /// 任务列表项：从第一段去掉 `[x] ` / `[ ] ` 前缀，返回勾选状态和剩余块。
 fn strip_task_marker(item: &[Block]) -> (Option<bool>, Vec<Block>) {
     let mut blocks = item.to_vec();
-    if let Some(Block::Paragraph(inlines)) = blocks.first_mut() {
-        if let Some(Inline::Text(t)) = inlines.first_mut() {
-            let state = if let Some(rest) = t.strip_prefix("[x] ") {
-                *t = rest.to_string();
-                Some(true)
-            } else if let Some(rest) = t.strip_prefix("[ ] ") {
-                *t = rest.to_string();
-                Some(false)
-            } else {
-                None
-            };
-            if state.is_some() && t.is_empty() {
-                inlines.remove(0);
-            }
-            if let Some(s) = state {
-                return (Some(s), blocks);
-            }
+    if let Some(Block::Paragraph(inlines)) = blocks.first_mut()
+        && let Some(Inline::Text(t)) = inlines.first_mut()
+    {
+        let state = if let Some(rest) = t.strip_prefix("[x] ") {
+            *t = rest.to_string();
+            Some(true)
+        } else if let Some(rest) = t.strip_prefix("[ ] ") {
+            *t = rest.to_string();
+            Some(false)
+        } else {
+            None
+        };
+        if state.is_some() && t.is_empty() {
+            inlines.remove(0);
+        }
+        if let Some(s) = state {
+            return (Some(s), blocks);
         }
     }
     (None, blocks)

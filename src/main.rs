@@ -1332,11 +1332,11 @@ impl MdEditorApp {
             return None;
         }
         let current_id = self.tabs[self.active_tab].id;
-        let active_tab_id = drafts
-            .iter()
-            .any(|draft| draft.id == current_id)
-            .then_some(current_id)
-            .unwrap_or(drafts[0].id);
+        let active_tab_id = if drafts.iter().any(|draft| draft.id == current_id) {
+            current_id
+        } else {
+            drafts[0].id
+        };
         Some(io::DraftSession::new(active_tab_id, drafts))
     }
 
@@ -1418,17 +1418,18 @@ impl MdEditorApp {
         let write_due = dirty_indices
             .iter()
             .any(|&index| now - self.tabs[index].draft_last_write > 30.0);
-        if all_idle && write_due {
-            if let Some(session) = self.draft_session() {
-                match io::save_draft_for_window(self.draft_window_id, &session) {
-                    Ok(()) => {
-                        for index in dirty_indices {
-                            self.tabs[index].draft_last_write = now;
-                        }
+        if all_idle
+            && write_due
+            && let Some(session) = self.draft_session()
+        {
+            match io::save_draft_for_window(self.draft_window_id, &session) {
+                Ok(()) => {
+                    for index in dirty_indices {
+                        self.tabs[index].draft_last_write = now;
                     }
-                    Err(error) => {
-                        self.status_note = format!("草稿会话保存失败：{error}");
-                    }
+                }
+                Err(error) => {
+                    self.status_note = format!("草稿会话保存失败：{error}");
                 }
             }
         }
@@ -2573,10 +2574,10 @@ impl MdEditorApp {
                 ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("恢复草稿").clicked() {
-                        if let Some(session) = self.recovery.take() {
-                            self.restore_draft_session(session);
-                        }
+                    if ui.button("恢复草稿").clicked()
+                        && let Some(session) = self.recovery.take()
+                    {
+                        self.restore_draft_session(session);
                     }
                     if ui.button("放弃草稿").clicked() {
                         self.recovery = None;
@@ -2838,8 +2839,10 @@ impl eframe::App for MdEditorApp {
                             editor_focused,
                             body_font_size,
                             &doc_theme,
-                            search_range.as_ref(),
-                            scroll_to_search,
+                            EditorSearchTarget {
+                                range: search_range.as_ref(),
+                                scroll_to_search,
+                            },
                         );
                     });
             }
@@ -2972,11 +2975,11 @@ impl eframe::App for MdEditorApp {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
             let popup_open = ctx.any_popup_open();
-            if popup_open && browser_rect.is_some() {
+            if popup_open && let Some(browser_rect) = browser_rect {
                 self.browser_preview.freeze_for_overlay(
                     frame,
                     &ctx,
-                    browser_rect.expect("已检查预览区域"),
+                    browser_rect,
                     ctx.pixels_per_point(),
                 );
             } else if browser_rect.is_none() {
@@ -3168,6 +3171,11 @@ fn show_preview_scroll(
         })
 }
 
+struct EditorSearchTarget<'a> {
+    range: Option<&'a Range<usize>>,
+    scroll_to_search: bool,
+}
+
 fn show_centered_editor(
     ui: &mut egui::Ui,
     tab_id: u64,
@@ -3175,8 +3183,7 @@ fn show_centered_editor(
     focused: &mut bool,
     font_size: f32,
     theme: &ThemeSpec,
-    search_range: Option<&Range<usize>>,
-    scroll_to_search: bool,
+    search: EditorSearchTarget<'_>,
 ) {
     egui::ScrollArea::vertical()
         .id_salt(document_scroll_id("editor_scroll_solo", tab_id))
@@ -3191,8 +3198,10 @@ fn show_centered_editor(
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.add_space(54.0);
-                        let output = editor_widget(ui, text, focused, font_size, search_range);
-                        if scroll_to_search && let Some(range) = search_range {
+                        let output = editor_widget(ui, text, focused, font_size, search.range);
+                        if search.scroll_to_search
+                            && let Some(range) = search.range
+                        {
                             scroll_editor_to_search(ui, &output, range);
                         }
                         ui.add_space(160.0);
