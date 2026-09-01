@@ -20,7 +20,10 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, mpsc, mpsc::Receiver};
+use std::sync::{
+    Arc, mpsc,
+    mpsc::{Receiver, Sender},
+};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -200,6 +203,7 @@ struct DocumentTab {
     status: DocStatus,
     document: ParsedDocument,
     document_revision: u64,
+    parse_pending: bool,
     status_note: String,
     conflict: Option<PathBuf>,
     draft_last_write: f64,
@@ -298,6 +302,59 @@ struct BrowserDocumentCache {
     document: Arc<web_preview::PreviewDocument>,
 }
 
+struct ParseRequest {
+    tab_id: u64,
+    revision: u64,
+    text: String,
+}
+
+struct ParseResult {
+    tab_id: u64,
+    revision: u64,
+    document: ParsedDocument,
+}
+
+struct ParseWorker {
+    requests: Sender<ParseRequest>,
+    results: Receiver<ParseResult>,
+}
+
+impl ParseWorker {
+    fn new() -> Self {
+        let (request_sender, request_receiver) = mpsc::channel::<ParseRequest>();
+        let (result_sender, result_receiver) = mpsc::channel::<ParseResult>();
+        std::thread::spawn(move || {
+            while let Ok(mut request) = request_receiver.recv() {
+                // If edits arrived while parsing was busy, skip queued intermediate
+                // revisions and parse only the newest snapshot.
+                while let Ok(newer) = request_receiver.try_recv() {
+                    request = newer;
+                }
+                let result = ParseResult {
+                    tab_id: request.tab_id,
+                    revision: request.revision,
+                    document: markdown::parse_document(&request.text),
+                };
+                if result_sender.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests: request_sender,
+            results: result_receiver,
+        }
+    }
+
+    fn submit(&self, request: ParseRequest) {
+        let _ = self.requests.send(request);
+    }
+
+    fn try_recv(&self) -> Result<ParseResult, mpsc::TryRecvError> {
+        self.results.try_recv()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalChangeResult {
     Unchanged,
@@ -322,6 +379,7 @@ impl DocumentTab {
             status: DocStatus::Unsaved,
             document: markdown::parse_document(""),
             document_revision: 0,
+            parse_pending: false,
             status_note: String::new(),
             conflict: None,
             draft_last_write: 0.0,
@@ -344,6 +402,7 @@ impl DocumentTab {
             status: DocStatus::Saved,
             document,
             document_revision: 1,
+            parse_pending: false,
             status_note: String::new(),
             conflict: None,
             draft_last_write: 0.0,
@@ -403,6 +462,7 @@ fn apply_external_bytes(
     tab.disk_snapshot = bytes;
     tab.document = markdown::parse_document(&tab.text);
     tab.document_revision = tab.document_revision.wrapping_add(1);
+    tab.parse_pending = false;
     tab.status = DocStatus::Saved;
     tab.conflict = None;
     tab.status_note = format!("已自动加载外部修改 {}", clock_time());
@@ -457,6 +517,7 @@ fn restore_draft_tab(draft: io::DraftTab) -> DocumentTab {
         status,
         document,
         document_revision: 1,
+        parse_pending: false,
         status_note,
         conflict,
         draft_last_write: 0.0,
@@ -794,6 +855,7 @@ struct MdEditorApp {
     external_watcher: Option<ExternalFileWatcher>,
     observed_file_stamps: HashMap<PathBuf, io::FileStamp>,
     pending_external_changes: HashMap<PathBuf, PendingExternalChange>,
+    parse_worker: ParseWorker,
     instance_requests: Option<Receiver<single_instance::OpenRequest>>,
     draft_window_id: Option<u32>,
     persisted_window_session: Option<window_session::WindowSession>,
@@ -872,6 +934,7 @@ impl MdEditorApp {
             external_watcher: ExternalFileWatcher::new(),
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
+            parse_worker: ParseWorker::new(),
             instance_requests: None,
             draft_window_id,
             persisted_window_session: None,
@@ -898,6 +961,47 @@ impl MdEditorApp {
         self.pending_preview_restore = Some((tab.id, tab.preview_source_position));
         self.active_tab = index;
         self.editor_focused = false;
+    }
+
+    fn queue_document_parse(&mut self, now: f64) {
+        if self.text == self.document.source() {
+            return;
+        }
+        self.document_revision = self.document_revision.wrapping_add(1);
+        self.parse_pending = true;
+        self.last_edit_time = now;
+        self.refresh_status();
+        self.parse_worker.submit(ParseRequest {
+            tab_id: self.id,
+            revision: self.document_revision,
+            text: self.text.clone(),
+        });
+    }
+
+    fn poll_document_parse_results(&mut self, ctx: &egui::Context) {
+        let mut active_document_changed = false;
+        let mut any_result = false;
+        while let Ok(result) = self.parse_worker.try_recv() {
+            any_result = true;
+            let Some(index) = self.tabs.iter().position(|tab| tab.id == result.tab_id) else {
+                continue;
+            };
+            let tab = &mut self.tabs[index];
+            if result.revision != tab.document_revision || tab.text != result.document.source() {
+                // A newer edit is already pending. Keep the gate closed until its
+                // matching result arrives.
+                continue;
+            }
+            tab.document = result.document;
+            tab.parse_pending = false;
+            active_document_changed |= index == self.active_tab;
+        }
+        if active_document_changed {
+            self.refresh_status();
+        }
+        if any_result {
+            ctx.request_repaint();
+        }
     }
 
     fn switch_tab(&mut self, index: usize) {
@@ -1861,6 +1965,7 @@ impl MdEditorApp {
                     self.disk_snapshot = io::read_snapshot(&path).unwrap_or_default();
                     self.document = markdown::parse_document(&self.text);
                     self.document_revision = self.document_revision.wrapping_add(1);
+                    self.parse_pending = false;
                     self.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
                     if let Err(error) = self.persist_draft_session() {
@@ -2899,6 +3004,7 @@ impl eframe::App for MdEditorApp {
         let mut split_editor_scroll = None;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut preview_heading_target = None;
+        let mut editor_changed = false;
 
         let mut dropped_paths = ctx.input(|input| {
             input
@@ -2915,11 +3021,11 @@ impl eframe::App for MdEditorApp {
 
         self.poll_external_changes(&ctx, now);
 
-        if self.text != self.document.source() {
-            self.document = markdown::parse_document(&self.text);
-            self.document_revision = self.document_revision.wrapping_add(1);
-            self.last_edit_time = now;
-            self.refresh_status();
+        self.poll_document_parse_results(&ctx);
+        if !self.parse_pending && self.text != self.document.source() {
+            // Catch programmatic changes that do not pass through the editor
+            // widget's changed flag.
+            self.queue_document_parse(now);
         }
 
         self.autosave_draft(now);
@@ -3032,7 +3138,7 @@ impl eframe::App for MdEditorApp {
                             .inner_margin(egui::Margin::symmetric(22, 0)),
                     )
                     .show(ui, |ui| {
-                        show_centered_editor(
+                        editor_changed = show_centered_editor(
                             ui,
                             active_tab_id,
                             &mut tabs[active_index].text,
@@ -3122,6 +3228,7 @@ impl eframe::App for MdEditorApp {
                             scroll_to_search,
                         )
                     });
+                editor_changed = editor_out.inner.inner.changed;
                 #[cfg(any(target_os = "windows", target_os = "macos"))]
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(ui.visuals().window_fill))
@@ -3170,6 +3277,10 @@ impl eframe::App for MdEditorApp {
                     split_editor_scroll = Some(editor_out.inner);
                 }
             }
+        }
+
+        if editor_changed {
+            self.queue_document_parse(now);
         }
 
         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -3274,6 +3385,7 @@ struct EditorWidgetOutput {
     id: egui::Id,
     galley: Arc<egui::Galley>,
     galley_pos: egui::Pos2,
+    changed: bool,
 }
 
 fn editor_widget(
@@ -3318,12 +3430,14 @@ fn editor_widget(
     } else {
         edit.show(ui)
     };
+    let changed = output.response.changed();
     *focused = output.response.has_focus();
     EditorWidgetOutput {
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         id,
         galley: output.galley,
         galley_pos: output.galley_pos,
+        changed,
     }
 }
 
@@ -3396,7 +3510,8 @@ fn show_centered_editor(
     font_size: f32,
     theme: &ThemeSpec,
     search: EditorSearchTarget<'_>,
-) {
+) -> bool {
+    let mut changed = false;
     egui::ScrollArea::vertical()
         .id_salt(document_scroll_id("editor_scroll_solo", tab_id))
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -3411,6 +3526,7 @@ fn show_centered_editor(
                     |ui| {
                         ui.add_space(54.0);
                         let output = editor_widget(ui, text, focused, font_size, search.range);
+                        changed = output.changed;
                         if search.scroll_to_search
                             && let Some(range) = search.range
                         {
@@ -3421,6 +3537,7 @@ fn show_centered_editor(
                 );
             });
         });
+    changed
 }
 
 fn show_centered_preview(
@@ -3754,6 +3871,7 @@ mod app_tests {
             external_watcher: None,
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
+            parse_worker: ParseWorker::new(),
             instance_requests: None,
             draft_window_id: None,
             persisted_window_session: None,
@@ -3766,6 +3884,24 @@ mod app_tests {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_document_cache: None,
         }
+    }
+
+    #[test]
+    fn 后台解析完成后应用当前标签文档() {
+        let mut app = app_with_two_tabs();
+        app.text = "# 后台解析\n\n正文".to_string();
+        app.queue_document_parse(1.0);
+        let revision = app.document_revision;
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.parse_pending {
+            app.poll_document_parse_results(&ctx);
+            assert!(Instant::now() < deadline, "后台解析未在测试期限内完成");
+            std::thread::yield_now();
+        }
+        assert_eq!(app.document_revision, revision);
+        assert_eq!(app.document.source(), "# 后台解析\n\n正文");
+        assert!(!app.parse_pending);
     }
 
     #[test]
