@@ -1,6 +1,7 @@
 //! 使用系统浏览器引擎执行主题 CSS 的 Markdown 预览。
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -47,6 +48,10 @@ pub struct PreviewDocument {
     has_mermaid: bool,
     total_bytes: usize,
     block_fingerprint: u64,
+    /// Stable identity for each top-level Markdown block, independent of its
+    /// position in the document. These IDs are embedded in the preview DOM so
+    /// navigation and incremental updates can target a block after edits.
+    block_ids: Arc<[u64]>,
 }
 
 const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
@@ -88,6 +93,16 @@ impl PreviewDocument {
     #[allow(dead_code)]
     pub fn virtual_chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Stable IDs for top-level Markdown blocks in document order.
+    ///
+    /// The IDs are derived from block content (with duplicate ordinals), not
+    /// from the block's current index, so callers can retain a target while
+    /// unrelated blocks are inserted or removed.
+    #[allow(dead_code)]
+    pub fn top_level_block_ids(&self) -> &[u64] {
+        &self.block_ids
     }
 
     /// Counts virtual chunks whose identity or rendered content changed.
@@ -1375,6 +1390,7 @@ fn capture_preview(
     }
 }
 
+#[allow(dead_code)]
 pub fn document(
     document: &crate::markdown::ParsedDocument,
     css: &str,
@@ -1382,11 +1398,31 @@ pub fn document(
     font_size_override: Option<f32>,
     dark_mode_css: Option<&str>,
 ) -> String {
+    let block_ids = stable_top_level_block_ids(document);
+    document_with_block_ids(
+        document,
+        css,
+        base_directory,
+        font_size_override,
+        dark_mode_css,
+        &block_ids,
+    )
+}
+
+fn document_with_block_ids(
+    document: &crate::markdown::ParsedDocument,
+    css: &str,
+    base_directory: Option<&Path>,
+    font_size_override: Option<f32>,
+    dark_mode_css: Option<&str>,
+    block_ids: &[u64],
+) -> String {
     let markdown = document.normalized_source();
     let line_starts = source_line_starts(markdown);
     let has_mermaid = document.has_mermaid();
     let mut heading_index = 0usize;
     let mut block_depth = 0usize;
+    let mut block_index = 0usize;
     let mut events = vec![Event::Html(source_anchor(0.0).into())];
     for item in document.events() {
         let mut event = item.event.clone();
@@ -1401,12 +1437,20 @@ pub fn document(
                 events.push(Event::Html(
                     source_anchor(source_line_at_byte(&line_starts, range.start)).into(),
                 ));
+                if let Some(block_id) = block_ids.get(block_index) {
+                    events.push(Event::Html(block_anchor(*block_id).into()));
+                }
+                block_index += 1;
             }
             block_depth += 1;
         } else if block_depth == 0 && matches!(event, Event::Rule) {
             events.push(Event::Html(
                 source_anchor(source_line_at_byte(&line_starts, range.start)).into(),
             ));
+            if let Some(block_id) = block_ids.get(block_index) {
+                events.push(Event::Html(block_anchor(*block_id).into()));
+            }
+            block_index += 1;
         }
         let ends_block = matches!(&event, Event::End(tag) if is_block_tag_end(*tag));
         events.push(rewrite_local_image_event(event, base_directory));
@@ -1453,15 +1497,18 @@ pub fn preview_document(
     font_size_override: Option<f32>,
     dark_mode_css: Option<&str>,
 ) -> PreviewDocument {
-    let html = self::document(
+    let block_ids = stable_top_level_block_ids(document);
+    let html = document_with_block_ids(
         document,
         css,
         base_directory,
         font_size_override,
         dark_mode_css,
+        &block_ids,
     );
     let mut preview = virtualize_document(html);
     preview.block_fingerprint = block_fingerprint(document);
+    preview.block_ids = block_ids.into();
     preview
 }
 
@@ -1495,6 +1542,7 @@ pub fn preview_document_placeholder(
         has_mermaid: false,
         total_bytes: 0,
         block_fingerprint: 0,
+        block_ids: Arc::from([]),
     }
 }
 
@@ -1515,6 +1563,7 @@ pub fn preview_document_with_previous(
     let html = replace_source_markers(previous.shell.as_ref(), &anchors);
     let mut preview = virtualize_document(html);
     preview.block_fingerprint = block_fingerprint(document);
+    preview.block_ids = reconcile_top_level_block_ids(previous, document).into();
     Some(preview)
 }
 
@@ -1570,6 +1619,7 @@ pub fn preview_document_incremental(
     }
 
     let mut body = String::with_capacity(previous_preview.shell.len());
+    let block_ids = stable_top_level_block_ids(document);
     for (chunk_index, old_chunk) in previous_preview.blocks.iter().enumerate() {
         let block_index = chunk_index.checked_sub(1);
         if let Some(index) = block_index.filter(|index| changed.binary_search(index).is_ok()) {
@@ -1578,6 +1628,7 @@ pub fn preview_document_incremental(
                 index,
                 &slices[index],
                 anchors[index + 1],
+                block_ids[index],
                 base_directory,
             )?);
         } else {
@@ -1595,6 +1646,7 @@ pub fn preview_document_incremental(
     }
     let mut preview = virtualize_document(html);
     preview.block_fingerprint = block_fingerprint(document);
+    preview.block_ids = block_ids.into();
     Some(preview)
 }
 
@@ -1638,6 +1690,7 @@ pub fn preview_document_virtual_incremental(
         return None;
     }
     let anchors = document_source_anchors(document);
+    let block_ids = stable_top_level_block_ids(document);
     let mut marker_cursor = 0usize;
     let mut chunks = Vec::with_capacity(previous_preview.chunks.len());
     for (chunk_index, old_chunk) in previous_preview.chunks.iter().enumerate() {
@@ -1669,6 +1722,7 @@ pub fn preview_document_virtual_incremental(
                 document,
                 block_index,
                 &slices[block_index],
+                block_ids[block_index],
                 base_directory,
             )?;
             html.replace_range(marker.end..content_end, &content);
@@ -1741,6 +1795,7 @@ pub fn preview_document_virtual_incremental(
         has_mermaid: previous_preview.has_mermaid,
         total_bytes,
         block_fingerprint: block_fingerprint(document),
+        block_ids: block_ids.into(),
     })
 }
 
@@ -1820,6 +1875,7 @@ fn render_incremental_block(
     index: usize,
     slice: &BlockSlice,
     source_start: f32,
+    block_id: u64,
     base_directory: Option<&Path>,
 ) -> Option<String> {
     let mut html = String::new();
@@ -1828,6 +1884,7 @@ fn render_incremental_block(
         document,
         index,
         slice,
+        block_id,
         base_directory,
     )?);
     Some(html)
@@ -1837,6 +1894,7 @@ fn render_incremental_block_content(
     document: &crate::markdown::ParsedDocument,
     index: usize,
     slice: &BlockSlice,
+    block_id: u64,
     base_directory: Option<&Path>,
 ) -> Option<String> {
     if slice.source_start > slice.source_end
@@ -1859,7 +1917,7 @@ fn render_incremental_block_content(
     }
     let mut html = String::new();
     html::push_html(&mut html, events.into_iter());
-    html.insert(0, '\n');
+    html.insert_str(0, &format!("{}\n", block_anchor(block_id)));
     annotate_code_languages(&mut html);
     Some(html)
 }
@@ -1948,16 +2006,17 @@ fn virtual_chunk_boundary_stable(
     if old_markers.len() != new_markers.len() {
         return false;
     }
-    let image_count_before = |html: &str, position: usize| {
-        image_tag_positions(html).partition_point(|image_position| *image_position < position)
-    };
+    let old_image_positions = image_tag_positions(old_html);
+    let new_image_positions = image_tag_positions(new_html);
     for index in 1..old_markers.len() {
         let old_marker = &old_markers[index];
         let new_marker = &new_markers[index];
         let old_bytes = old_marker.start;
         let new_bytes = new_marker.start;
-        let old_images = image_count_before(old_html, old_bytes);
-        let new_images = image_count_before(new_html, new_bytes);
+        let old_images =
+            old_image_positions.partition_point(|image_position| *image_position < old_bytes);
+        let new_images =
+            new_image_positions.partition_point(|image_position| *image_position < new_bytes);
         let old_crosses =
             old_bytes >= VIRTUAL_CHUNK_TARGET_BYTES || old_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
         let new_crosses =
@@ -1967,8 +2026,8 @@ fn virtual_chunk_boundary_stable(
         }
     }
     if has_following_boundary {
-        let old_images = image_count_before(old_html, old_html.len());
-        let new_images = image_count_before(new_html, new_html.len());
+        let old_images = old_image_positions.len();
+        let new_images = new_image_positions.len();
         let old_crosses = old_html.len() >= VIRTUAL_CHUNK_TARGET_BYTES
             || old_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
         let new_crosses = new_html.len() >= VIRTUAL_CHUNK_TARGET_BYTES
@@ -1995,6 +2054,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             has_mermaid: false,
             total_bytes,
             block_fingerprint: 0,
+            block_ids: Arc::from([]),
         };
     };
     let body_start = body_start_tag + "<body>".len();
@@ -2010,6 +2070,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             has_mermaid: false,
             total_bytes,
             block_fingerprint: 0,
+            block_ids: Arc::from([]),
         };
     };
     let body = &html[body_start..body_end];
@@ -2029,6 +2090,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             has_mermaid,
             total_bytes,
             block_fingerprint: 0,
+            block_ids: Arc::from([]),
         };
     }
     let mut boundaries = vec![0usize];
@@ -2102,6 +2164,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         has_mermaid,
         total_bytes,
         block_fingerprint: 0,
+        block_ids: Arc::from([]),
     }
 }
 
@@ -2135,7 +2198,8 @@ fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
             let end = pair[1];
             (start < end).then(|| PreviewChunk {
                 html: Arc::from(&body[start..end]),
-                block_id: stable_chunk_id(index),
+                block_id: block_id_in_html(&body[start..end])
+                    .unwrap_or_else(|| stable_chunk_id(index)),
                 content_hash: hash_source_markerless(&body[start..end]),
                 source_start: source_marker_at(body, start).unwrap_or(0.0),
                 source_end: source_marker_at(body, end).unwrap_or(0.0),
@@ -2152,6 +2216,12 @@ fn preview_block_content(html: &str) -> &str {
     html.strip_prefix("<!--md-source:")
         .and_then(|rest| rest.split_once("-->").map(|(_, content)| content))
         .unwrap_or(html)
+}
+
+fn block_id_in_html(html: &str) -> Option<u64> {
+    let start = html.find("<!--md-block:")? + "<!--md-block:".len();
+    let end = html[start..].find("-->")? + start;
+    html[start..end].parse().ok()
 }
 
 fn image_tag_positions(html: &str) -> Vec<usize> {
@@ -2215,6 +2285,44 @@ fn block_fingerprint(document: &crate::markdown::ParsedDocument) -> u64 {
     hasher.finish()
 }
 
+/// Assign IDs from block content plus a duplicate ordinal. Inserting or
+/// deleting unrelated blocks therefore does not renumber the remaining IDs.
+fn stable_top_level_block_ids(document: &crate::markdown::ParsedDocument) -> Vec<u64> {
+    let mut occurrences = HashMap::<u64, usize>::new();
+    document
+        .blocks()
+        .iter()
+        .map(|block| {
+            let mut content_hasher = DefaultHasher::new();
+            "markdown-preview-block".hash(&mut content_hasher);
+            block.hash(&mut content_hasher);
+            let content_hash = content_hasher.finish();
+            let occurrence = occurrences.entry(content_hash).or_default();
+            let id = hash(&format!(
+                "markdown-preview-block:{content_hash}:{occurrence}"
+            ));
+            *occurrence += 1;
+            id
+        })
+        .collect()
+}
+
+fn reconcile_top_level_block_ids(
+    previous: &PreviewDocument,
+    document: &crate::markdown::ParsedDocument,
+) -> Vec<u64> {
+    let mut ids = stable_top_level_block_ids(document);
+    if previous.block_ids.len() != document.blocks().len() {
+        return ids;
+    }
+    ids.iter_mut().enumerate().for_each(|(index, id)| {
+        if index < previous.block_ids.len() {
+            *id = previous.block_ids[index];
+        }
+    });
+    ids
+}
+
 fn replace_source_markers(html: &str, values: &[f32]) -> String {
     let mut output = String::with_capacity(html.len());
     let mut cursor = 0;
@@ -2249,25 +2357,43 @@ fn hash_source_markerless(html: &str) -> u64 {
         cursor = end;
     }
     normalized.push_str(&html[cursor..]);
-    let mut stable = String::with_capacity(normalized.len());
+    let mut markerless = String::with_capacity(normalized.len());
     let mut cursor = 0;
-    while let Some(relative) = normalized[cursor..].find("id=\"md-heading-") {
+    while let Some(relative) = normalized[cursor..].find("<!--md-block:") {
         let start = cursor + relative;
-        stable.push_str(&normalized[cursor..start]);
+        markerless.push_str(&normalized[cursor..start]);
+        markerless.push_str("<!--md-block-->");
+        let Some(end_relative) = normalized[start..].find("-->") else {
+            cursor = start;
+            break;
+        };
+        cursor = start + end_relative + "-->".len();
+    }
+    markerless.push_str(&normalized[cursor..]);
+
+    let mut stable = String::with_capacity(markerless.len());
+    let mut cursor = 0;
+    while let Some(relative) = markerless[cursor..].find("id=\"md-heading-") {
+        let start = cursor + relative;
+        stable.push_str(&markerless[cursor..start]);
         stable.push_str("id=\"md-heading\"");
         let digits_start = start + "id=\"md-heading-".len();
-        let Some(end_relative) = normalized[digits_start..].find('"') else {
+        let Some(end_relative) = markerless[digits_start..].find('"') else {
             cursor = start;
             break;
         };
         cursor = digits_start + end_relative + 1;
     }
-    stable.push_str(&normalized[cursor..]);
+    stable.push_str(&markerless[cursor..]);
     hash(&stable)
 }
 
 fn stable_chunk_id(index: usize) -> u64 {
     hash(&format!("markdown-preview-chunk:{index}"))
+}
+
+fn block_anchor(id: u64) -> String {
+    format!("<!--md-block:{id}-->")
 }
 
 fn heading_bounds(html: &str) -> Option<(usize, usize)> {
@@ -3258,6 +3384,48 @@ mod tests {
                 "source anchors for {markdown:?}"
             );
         }
+    }
+
+    #[test]
+    fn top_level_block_ids_survive_unrelated_insertion() {
+        let first = crate::markdown::parse_document("# A\n\n正文\n");
+        let next = crate::markdown::parse_document("# 新章节\n\n# A\n\n正文\n");
+        let first_ids = super::stable_top_level_block_ids(&first);
+        let next_ids = super::stable_top_level_block_ids(&next);
+
+        assert_eq!(first_ids[0], next_ids[1]);
+        assert_eq!(first_ids[1], next_ids[2]);
+    }
+
+    #[test]
+    fn rendered_top_level_blocks_include_stable_identity_markers() {
+        let document = crate::markdown::parse_document("# 标题\n\n正文\n\n---\n");
+        let ids = super::stable_top_level_block_ids(&document);
+        let html = super::document(&document, "", None, None, None);
+        let preview = super::preview_document(&document, "", None, None, None);
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(preview.top_level_block_ids(), ids.as_slice());
+        assert_eq!(
+            preview
+                .blocks
+                .iter()
+                .skip(1)
+                .map(|block| block.block_id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        for id in ids {
+            assert!(html.contains(&format!("<!--md-block:{id}-->")));
+        }
+    }
+
+    #[test]
+    fn block_identity_markers_do_not_change_content_hash() {
+        assert_eq!(
+            super::hash_source_markerless("<!--md-source:1--><!--md-block:1--><p>x</p>"),
+            super::hash_source_markerless("<!--md-source:1--><!--md-block:2--><p>x</p>"),
+        );
     }
 
     #[test]
