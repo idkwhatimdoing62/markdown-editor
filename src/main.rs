@@ -380,6 +380,7 @@ struct ParseRequest {
     tab_id: u64,
     revision: u64,
     text: String,
+    previous: Option<ParsedDocument>,
 }
 
 struct ParseResult {
@@ -404,10 +405,17 @@ impl ParseWorker {
                 while let Ok(newer) = request_receiver.try_recv() {
                     request = newer;
                 }
+                let document = request
+                    .previous
+                    .as_ref()
+                    .and_then(|previous| {
+                        markdown::parse_document_incremental(previous, &request.text)
+                    })
+                    .unwrap_or_else(|| markdown::parse_document(&request.text));
                 let result = ParseResult {
                     tab_id: request.tab_id,
                     revision: request.revision,
-                    document: markdown::parse_document(&request.text),
+                    document,
                 };
                 if result_sender.send(result).is_err() {
                     break;
@@ -1057,6 +1065,7 @@ impl MdEditorApp {
             tab_id: self.id,
             revision: self.document_revision,
             text: self.text.clone(),
+            previous: Some(self.document.clone()),
         });
     }
 

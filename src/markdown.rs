@@ -280,6 +280,74 @@ pub fn parse_document(markdown: &str) -> ParsedDocument {
     }
 }
 
+/// Reuse a parsed document when an edit only adds or removes line breaks at a
+/// block-safe boundary. All other edits return `None` and must use
+/// [`parse_document`] so Markdown context is re-evaluated conservatively.
+pub fn parse_document_incremental(
+    previous: &ParsedDocument,
+    markdown: &str,
+) -> Option<ParsedDocument> {
+    if previous.source == markdown || previous.normalized.is_some() {
+        return None;
+    }
+    let old = previous.source.as_bytes();
+    let new = markdown.as_bytes();
+    let prefix = old
+        .iter()
+        .zip(new.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut old_end = old.len();
+    let mut new_end = new.len();
+    while old_end > prefix && new_end > prefix && old[old_end - 1] == new[new_end - 1] {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    let old_mid = &old[prefix..old_end];
+    let new_mid = &new[prefix..new_end];
+    let line_only =
+        |slice: &[u8]| !slice.is_empty() && slice.iter().all(|byte| matches!(byte, b'\r' | b'\n'));
+    if !(line_only(old_mid) || line_only(new_mid)) || !safe_line_edit(old, prefix, old_end) {
+        return None;
+    }
+    if !matches!(normalize_compat_markdown(markdown), Cow::Borrowed(_)) {
+        return None;
+    }
+
+    let old_mid_len = old_end - prefix;
+    let new_mid_len = new_end - prefix;
+    let delta = new_mid_len as isize - old_mid_len as isize;
+    let shift = |offset: usize| {
+        if offset <= prefix {
+            offset
+        } else if offset >= old_end {
+            offset.saturating_add_signed(delta)
+        } else {
+            prefix + new_mid_len
+        }
+    };
+    let events = previous
+        .events
+        .iter()
+        .map(|item| SpannedEvent {
+            event: item.event.clone(),
+            range: shift(item.range.start)..shift(item.range.end),
+        })
+        .collect();
+    Some(ParsedDocument {
+        source: markdown.to_string(),
+        normalized: None,
+        blocks: previous.blocks.clone(),
+        events,
+    })
+}
+
+fn safe_line_edit(source: &[u8], start: usize, end: usize) -> bool {
+    start == 0
+        || end == source.len()
+        || (start > 0 && source[start - 1] == b'\n' && end < source.len() && source[end] == b'\n')
+}
+
 #[cfg(test)]
 pub fn parse(markdown: &str) -> Vec<Block> {
     parse_document(markdown).blocks
@@ -780,6 +848,28 @@ fn plain_of_inlines(inlines: &[Inline]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_parse_reuses_ast_for_safe_blank_line_insertion() {
+        let previous = parse_document("# 标题\n\n正文\n");
+        let next = parse_document_incremental(&previous, "\n# 标题\n\n正文\n")
+            .expect("leading blank line should preserve markdown structure");
+
+        assert_eq!(next.blocks(), previous.blocks());
+        assert_eq!(next.events().len(), previous.events().len());
+        assert_eq!(next.source(), "\n# 标题\n\n正文\n");
+        assert!(
+            next.events()
+                .iter()
+                .all(|event| event.range.end <= next.source().len())
+        );
+    }
+
+    #[test]
+    fn incremental_parse_falls_back_when_text_content_changes() {
+        let previous = parse_document("# 标题\n\n正文\n");
+        assert!(parse_document_incremental(&previous, "# 标题\n\n修改后的正文\n").is_none());
+    }
 
     #[derive(Debug, Default, PartialEq, Eq)]
     struct StructureCounts {
