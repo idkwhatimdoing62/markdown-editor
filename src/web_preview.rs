@@ -35,8 +35,11 @@ pub struct BrowserPreview {
 #[derive(Clone)]
 pub struct PreviewDocument {
     shell: Arc<str>,
+    body_range: Option<(usize, usize)>,
     chunks: Arc<[PreviewChunk]>,
     hash: u64,
+    chrome_hash: u64,
+    has_mermaid: bool,
     total_bytes: usize,
 }
 
@@ -54,6 +57,13 @@ impl PreviewDocument {
     #[allow(dead_code)]
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    fn can_patch_body_into(&self, next: &Self) -> bool {
+        self.body_range.is_some()
+            && next.body_range.is_some()
+            && self.chrome_hash == next.chrome_hash
+            && self.has_mermaid == next.has_mermaid
     }
 }
 
@@ -240,6 +250,34 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     if (requestRevision !== searchRevision) return;
     if (typeof window.find === 'function') {
       window.find(needle, false, !!backwards, true, false, false, false);
+    }
+  };
+
+  window.__mdEditorPatchBody = async (revision) => {
+    const patchRevision = ++navigationRevision;
+    cancelSourceAnimation();
+    suppressUntil = performance.now() + 500;
+    const match = /^md-source:([0-9.]+)$/.exec(window.name || '');
+    const saved = match ? Number(match[1]) : 0;
+    try {
+      const url = new URL(`/body?revision=${encodeURIComponent(revision)}`, location.origin);
+      const response = await fetch(url, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`preview body request failed: ${response.status}`);
+      const body = await response.text();
+      if (patchRevision !== navigationRevision) return;
+      document.body.innerHTML = body;
+      anchorCache = null;
+      if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+      await document.fonts.ready;
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (patchRevision !== navigationRevision) return;
+      window.name = `md-source:${saved}`;
+      window.ipc.postMessage(`md-source:program:${saved}`);
+      const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+      window.ipc.postMessage(`md-ready:${height}:${window.innerHeight}:${document.body.getElementsByTagName('*').length}`);
+      window.__mdEditorSetSourcePosition(saved, false);
+    } catch (error) {
+      window.ipc.postMessage(`md-patch-error:${error?.stack || error?.message || String(error)}`);
     }
   };
 
@@ -572,8 +610,15 @@ impl BrowserPreview {
             return Ok(());
         }
 
+        let patch_body = source_changed
+            && self
+                .document_source
+                .as_ref()
+                .is_some_and(|current| current.can_patch_body_into(document));
         if source_changed {
-            self.reset_scroll_bridge_for_document();
+            if !patch_body {
+                self.reset_scroll_bridge_for_document();
+            }
             self.store_document(document);
         }
 
@@ -585,9 +630,17 @@ impl BrowserPreview {
             self.bounds = Some(bounds);
         }
         if source_changed {
-            webview
-                .load_url(&preview_document_url(document_hash))
-                .map_err(|error| format!("无法刷新浏览器预览：{error}"))?;
+            if patch_body {
+                webview
+                    .evaluate_script(&format!(
+                        "window.__mdEditorPatchBody?.('{document_hash:016x}');"
+                    ))
+                    .map_err(|error| format!("无法更新浏览器预览内容：{error}"))?;
+            } else {
+                webview
+                    .load_url(&preview_document_url(document_hash))
+                    .map_err(|error| format!("无法刷新浏览器预览：{error}"))?;
+            }
             self.document_hash = document_hash;
             self.document_source = Some(Arc::clone(document));
             self.document_changed = true;
@@ -1039,13 +1092,16 @@ fn virtualize_document(html: String) -> PreviewDocument {
     const TARGET_CHUNK_BYTES: usize = 96 * 1024;
     const TARGET_CHUNK_IMAGES: usize = 4;
     const ESTIMATED_IMAGE_HEIGHT: f32 = 480.0;
-    let hash = hash(&html);
+    let document_hash = hash(&html);
     let total_bytes = html.len();
     let Some(body_start_tag) = html.find("<body>") else {
         return PreviewDocument {
             shell: html.into(),
+            body_range: None,
             chunks: Arc::from([]),
-            hash,
+            hash: document_hash,
+            chrome_hash: document_hash,
+            has_mermaid: false,
             total_bytes,
         };
     };
@@ -1053,18 +1109,26 @@ fn virtualize_document(html: String) -> PreviewDocument {
     let Some(body_end) = html.rfind("</body>") else {
         return PreviewDocument {
             shell: html.into(),
+            body_range: None,
             chunks: Arc::from([]),
-            hash,
+            hash: document_hash,
+            chrome_hash: document_hash,
+            has_mermaid: false,
             total_bytes,
         };
     };
     let body = &html[body_start..body_end];
+    let has_mermaid = html.contains("mermaid-init.js");
+    let chrome_hash = hash(&format!("{}{}", &html[..body_start], &html[body_end..]));
     let image_positions = image_tag_positions(body);
     if total_bytes < VIRTUALIZE_AT_BYTES && image_positions.len() <= VIRTUALIZE_AT_IMAGES {
         return PreviewDocument {
             shell: html.into(),
+            body_range: Some((body_start, body_end)),
             chunks: Arc::from([]),
-            hash,
+            hash: document_hash,
+            chrome_hash,
+            has_mermaid,
             total_bytes,
         };
     }
@@ -1141,8 +1205,11 @@ fn virtualize_document(html: String) -> PreviewDocument {
     shell.push_str(&html[body_end..]);
     PreviewDocument {
         shell: shell.into(),
+        body_range: None,
         chunks: chunks.into(),
-        hash,
+        hash: document_hash,
+        chrome_hash,
+        has_mermaid,
         total_bytes,
     }
 }
@@ -1348,6 +1415,11 @@ fn preview_document_response(
         .and_then(|payload| {
             if path == "/document" {
                 Some(payload.shell.as_bytes().to_vec())
+            } else if path == "/body" {
+                payload
+                    .body_range
+                    .and_then(|(start, end)| payload.shell.get(start..end))
+                    .map(|body| body.as_bytes().to_vec())
             } else {
                 path.strip_prefix("/chunk/")
                     .and_then(|index| index.parse::<usize>().ok())
@@ -1869,6 +1941,28 @@ mod tests {
 
         assert!(preview.chunks.is_empty());
         assert!(!preview.shell.contains("md-virtual-manifest"));
+    }
+
+    #[test]
+    fn ordinary_documents_can_update_body_without_navigation() {
+        let first = crate::markdown::parse_document("# 第一版\n\n正文");
+        let second = crate::markdown::parse_document("# 第二版\n\n正文");
+        let first = super::preview_document(&first, "body { color: black; }", None, None, None);
+        let second = super::preview_document(&second, "body { color: black; }", None, None, None);
+
+        assert!(first.body_range.is_some());
+        assert!(second.body_range.is_some());
+        assert!(first.can_patch_body_into(&second));
+        assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorPatchBody"));
+    }
+
+    #[test]
+    fn theme_changes_still_require_a_full_navigation() {
+        let parsed = crate::markdown::parse_document("# 标题\n\n正文");
+        let first = super::preview_document(&parsed, "body { color: black; }", None, None, None);
+        let second = super::preview_document(&parsed, "body { color: white; }", None, None, None);
+
+        assert!(!first.can_patch_body_into(&second));
     }
 
     #[test]
