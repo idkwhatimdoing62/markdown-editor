@@ -58,7 +58,12 @@ pub fn export_pdf(
     options: ExportOptions<'_>,
 ) -> Result<(), String> {
     let (body, images) = render_export_body(document, options.base_directory, ImageMode::Pdf);
-    let html_doc = styled_document(&body, options, false);
+    // printpdf's HTML layout treats the newline text nodes that pulldown-cmark
+    // emits between block elements as inline content. On a long document this
+    // makes the following paragraphs disappear from the layout while headings
+    // remain visible. Chromium (HTML export/preview) handles those nodes
+    // correctly, so normalize only the PDF input and leave HTML untouched.
+    let html_doc = pdf_safe_html(&styled_document(&body, options, false));
 
     let mut fonts = BTreeMap::new();
     fonts.insert(
@@ -92,6 +97,48 @@ pub fn export_pdf(
         printpdf::PdfDocument::from_html(&html_doc, &images, &fonts, &options, &mut warnings)?;
     let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
     std::fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+fn compact_html_between_tags(html: &str) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut chars = html.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        output.push(ch);
+        if ch != '>' {
+            continue;
+        }
+        let mut whitespace = String::new();
+        while let Some(&(_, next)) = chars.peek() {
+            if next.is_whitespace() {
+                whitespace.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if !matches!(chars.peek(), Some((_, '<'))) {
+            output.push_str(&whitespace);
+        }
+    }
+    output
+}
+
+/// Prepare browser HTML for printpdf's smaller HTML/CSS parser.
+///
+/// The browser preview can safely use `<strong>`/`<b>` and the parser marker
+/// emitted by `markdown.rs`. printpdf 0.12.x mishandles those inline elements:
+/// it keeps the emphasized word but drops the rest of the paragraph (and can
+/// stop laying out following blocks). A class-based span has the same visual
+/// intent and is handled correctly by printpdf, so this conversion is kept
+/// strictly on the PDF path. HTML export and the live preview remain
+/// unchanged.
+fn pdf_safe_html(html: &str) -> String {
+    compact_html_between_tags(html)
+        .replace("<!--md-strong-boundary-->", "")
+        .replace("<strong>", "<span class=\"md-pdf-strong\">")
+        .replace("</strong>", "</span>")
+        .replace("<b>", "<span class=\"md-pdf-strong\">")
+        .replace("</b>", "</span>")
 }
 
 fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool) -> String {
@@ -368,7 +415,7 @@ ol:not(#footnotes) > li::marker { font-variant-numeric: tabular-nums; }
 
 const PDF_FONT_CSS: &str = r#"
 body,pre,code,blockquote::before,blockquote::after { font-family: 'Markdown Editor Mono','LXGW WenKai Lite',monospace !important; }
-strong,b { font-family: 'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',monospace !important; font-weight: 700 !important; }
+span.md-pdf-strong { font-family: 'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',monospace !important; font-weight: 700 !important; }
 "#;
 
 const MERMAID_BOOTSTRAP: &str = r#"
@@ -535,6 +582,36 @@ mod tests {
             base_directory,
             body_font_size: Some(17.0),
         }
+    }
+
+    #[test]
+    fn pdf输入仅移除标签之间的换行() {
+        let html = "<h2>标题</h2>\n<p>正文</p><pre><code>一行\n&lt;二行&gt;</code></pre>";
+        let compact = compact_html_between_tags(html);
+        assert_eq!(
+            compact,
+            "<h2>标题</h2><p>正文</p><pre><code>一行\n&lt;二行&gt;</code></pre>"
+        );
+    }
+
+    #[test]
+    fn pdf输入移除浏览器专用边界注释() {
+        let html = "<p><strong>说明</strong><!--md-strong-boundary-->：正文</p>";
+        assert_eq!(
+            compact_html_between_tags(html).replace("<!--md-strong-boundary-->", ""),
+            "<p><strong>说明</strong>：正文</p>"
+        );
+    }
+
+    #[test]
+    fn pdf输入将强调转换为兼容的span且保留后续正文() {
+        let safe = pdf_safe_html(
+            "<p><strong>说明</strong><!--md-strong-boundary-->：正文。</p><p>后文。</p>",
+        );
+        assert!(safe.contains("<span class=\"md-pdf-strong\">说明</span>：正文。</p>"));
+        assert!(safe.contains("<p>后文。</p>"));
+        assert!(!safe.contains("<strong>"));
+        assert!(!safe.contains("md-strong-boundary"));
     }
 
     #[test]
