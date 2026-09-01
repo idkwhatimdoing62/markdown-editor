@@ -2473,6 +2473,24 @@ mod tests {
     }
 
     #[test]
+    fn generated_source_anchor_sequence_matches_rendered_blocks() {
+        for markdown in [
+            "# 标题\n\n正文\n",
+            "---\n\n段落\n",
+            "> 引用\n\n- 一\n- 二\n",
+            "```rust\nfn main() {}\n```\n",
+        ] {
+            let parsed = crate::markdown::parse_document(markdown);
+            let preview = super::preview_document(&parsed, "", None, None, None);
+            assert_eq!(
+                preview.source_anchors(),
+                super::document_source_anchors(&parsed),
+                "source anchors for {markdown:?}"
+            );
+        }
+    }
+
+    #[test]
     fn structural_edits_fall_back_to_full_preview_rendering() {
         let first = crate::markdown::parse_document("# 标题\n\n第一段");
         let second = crate::markdown::parse_document("# 标题\n\n第二段");
