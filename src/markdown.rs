@@ -1023,6 +1023,34 @@ mod tests {
     }
 
     #[test]
+    fn incremental_parse_reparses_heading_and_code_blocks() {
+        for (previous_source, next_source) in [
+            ("# 标题\n\n正文\n", "# 新标题\n\n正文\n"),
+            (
+                "正文\n\n```rust\nlet a = 1;\n```\n",
+                "正文\n\n```rust\nlet answer = 42;\n```\n",
+            ),
+        ] {
+            let previous = parse_document(previous_source);
+            let next = parse_document_incremental(&previous, next_source)
+                .expect("simple block edit should be incremental");
+            let full = parse_document(next_source);
+            assert_eq!(next.blocks(), full.blocks());
+            assert_eq!(next.events(), full.events());
+        }
+    }
+
+    #[test]
+    fn incremental_parse_handles_text_edit_at_end_of_document() {
+        let previous = parse_document("前文\n\n末尾\n");
+        let next = parse_document_incremental(&previous, "前文\n\n末尾追加\n")
+            .expect("editing the final paragraph should be incremental");
+        let full = parse_document("前文\n\n末尾追加\n");
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
     fn incremental_parse_falls_back_for_cross_block_list_semantics() {
         let previous = parse_document("- 一\n- 二\n");
         assert!(parse_document_incremental(&previous, "- 一\n- 修改后的二\n").is_none());
