@@ -45,6 +45,7 @@ struct BenchmarkReport {
     parse: Timing,
     browser_html: Timing,
     export_html: Timing,
+    incremental_edit: IncrementalEditMetrics,
     memory: MemoryStages,
 }
 
@@ -54,6 +55,14 @@ struct Timing {
     p95_ms: f64,
     min_ms: f64,
     max_ms: f64,
+}
+
+#[derive(Serialize)]
+struct IncrementalEditMetrics {
+    timing: Timing,
+    changed_blocks: usize,
+    changed_virtual_chunks: usize,
+    full_navigation_count: usize,
 }
 
 #[derive(Serialize, Default, Clone, Copy)]
@@ -234,8 +243,39 @@ fn benchmark_case(label: &str, path: &Path) -> Result<BenchmarkReport, String> {
     let export_document = export::render_styled_html(&parsed, export_options);
     let export_html_retained = process_memory();
 
+    let edited_source = source.replacen("关键结论", "增量关键结论", 1);
+    let edited_parsed = markdown::parse_document_incremental(&parsed, &edited_source)
+        .unwrap_or_else(|| markdown::parse_document(&edited_source));
+    let changed_blocks = parsed
+        .blocks()
+        .iter()
+        .zip(edited_parsed.blocks())
+        .filter(|(old, new)| old != new)
+        .count();
+    let baseline_incremental_preview =
+        incremental_preview(&browser_document, &parsed, &edited_parsed, path.parent());
+    let changed_virtual_chunks = baseline_incremental_preview
+        .as_ref()
+        .map(|next| changed_chunk_count(&browser_document, next))
+        .unwrap_or(0);
+    let full_navigation_count = usize::from(baseline_incremental_preview.is_none());
+    let incremental_edit = IncrementalEditMetrics {
+        timing: measure(iterations, || {
+            let next = markdown::parse_document_incremental(&parsed, &edited_source)
+                .unwrap_or_else(|| markdown::parse_document(&edited_source));
+            let preview = incremental_preview(&browser_document, &parsed, &next, path.parent());
+            black_box((
+                next.blocks().len(),
+                preview.map(|value| preview_size(&value)),
+            ))
+        }),
+        changed_blocks,
+        changed_virtual_chunks,
+        full_navigation_count,
+    };
+
     Ok(BenchmarkReport {
-        schema_version: 1,
+        schema_version: 2,
         generated_at_unix_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -251,6 +291,7 @@ fn benchmark_case(label: &str, path: &Path) -> Result<BenchmarkReport, String> {
         parse,
         browser_html,
         export_html,
+        incremental_edit,
         memory: MemoryStages {
             process_start,
             source_loaded,
@@ -259,6 +300,62 @@ fn benchmark_case(label: &str, path: &Path) -> Result<BenchmarkReport, String> {
             export_html_retained,
         },
     })
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn incremental_preview(
+    previous_preview: &web_preview::PreviewDocument,
+    previous_document: &markdown::ParsedDocument,
+    document: &markdown::ParsedDocument,
+    base_directory: Option<&Path>,
+) -> Option<web_preview::PreviewDocument> {
+    web_preview::preview_document_virtual_incremental(
+        Some(previous_preview),
+        Some(previous_document),
+        document,
+        base_directory,
+    )
+    .or_else(|| {
+        web_preview::preview_document_incremental(
+            Some(previous_preview),
+            Some(previous_document),
+            document,
+            base_directory,
+        )
+    })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn incremental_preview(
+    _previous_preview: &String,
+    _previous_document: &markdown::ParsedDocument,
+    _document: &markdown::ParsedDocument,
+    _base_directory: Option<&Path>,
+) -> Option<String> {
+    None
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn changed_chunk_count(
+    previous: &web_preview::PreviewDocument,
+    next: &web_preview::PreviewDocument,
+) -> usize {
+    previous.changed_virtual_chunk_count(next)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn changed_chunk_count(_previous: &String, _next: &String) -> usize {
+    0
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn preview_size(document: &web_preview::PreviewDocument) -> usize {
+    document.total_bytes()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn preview_size(document: &String) -> usize {
+    document.len()
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]

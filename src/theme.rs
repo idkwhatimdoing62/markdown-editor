@@ -758,6 +758,64 @@ pub fn font_size_override_css(css: &str, target_body_size: f32) -> String {
     scaled_rules
 }
 
+/// Browser-only font layer whose values can be changed without rebuilding the
+/// document. Absolute pixel rules use the shared scale variable so headings,
+/// code and other fixed-size theme elements track the body size together.
+pub fn font_size_runtime_css(css: &str, target_body_size: Option<f32>) -> String {
+    let base_body_size = css_property(css, "body", "font-size")
+        .as_deref()
+        .and_then(absolute_px)
+        .unwrap_or(15.0);
+    let target_body_size = target_body_size.unwrap_or(base_body_size);
+    let scale = target_body_size / base_body_size.max(1.0);
+    let mut scaled_rules = String::new();
+    append_scaled_font_rules_runtime(css, &mut scaled_rules);
+    format!(
+        ":root {{ --md-body-font-size: {target_body_size:.2}px; --md-font-scale: {scale:.6}; }} body {{ font-size: var(--md-body-font-size) !important; }}{scaled_rules}"
+    )
+}
+
+fn append_scaled_font_rules_runtime(css: &str, output: &mut String) {
+    let mut cursor = 0usize;
+    while let Some(relative_open) = css[cursor..].find('{') {
+        let open = cursor + relative_open;
+        let raw_prelude = css[cursor..open].trim();
+        let prelude = raw_prelude
+            .rsplit_once(';')
+            .map_or(raw_prelude, |(_, tail)| tail)
+            .trim();
+        let Some(close) = matching_brace(css, open) else {
+            break;
+        };
+        let declarations = &css[open + 1..close];
+        if prelude.starts_with("@media")
+            || prelude.starts_with("@supports")
+            || prelude.starts_with("@container")
+            || prelude.starts_with("@layer")
+        {
+            let mut nested = String::new();
+            append_scaled_font_rules_runtime(declarations, &mut nested);
+            if !nested.is_empty() {
+                output.push_str(prelude);
+                output.push('{');
+                output.push_str(&nested);
+                output.push('}');
+            }
+        } else if !prelude.is_empty()
+            && !prelude.starts_with('@')
+            && let Some(size) = declaration_value(declarations, "font-size")
+                .as_deref()
+                .and_then(absolute_px)
+        {
+            output.push_str(prelude);
+            output.push_str(" { font-size: calc(");
+            output.push_str(&format!("{size:.2}px * var(--md-font-scale)"));
+            output.push_str(") !important; }");
+        }
+        cursor = close + 1;
+    }
+}
+
 fn append_scaled_font_rules(css: &str, scale: f32, output: &mut String) {
     let mut cursor = 0usize;
     while let Some(relative_open) = css[cursor..].find('{') {
@@ -949,6 +1007,17 @@ mod tests {
         assert_eq!(light.list_item_spacing, 11.25);
         assert_eq!(package.recommended_body_font_size(), 15.0);
         assert_eq!(package.browser_css(), Some(css));
+    }
+
+    #[test]
+    fn 浏览器字号层使用可热更新的缩放变量() {
+        let css = "body { font-size:15px; } h1 { font-size: 30px; } @media (min-width: 1px) { code { font-size: 12px; } }";
+        let runtime = font_size_runtime_css(css, Some(18.0));
+        assert!(runtime.contains("--md-body-font-size: 18.00px"));
+        assert!(runtime.contains("--md-font-scale: 1.200000"));
+        assert!(runtime.contains("30.00px * var(--md-font-scale)"));
+        assert!(runtime.contains("@media (min-width: 1px)"));
+        assert!(runtime.contains("12.00px * var(--md-font-scale)"));
     }
 
     #[test]

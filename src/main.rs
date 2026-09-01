@@ -294,7 +294,6 @@ impl BrowserDocumentKey {
     fn same_render_context(&self, other: &Self) -> bool {
         self.tab_id == other.tab_id
             && self.theme_revision == other.theme_revision
-            && self.body_font_size_bits == other.body_font_size_bits
             && self.base_directory == other.base_directory
     }
 }
@@ -1457,6 +1456,15 @@ impl MdEditorApp {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn browser_base_font_size(&self) -> f32 {
+        let built_in = ThemePackage::built_in_sspai();
+        self.theme_package
+            .as_ref()
+            .unwrap_or(&built_in)
+            .recommended_body_font_size()
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn queue_browser_render(&mut self, key: BrowserDocumentKey) {
         if self.render_pending.as_ref() == Some(&key) {
             return;
@@ -1521,8 +1529,15 @@ impl MdEditorApp {
             && cache.key.same_render_context(&key)
         {
             let document = Arc::clone(&cache.document);
-            if document_ready {
-                self.queue_browser_render(key);
+            let source_matches = cache.key.document_revision == key.document_revision
+                && cache.key.document_source_hash == key.document_source_hash;
+            if document_ready && !source_matches {
+                self.queue_browser_render(key.clone());
+            }
+            if source_matches && let Some(cache) = self.browser_document_cache.as_mut() {
+                // Keep the cached HTML while applying font-size through the
+                // WebView CSS variables; this avoids a full navigation.
+                cache.key = key;
             }
             return document;
         }
@@ -3527,6 +3542,12 @@ impl eframe::App for MdEditorApp {
                 {
                     self.status_note = error;
                 } else {
+                    if let Err(error) = self
+                        .browser_preview
+                        .set_body_font_size(self.body_font_size, self.browser_base_font_size())
+                    {
+                        self.status_note = error;
+                    }
                     let document_changed = self.browser_preview.take_document_changed();
                     if let Some(editor) = split_editor_scroll.as_ref()
                         && let Err(error) =
@@ -4045,6 +4066,18 @@ mod app_tests {
 
         assert_ne!(initial.document_source_hash, pending.document_source_hash);
         assert_ne!(initial, pending);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn browser_font_size_change_keeps_render_context() {
+        let mut app = app_with_two_tabs();
+        let initial = app.current_browser_document_key();
+        app.body_font_size += 1.0;
+        let changed = app.current_browser_document_key();
+
+        assert_ne!(initial.body_font_size_bits, changed.body_font_size_bits);
+        assert!(initial.same_render_context(&changed));
     }
 
     #[test]

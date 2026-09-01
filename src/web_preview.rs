@@ -32,6 +32,7 @@ pub struct BrowserPreview {
     local_image_requests: Arc<AtomicUsize>,
     mermaid_runtime_requests: Arc<AtomicUsize>,
     font_asset_requests: Arc<[AtomicUsize; 4]>,
+    applied_font_size: Option<(u32, u32)>,
 }
 
 #[derive(Clone)]
@@ -80,6 +81,26 @@ impl PreviewDocument {
     #[allow(dead_code)]
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    /// Number of virtual chunks currently represented by this preview.
+    /// A zero value means the document uses the ordinary single-body path.
+    #[allow(dead_code)]
+    pub fn virtual_chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Counts virtual chunks whose identity or rendered content changed.
+    #[allow(dead_code)]
+    pub fn changed_virtual_chunk_count(&self, next: &Self) -> usize {
+        self.chunks
+            .iter()
+            .zip(next.chunks.iter())
+            .filter(|(old, new)| {
+                old.block_id != new.block_id || old.content_hash != new.content_hash
+            })
+            .count()
+            + self.chunks.len().abs_diff(next.chunks.len())
     }
 
     fn can_patch_body_into(&self, next: &Self) -> bool {
@@ -357,6 +378,13 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     } else if (!animationFrame) {
       animationFrame = window.requestAnimationFrame(animateToTarget);
     }
+  };
+
+  window.__mdEditorSetFontSize = (value, baseValue = 15) => {
+    const base = Math.max(1, Number(baseValue) || 15);
+    const target = Math.max(1, Number(value) || base);
+    document.documentElement.style.setProperty('--md-body-font-size', `${target}px`);
+    document.documentElement.style.setProperty('--md-font-scale', String(target / base));
   };
 
   window.__mdEditorFindText = async (query, sourcePosition, backwards = false) => {
@@ -815,6 +843,7 @@ impl Default for BrowserPreview {
             local_image_requests: Arc::new(AtomicUsize::new(0)),
             mermaid_runtime_requests: Arc::new(AtomicUsize::new(0)),
             font_asset_requests: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
+            applied_font_size: None,
         }
     }
 }
@@ -1019,6 +1048,7 @@ impl BrowserPreview {
         self.document_changed = false;
         self.bounds = None;
         self.frozen_frame = None;
+        self.applied_font_size = None;
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             *bridge = ScrollBridge::default();
         }
@@ -1146,6 +1176,26 @@ impl BrowserPreview {
                 if smooth { "true" } else { "false" }
             ))
             .map_err(|error| format!("无法同步预览滚动位置：{error}"))
+    }
+
+    pub fn set_body_font_size(&mut self, size: f32, base_size: f32) -> Result<(), String> {
+        let size = size.max(1.0);
+        let base_size = base_size.max(1.0);
+        let key = (size.to_bits(), base_size.to_bits());
+        if self.applied_font_size == Some(key) {
+            return Ok(());
+        }
+        let Some(webview) = &self.webview else {
+            return Ok(());
+        };
+        webview
+            .evaluate_script(&format!(
+                "window.__mdEditorSetFontSize?.({:.4}, {:.4});",
+                size, base_size
+            ))
+            .map_err(|error| format!("无法更新预览字号：{error}"))?;
+        self.applied_font_size = Some(key);
+        Ok(())
     }
 
     pub fn scroll_to_heading(&self, index: usize) -> Result<(), String> {
@@ -1378,6 +1428,7 @@ pub fn document(
     let font_override = font_size_override
         .map(|size| crate::theme::font_size_override_css(css, size))
         .unwrap_or_default();
+    let font_runtime = crate::theme::font_size_runtime_css(css, font_size_override);
     let editor_font = editor_font_css();
     let dark_mode_css = dark_mode_css.unwrap_or_default();
     let asset_origin = custom_protocol_script_source("mdfont");
@@ -1391,7 +1442,7 @@ pub fn document(
     };
 
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src {asset_origin}; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{dark_mode_css}</style>{mermaid_scripts}</head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src {asset_origin}; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{font_runtime}{dark_mode_css}</style>{mermaid_scripts}</head><body>{body}</body></html>"
     )
 }
 
@@ -1426,10 +1477,11 @@ pub fn preview_document_placeholder(
     let font_override = font_size_override
         .map(|size| crate::theme::font_size_override_css(css, size))
         .unwrap_or_default();
+    let font_runtime = crate::theme::font_size_runtime_css(css, font_size_override);
     let editor_font = editor_font_css();
     let dark_mode_css = dark_mode_css.unwrap_or_default();
     let shell = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{dark_mode_css}</style></head><body><div class=\"md-render-pending\">正在渲染…</div></body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{font_runtime}{dark_mode_css}</style></head><body><div class=\"md-render-pending\">正在渲染…</div></body></html>"
     );
     let hash = hash(&shell);
     PreviewDocument {
@@ -3346,6 +3398,9 @@ mod tests {
         );
         assert_eq!(parse_source_message("other:user:0.5"), None);
         assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorSetSourcePosition"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorSetFontSize"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("--md-body-font-size"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("--md-font-scale"));
         assert!(SCROLL_SYNC_SCRIPT.contains("sourceForY"));
         assert!(SCROLL_SYNC_SCRIPT.contains("distance * 0.38"));
         assert!(SCROLL_SYNC_SCRIPT.contains("cancelAnimationFrame"));
