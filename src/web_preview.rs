@@ -43,6 +43,7 @@ pub struct PreviewDocument {
     chrome_hash: u64,
     has_mermaid: bool,
     total_bytes: usize,
+    block_fingerprint: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1334,7 +1335,29 @@ pub fn preview_document(
         font_size_override,
         dark_mode_css,
     );
-    virtualize_document(html)
+    let mut preview = virtualize_document(html);
+    preview.block_fingerprint = block_fingerprint(document);
+    preview
+}
+
+pub fn preview_document_with_previous(
+    previous: Option<&PreviewDocument>,
+    document: &crate::markdown::ParsedDocument,
+) -> Option<PreviewDocument> {
+    let previous = previous?;
+    if previous.virtual_manifest.is_some()
+        || previous.block_fingerprint != block_fingerprint(document)
+    {
+        return None;
+    }
+    let anchors = document_source_anchors(document);
+    if anchors.len() != previous.source_anchors().len() {
+        return None;
+    }
+    let html = replace_source_markers(previous.shell.as_ref(), &anchors);
+    let mut preview = virtualize_document(html);
+    preview.block_fingerprint = block_fingerprint(document);
+    Some(preview)
 }
 
 fn virtualize_document(html: String) -> PreviewDocument {
@@ -1356,6 +1379,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             chrome_hash: document_hash,
             has_mermaid: false,
             total_bytes,
+            block_fingerprint: 0,
         };
     };
     let body_start = body_start_tag + "<body>".len();
@@ -1370,6 +1394,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             chrome_hash: document_hash,
             has_mermaid: false,
             total_bytes,
+            block_fingerprint: 0,
         };
     };
     let body = &html[body_start..body_end];
@@ -1388,6 +1413,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             chrome_hash,
             has_mermaid,
             total_bytes,
+            block_fingerprint: 0,
         };
     }
     let mut boundaries = vec![0usize];
@@ -1477,6 +1503,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         chrome_hash,
         has_mermaid,
         total_bytes,
+        block_fingerprint: 0,
     }
 }
 
@@ -1545,6 +1572,53 @@ fn source_markers(html: &str) -> Vec<f32> {
         search_from = position + "<!--md-source:".len();
     }
     markers
+}
+
+fn document_source_anchors(document: &crate::markdown::ParsedDocument) -> Vec<f32> {
+    let markdown = document.normalized_source();
+    let line_starts = source_line_starts(markdown);
+    let mut anchors = vec![0.0];
+    let mut block_depth = 0usize;
+    for item in document.events() {
+        let starts_block = matches!(&item.event, Event::Start(tag) if is_block_tag(tag));
+        if block_depth == 0 && (starts_block || matches!(item.event, Event::Rule)) {
+            anchors.push(source_line_at_byte(&line_starts, item.range.start));
+        }
+        if starts_block {
+            block_depth += 1;
+        }
+        if matches!(&item.event, Event::End(tag) if is_block_tag_end(*tag)) {
+            block_depth = block_depth.saturating_sub(1);
+        }
+    }
+    anchors.push(line_starts.len() as f32);
+    anchors
+}
+
+fn block_fingerprint(document: &crate::markdown::ParsedDocument) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    document.blocks().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn replace_source_markers(html: &str, values: &[f32]) -> String {
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0;
+    let mut index = 0;
+    while let Some(relative) = html[cursor..].find("<!--md-source:") {
+        let start = cursor + relative;
+        let Some(end_relative) = html[start..].find("-->") else {
+            break;
+        };
+        let end = start + end_relative + "-->".len();
+        output.push_str(&html[cursor..start]);
+        let value = values.get(index).copied().unwrap_or(0.0);
+        output.push_str(&source_anchor(value));
+        index += 1;
+        cursor = end;
+    }
+    output.push_str(&html[cursor..]);
+    output
 }
 
 fn hash_source_markerless(html: &str) -> u64 {
@@ -2382,6 +2456,28 @@ mod tests {
         assert_eq!(patch.delete_count, 0);
         assert_eq!(patch.insert_count, 0);
         assert_ne!(first.source_anchors(), second.source_anchors());
+    }
+
+    #[test]
+    fn source_only_edits_reuse_rendered_html_without_full_html_generation() {
+        let first = crate::markdown::parse_document("# 标题\n\n第一段\n\n第二段");
+        let second = crate::markdown::parse_document("\n# 标题\n\n第一段\n\n第二段");
+        let first = super::preview_document(&first, "", None, None, None);
+        let reused = super::preview_document_with_previous(Some(&first), &second);
+
+        assert!(reused.is_some());
+        assert_eq!(reused.unwrap().source_anchors(), {
+            let parsed = crate::markdown::parse_document("\n# 标题\n\n第一段\n\n第二段");
+            super::preview_document(&parsed, "", None, None, None).source_anchors()
+        });
+    }
+
+    #[test]
+    fn structural_edits_fall_back_to_full_preview_rendering() {
+        let first = crate::markdown::parse_document("# 标题\n\n第一段");
+        let second = crate::markdown::parse_document("# 标题\n\n第二段");
+        let first = super::preview_document(&first, "", None, None, None);
+        assert!(super::preview_document_with_previous(Some(&first), &second).is_none());
     }
 
     #[test]

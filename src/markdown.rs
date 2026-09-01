@@ -158,7 +158,7 @@ fn normalize_strong_whitespace_in_line(line: &str) -> Cow<'_, str> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Inline {
     Text(String),
     Emphasis(Vec<Inline>),
@@ -178,7 +178,7 @@ pub enum Inline {
     HardBreak,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum Block {
     Heading {
         level: u8,
