@@ -176,6 +176,26 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     return interpolate(y, anchorY(a), anchorY(b), a.source, b.source);
   };
 
+  const captureViewportAnchor = () => {
+    const list = anchors();
+    if (!list.length) return null;
+    let index = 0;
+    for (let candidate = 1; candidate < list.length; candidate += 1) {
+      if (anchorY(list[candidate]) > window.scrollY + 1) break;
+      index = candidate;
+    }
+    return { index, offset: anchorY(list[index]) - window.scrollY };
+  };
+
+  const restoreViewportAnchor = (saved) => {
+    if (!saved) return false;
+    const list = anchors();
+    const anchor = list[Math.min(saved.index, Math.max(0, list.length - 1))];
+    if (!anchor) return false;
+    window.scrollTo(0, Math.max(0, anchorY(anchor) - saved.offset));
+    return true;
+  };
+
   const placeSearchAnchor = (sourcePosition, backwards) => {
     const selection = window.getSelection();
     if (!selection) return;
@@ -274,6 +294,8 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     suppressUntil = performance.now() + 500;
     const match = /^md-source:([0-9.]+)$/.exec(window.name || '');
     const saved = match ? Number(match[1]) : 0;
+    const savedViewportAnchor = captureViewportAnchor();
+    let blockPatched = false;
     try {
       if (window.__mdVirtualPreview) {
         await window.__mdVirtualPreview.patch(revision, saved);
@@ -297,6 +319,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
               range.insertNode(template.content.cloneNode(true));
             }
             anchorCache = null;
+            blockPatched = true;
           } else {
             const bodyResponse = await fetch(`/body?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
             if (!bodyResponse.ok) throw new Error(`preview body request failed: ${bodyResponse.status}`);
@@ -314,11 +337,12 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
       await document.fonts.ready;
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       if (patchRevision !== navigationRevision) return;
+      const restoredViewportAnchor = blockPatched && restoreViewportAnchor(savedViewportAnchor);
       window.name = `md-source:${saved}`;
       window.ipc.postMessage(`md-source:program:${saved}`);
       const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
       window.ipc.postMessage(`md-ready:${height}:${window.innerHeight}:${document.body.getElementsByTagName('*').length}`);
-      window.__mdEditorSetSourcePosition(saved, false);
+      if (!restoredViewportAnchor) window.__mdEditorSetSourcePosition(saved, false);
     } catch (error) {
       window.ipc.postMessage(`md-patch-error:${error?.stack || error?.message || String(error)}`);
     }
@@ -2122,6 +2146,9 @@ mod tests {
         assert!(first.can_patch_into(&second));
         assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorPatchBody"));
         assert!(SCROLL_SYNC_SCRIPT.contains("/blocks?revision="));
+        assert!(SCROLL_SYNC_SCRIPT.contains("captureViewportAnchor"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("restoreViewportAnchor"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("blockPatched && restoreViewportAnchor"));
     }
 
     #[test]
