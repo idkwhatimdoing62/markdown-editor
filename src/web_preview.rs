@@ -57,6 +57,7 @@ const ESTIMATED_IMAGE_HEIGHT: f32 = 480.0;
 struct PreviewChunk {
     html: Arc<str>,
     block_id: u64,
+    content_hash: u64,
     source_start: f32,
     source_end: f32,
     source_anchors: Arc<[f32]>,
@@ -704,7 +705,8 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
       for (let index = 0; index < nextChunks.length; index += 1) {
         const next = nextChunks[index];
         const current = chunks[index];
-        if (String(next.blockId) === String(current.blockId)) {
+        if (String(next.blockId) === String(current.blockId)
+            && String(next.contentHash) === String(current.contentHash)) {
           const measuredHeight = current.start ? current.height : next.height;
           Object.assign(current, next);
           current.height = measuredHeight;
@@ -1562,7 +1564,8 @@ pub fn preview_document_virtual_incremental(
         let heading_bounds = heading_bounds(&html);
         let source_anchors = source_markers(&html);
         chunks.push(PreviewChunk {
-            block_id: hash_source_markerless(&html),
+            block_id: old_chunk.block_id,
+            content_hash: hash_source_markerless(&html),
             html: html.into(),
             source_start,
             source_end,
@@ -1766,8 +1769,9 @@ fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
         .enumerate()
         .map(|(index, chunk)| {
             format!(
-                "{{\"index\":{index},\"blockId\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
+                "{{\"index\":{index},\"blockId\":\"{}\",\"contentHash\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
                 chunk.block_id,
+                chunk.content_hash,
                 chunk.source_start,
                 chunk.source_end,
                 serde_json::to_string(&chunk.source_anchors[..])
@@ -1866,7 +1870,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
     let source_end =
         source_marker_at(body, body.rfind("<!--md-source:").unwrap_or(0)).unwrap_or(1.0);
     let mut chunks = Vec::with_capacity(boundaries.len().saturating_sub(1));
-    for pair in boundaries.windows(2) {
+    for (index, pair) in boundaries.windows(2).enumerate() {
         let start = pair[0];
         let end = pair[1];
         let source_start = source_marker_at(body, start).unwrap_or(0.0);
@@ -1879,7 +1883,8 @@ fn virtualize_document(html: String) -> PreviewDocument {
         let heading_bounds = heading_bounds(&body[start..end]);
         chunks.push(PreviewChunk {
             html: Arc::from(&body[start..end]),
-            block_id: hash_source_markerless(&body[start..end]),
+            block_id: stable_chunk_id(index),
+            content_hash: hash_source_markerless(&body[start..end]),
             source_start,
             source_end: source_end_for_chunk,
             source_anchors: source_markers(&body[start..end]).into(),
@@ -1936,12 +1941,14 @@ fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
     }
     markers
         .windows(2)
-        .filter_map(|pair| {
+        .enumerate()
+        .filter_map(|(index, pair)| {
             let start = pair[0];
             let end = pair[1];
             (start < end).then(|| PreviewChunk {
                 html: Arc::from(&body[start..end]),
-                block_id: hash_source_markerless(&body[start..end]),
+                block_id: stable_chunk_id(index),
+                content_hash: hash_source_markerless(&body[start..end]),
                 source_start: source_marker_at(body, start).unwrap_or(0.0),
                 source_end: source_marker_at(body, end).unwrap_or(0.0),
                 source_anchors: source_markers(&body[start..end]).into(),
@@ -2069,6 +2076,10 @@ fn hash_source_markerless(html: &str) -> u64 {
     }
     stable.push_str(&normalized[cursor..]);
     hash(&stable)
+}
+
+fn stable_chunk_id(index: usize) -> u64 {
+    hash(&format!("markdown-preview-chunk:{index}"))
 }
 
 fn heading_bounds(html: &str) -> Option<(usize, usize)> {
