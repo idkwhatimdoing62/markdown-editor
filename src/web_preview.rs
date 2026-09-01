@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,6 +51,7 @@ pub struct PreviewDocument {
 
 const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
 const VIRTUALIZE_AT_IMAGES: usize = 8;
+const ESTIMATED_IMAGE_HEIGHT: f32 = 480.0;
 
 #[derive(Debug, Clone)]
 struct PreviewChunk {
@@ -1468,6 +1470,142 @@ pub fn preview_document_incremental(
     Some(preview)
 }
 
+/// Update only the virtual chunks containing changed simple blocks. The chunk
+/// boundaries and source-marker count must remain stable; otherwise the caller
+/// falls back to a complete virtual document render.
+pub fn preview_document_virtual_incremental(
+    previous_preview: Option<&PreviewDocument>,
+    previous_document: Option<&crate::markdown::ParsedDocument>,
+    document: &crate::markdown::ParsedDocument,
+    base_directory: Option<&Path>,
+) -> Option<PreviewDocument> {
+    let previous_preview = previous_preview?;
+    let previous_document = previous_document?;
+    if previous_preview.virtual_manifest.is_none()
+        || previous_preview.has_mermaid != document.has_mermaid()
+        || previous_document.blocks().len() != document.blocks().len()
+    {
+        return None;
+    }
+    let changed = previous_document
+        .blocks()
+        .iter()
+        .zip(document.blocks())
+        .enumerate()
+        .filter_map(|(index, (old, new))| (old != new).then_some(index))
+        .collect::<Vec<_>>();
+    if changed.is_empty()
+        || changed.iter().any(|index| {
+            !simple_block_pair(
+                &previous_document.blocks()[*index],
+                &document.blocks()[*index],
+            )
+        })
+    {
+        return None;
+    }
+    let slices = top_level_event_slices(document)?;
+    if slices.len() != document.blocks().len() {
+        return None;
+    }
+    let anchors = document_source_anchors(document);
+    let mut marker_cursor = 0usize;
+    let mut chunks = Vec::with_capacity(previous_preview.chunks.len());
+    for old_chunk in previous_preview.chunks.iter() {
+        let marker_count = old_chunk.source_anchors.len();
+        let marker_ranges = source_marker_ranges(&old_chunk.html);
+        if marker_count == 0 || marker_ranges.len() != marker_count {
+            return None;
+        }
+        let chunk_end = marker_cursor + marker_count;
+        let mut replacements = changed
+            .iter()
+            .filter_map(|index| {
+                let marker_index = index + 1;
+                if marker_index >= marker_cursor && marker_index < chunk_end {
+                    Some((marker_index - marker_cursor, *index))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        replacements.sort_unstable_by_key(|replacement| std::cmp::Reverse(replacement.0));
+        let mut html = old_chunk.html.to_string();
+        for (local_marker, block_index) in replacements {
+            let marker = &marker_ranges[local_marker];
+            let content_end = marker_ranges
+                .get(local_marker + 1)
+                .map_or(html.len(), |next| next.start);
+            let content = render_incremental_block_content(
+                document,
+                block_index,
+                &slices[block_index],
+                base_directory,
+            )?;
+            html.replace_range(marker.end..content_end, &content);
+        }
+        let values = anchors.get(marker_cursor..chunk_end)?;
+        let replaced = replace_source_markers_with_values(&html, values)?;
+        html = replaced;
+        let source_start = values.first().copied()?;
+        let source_end = anchors
+            .get(chunk_end)
+            .copied()
+            .or_else(|| anchors.last().copied())?;
+        if source_end < source_start {
+            return None;
+        }
+        let image_count = image_tag_positions(&html).len();
+        let estimated_height = ((source_end - source_start).max(1.0) * 34.0)
+            .max(image_count as f32 * ESTIMATED_IMAGE_HEIGHT)
+            .max(96.0);
+        let heading_bounds = heading_bounds(&html);
+        let source_anchors = source_markers(&html);
+        chunks.push(PreviewChunk {
+            block_id: hash_source_markerless(&html),
+            html: html.into(),
+            source_start,
+            source_end,
+            source_anchors: source_anchors.into(),
+            estimated_height,
+            heading_start: heading_bounds.map(|bounds| bounds.0),
+            heading_end: heading_bounds.map(|bounds| bounds.1),
+        });
+        marker_cursor = chunk_end;
+    }
+    if marker_cursor != anchors.len() {
+        return None;
+    }
+    let manifest = virtual_manifest(&chunks);
+    let shell = replace_virtual_manifest(previous_preview.shell.as_ref(), &manifest)?;
+    let mut hash_input = shell.clone();
+    for chunk in &chunks {
+        hash_input.push_str(&chunk.block_id.to_string());
+    }
+    let previous_body_bytes = previous_preview
+        .chunks
+        .iter()
+        .map(|chunk| chunk.html.len())
+        .sum::<usize>();
+    let next_body_bytes = chunks.iter().map(|chunk| chunk.html.len()).sum::<usize>();
+    let total_bytes = previous_preview
+        .total_bytes
+        .saturating_sub(previous_body_bytes)
+        .saturating_add(next_body_bytes);
+    Some(PreviewDocument {
+        shell: shell.into(),
+        body_range: None,
+        virtual_manifest: Some(manifest.into()),
+        blocks: Arc::from([]),
+        chunks: chunks.into(),
+        hash: hash(&hash_input),
+        chrome_hash: previous_preview.chrome_hash,
+        has_mermaid: previous_preview.has_mermaid,
+        total_bytes,
+        block_fingerprint: block_fingerprint(document),
+    })
+}
+
 fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block) -> bool {
     let simple = |block: &crate::markdown::Block| {
         matches!(
@@ -1537,12 +1675,29 @@ fn render_incremental_block(
     source_start: f32,
     base_directory: Option<&Path>,
 ) -> Option<String> {
+    let mut html = String::new();
+    html.push_str(&source_anchor(source_start));
+    html.push_str(&render_incremental_block_content(
+        document,
+        index,
+        slice,
+        base_directory,
+    )?);
+    Some(html)
+}
+
+fn render_incremental_block_content(
+    document: &crate::markdown::ParsedDocument,
+    index: usize,
+    slice: &BlockSlice,
+    base_directory: Option<&Path>,
+) -> Option<String> {
     if slice.source_start > slice.source_end
         || slice.source_end > document.normalized_source().len()
     {
         return None;
     }
-    let mut events = vec![Event::Html(source_anchor(source_start).into())];
+    let mut events = Vec::new();
     let mut heading_index = document.blocks()[..index]
         .iter()
         .filter(|block| matches!(block, crate::markdown::Block::Heading { .. }))
@@ -1557,14 +1712,83 @@ fn render_incremental_block(
     }
     let mut html = String::new();
     html::push_html(&mut html, events.into_iter());
+    html.insert(0, '\n');
     annotate_code_languages(&mut html);
     Some(html)
+}
+
+fn source_marker_ranges(html: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative_start) = html[cursor..].find("<!--md-source:") {
+        let start = cursor + relative_start;
+        let Some(relative_end) = html[start..].find("-->") else {
+            break;
+        };
+        let end = start + relative_end + "-->".len();
+        ranges.push(start..end);
+        cursor = end;
+    }
+    ranges
+}
+
+fn replace_source_markers_with_values(html: &str, values: &[f32]) -> Option<String> {
+    let ranges = source_marker_ranges(html);
+    if ranges.len() != values.len() {
+        return None;
+    }
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    for (range, value) in ranges.into_iter().zip(values) {
+        output.push_str(&html[cursor..range.start]);
+        output.push_str(&source_anchor(*value));
+        cursor = range.end;
+    }
+    output.push_str(&html[cursor..]);
+    Some(output)
+}
+
+fn replace_virtual_manifest(shell: &str, manifest: &str) -> Option<String> {
+    const PREFIX: &str = "<script id=\"md-virtual-manifest\" type=\"application/json\">";
+    let start = shell.find(PREFIX)?;
+    let content_start = start + PREFIX.len();
+    let content_end = content_start + shell[content_start..].find("</script>")?;
+    let mut output = String::with_capacity(shell.len() + manifest.len());
+    output.push_str(&shell[..content_start]);
+    output.push_str(manifest);
+    output.push_str(&shell[content_end..]);
+    Some(output)
+}
+
+fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
+    let manifest = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, chunk)| {
+            format!(
+                "{{\"index\":{index},\"blockId\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
+                chunk.block_id,
+                chunk.source_start,
+                chunk.source_end,
+                serde_json::to_string(&chunk.source_anchors[..])
+                    .unwrap_or_else(|_| "[]".to_string()),
+                chunk.estimated_height,
+                chunk
+                    .heading_start
+                    .map_or("null".to_string(), |value| value.to_string()),
+                chunk
+                    .heading_end
+                    .map_or("null".to_string(), |value| value.to_string()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{manifest}]")
 }
 
 fn virtualize_document(html: String) -> PreviewDocument {
     const TARGET_CHUNK_BYTES: usize = 96 * 1024;
     const TARGET_CHUNK_IMAGES: usize = 4;
-    const ESTIMATED_IMAGE_HEIGHT: f32 = 480.0;
     let document_hash = hash(&html);
     let total_bytes = html.len();
     let Some(body_start_tag) = html.find("<body>") else {
@@ -1665,25 +1889,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         });
     }
 
-    let manifest = chunks
-        .iter()
-        .enumerate()
-        .map(|(index, chunk)| {
-            format!(
-                "{{\"index\":{index},\"blockId\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
-                chunk.block_id,
-                chunk.source_start,
-                chunk.source_end,
-                serde_json::to_string(&chunk.source_anchors[..])
-                    .unwrap_or_else(|_| "[]".to_string()),
-                chunk.estimated_height,
-                chunk.heading_start.map_or("null".to_string(), |value| value.to_string()),
-                chunk.heading_end.map_or("null".to_string(), |value| value.to_string())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let manifest = format!("[{manifest}]");
+    let manifest = virtual_manifest(&chunks);
     let virtual_script = format!(
         "<script id=\"md-virtual-manifest\" type=\"application/json\">{manifest}</script><script defer src=\"{}\"></script>",
         custom_protocol_url("mdfont", "virtual-preview.js")
@@ -2686,6 +2892,46 @@ mod tests {
 
         assert_eq!(incremental.shell, full.shell);
         assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn virtual_incremental_preview_rebuilds_changed_chunk() {
+        let first_source = "## 章节\n\n正文段落。\n\n".repeat(15_000);
+        let next_source = first_source.replacen("正文段落。", "修改后的正文段落。", 1);
+        let first_document = crate::markdown::parse_document(&first_source);
+        let next_document = crate::markdown::parse_document(&next_source);
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+        assert!(first_preview.virtual_manifest.is_some());
+
+        let incremental = super::preview_document_virtual_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("simple virtual chunk edit should be incremental");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.chunks.len(), full.chunks.len());
+        let incremental_ids = incremental
+            .chunks
+            .iter()
+            .map(|chunk| chunk.block_id)
+            .collect::<Vec<_>>();
+        let full_ids = full
+            .chunks
+            .iter()
+            .map(|chunk| chunk.block_id)
+            .collect::<Vec<_>>();
+        let first_difference = incremental_ids
+            .iter()
+            .zip(&full_ids)
+            .position(|(left, right)| left != right);
+        assert_eq!(
+            incremental_ids, full_ids,
+            "first differing chunk: {first_difference:?}"
+        );
+        assert_eq!(incremental.virtual_manifest, full.virtual_manifest);
     }
 
     #[test]

@@ -340,12 +340,20 @@ impl RenderWorker {
                 }
                 let parsed_document = Arc::new(request.document.clone());
                 let document = Arc::new(
-                    web_preview::preview_document_incremental(
+                    web_preview::preview_document_virtual_incremental(
                         request.previous.as_deref(),
                         request.previous_parsed.as_deref(),
                         &request.document,
                         request.base_directory.as_deref(),
                     )
+                    .or_else(|| {
+                        web_preview::preview_document_incremental(
+                            request.previous.as_deref(),
+                            request.previous_parsed.as_deref(),
+                            &request.document,
+                            request.base_directory.as_deref(),
+                        )
+                    })
                     .or_else(|| {
                         web_preview::preview_document_with_previous(
                             request.previous.as_deref(),
