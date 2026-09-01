@@ -37,6 +37,7 @@ pub struct PreviewDocument {
     shell: Arc<str>,
     body_range: Option<(usize, usize)>,
     virtual_manifest: Option<Arc<str>>,
+    blocks: Arc<[PreviewChunk]>,
     chunks: Arc<[PreviewChunk]>,
     hash: u64,
     chrome_hash: u64,
@@ -63,6 +64,8 @@ impl PreviewDocument {
     fn can_patch_body_into(&self, next: &Self) -> bool {
         self.body_range.is_some()
             && next.body_range.is_some()
+            && !self.blocks.is_empty()
+            && self.blocks.len() == next.blocks.len()
             && self.chrome_hash == next.chrome_hash
             && self.has_mermaid == next.has_mermaid
     }
@@ -275,13 +278,37 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
       if (window.__mdVirtualPreview) {
         await window.__mdVirtualPreview.patch(revision, saved);
       } else {
-        const url = new URL(`/body?revision=${encodeURIComponent(revision)}`, location.origin);
-        const response = await fetch(url, { cache: 'no-store' });
-        if (!response.ok) throw new Error(`preview body request failed: ${response.status}`);
-        const body = await response.text();
         if (patchRevision !== navigationRevision) return;
-        document.body.innerHTML = body;
-        anchorCache = null;
+        const blocksResponse = await fetch(`/blocks?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
+        if (blocksResponse.ok) {
+          const blocks = await blocksResponse.json();
+          const current = anchors();
+          if (current.length === blocks.length + 1) {
+            for (let index = blocks.length - 1; index >= 0; index -= 1) {
+              const start = current[index]?.node;
+              const end = current[index + 1]?.node;
+              if (!start || !end) throw new Error('preview block anchors missing');
+              const range = document.createRange();
+              range.setStartBefore(start);
+              range.setEndBefore(end);
+              range.deleteContents();
+              const template = document.createElement('template');
+              template.innerHTML = blocks[index].html;
+              range.insertNode(template.content.cloneNode(true));
+            }
+            anchorCache = null;
+          } else {
+            const bodyResponse = await fetch(`/body?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
+            if (!bodyResponse.ok) throw new Error(`preview body request failed: ${bodyResponse.status}`);
+            document.body.innerHTML = await bodyResponse.text();
+            anchorCache = null;
+          }
+        } else {
+          const bodyResponse = await fetch(`/body?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
+          if (!bodyResponse.ok) throw new Error(`preview body request failed: ${bodyResponse.status}`);
+          document.body.innerHTML = await bodyResponse.text();
+          anchorCache = null;
+        }
         if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
       }
       await document.fonts.ready;
@@ -1160,6 +1187,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             shell: html.into(),
             body_range: None,
             virtual_manifest: None,
+            blocks: Arc::from([]),
             chunks: Arc::from([]),
             hash: document_hash,
             chrome_hash: document_hash,
@@ -1173,6 +1201,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             shell: html.into(),
             body_range: None,
             virtual_manifest: None,
+            blocks: Arc::from([]),
             chunks: Arc::from([]),
             hash: document_hash,
             chrome_hash: document_hash,
@@ -1185,10 +1214,12 @@ fn virtualize_document(html: String) -> PreviewDocument {
     let chrome_hash = hash(&format!("{}{}", &html[..body_start], &html[body_end..]));
     let image_positions = image_tag_positions(body);
     if total_bytes < VIRTUALIZE_AT_BYTES && image_positions.len() <= VIRTUALIZE_AT_IMAGES {
+        let blocks = split_preview_blocks(body);
         return PreviewDocument {
             shell: html.into(),
             body_range: Some((body_start, body_end)),
             virtual_manifest: None,
+            blocks: blocks.into(),
             chunks: Arc::from([]),
             hash: document_hash,
             chrome_hash,
@@ -1272,12 +1303,38 @@ fn virtualize_document(html: String) -> PreviewDocument {
         shell: shell.into(),
         body_range: None,
         virtual_manifest: Some(manifest.into()),
+        blocks: Arc::from([]),
         chunks: chunks.into(),
         hash: document_hash,
         chrome_hash,
         has_mermaid,
         total_bytes,
     }
+}
+
+fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
+    let mut markers = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(relative) = body[search_from..].find("<!--md-source:") {
+        let position = search_from + relative;
+        markers.push(position);
+        search_from = position + "<!--md-source:".len();
+    }
+    markers
+        .windows(2)
+        .filter_map(|pair| {
+            let start = pair[0];
+            let end = pair[1];
+            (start < end).then(|| PreviewChunk {
+                html: Arc::from(&body[start..end]),
+                source_start: source_marker_at(body, start).unwrap_or(0.0),
+                source_end: source_marker_at(body, end).unwrap_or(0.0),
+                estimated_height: 0.0,
+                heading_start: None,
+                heading_end: None,
+            })
+        })
+        .collect()
 }
 
 fn image_tag_positions(html: &str) -> Vec<usize> {
@@ -1502,6 +1559,21 @@ fn preview_document_response(
                     .body_range
                     .and_then(|(start, end)| payload.shell.get(start..end))
                     .map(|body| body.as_bytes().to_vec())
+            } else if path == "/blocks" {
+                (!payload.blocks.is_empty()).then(|| {
+                    let blocks = payload
+                        .blocks
+                        .iter()
+                        .map(|block| {
+                            serde_json::json!({
+                                "html": block.html.as_ref(),
+                                "sourceStart": block.source_start,
+                                "sourceEnd": block.source_end,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::to_vec(&blocks).unwrap_or_default()
+                })
             } else if path == "/manifest" {
                 payload
                     .virtual_manifest
@@ -1520,7 +1592,7 @@ fn preview_document_response(
         .status(status)
         .header(
             CONTENT_TYPE,
-            if path == "/manifest" {
+            if path == "/manifest" || path == "/blocks" {
                 "application/json; charset=utf-8"
             } else {
                 "text/html; charset=utf-8"
@@ -2049,6 +2121,7 @@ mod tests {
         assert!(first.can_patch_body_into(&second));
         assert!(first.can_patch_into(&second));
         assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorPatchBody"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("/blocks?revision="));
     }
 
     #[test]
@@ -2097,9 +2170,17 @@ mod tests {
             ))
             .body(Vec::new())
             .expect("current manifest request");
+        let blocks_request = Request::builder()
+            .uri(format!(
+                "https://mdpreview.localhost/blocks?revision={:016x}",
+                document.hash
+            ))
+            .body(Vec::new())
+            .expect("current blocks request");
 
         let stale = super::preview_document_response(stale_request, &payload);
         let current = super::preview_document_response(current_request, &payload);
+        let blocks = super::preview_document_response(blocks_request, &payload);
 
         assert_eq!(stale.status(), 409);
         assert_eq!(current.status(), 200);
@@ -2107,6 +2188,7 @@ mod tests {
             current.headers().get("content-type").unwrap(),
             "application/json; charset=utf-8"
         );
+        assert_eq!(blocks.status(), 404);
     }
 
     #[test]
