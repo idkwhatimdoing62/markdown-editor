@@ -50,7 +50,7 @@ pub struct PreviewDocument {
 #[derive(Debug, Clone)]
 struct PreviewChunk {
     html: Arc<str>,
-    content_hash: u64,
+    block_id: u64,
     source_start: f32,
     source_end: f32,
     source_anchors: Arc<[f32]>,
@@ -134,7 +134,7 @@ impl PreviewDocument {
         let mut positions_by_hash = HashMap::<u64, VecDeque<usize>>::new();
         for (index, block) in next.blocks.iter().enumerate() {
             positions_by_hash
-                .entry(block.content_hash)
+                .entry(block.block_id)
                 .or_default()
                 .push_back(index);
         }
@@ -143,7 +143,7 @@ impl PreviewDocument {
             .iter()
             .map(|block| {
                 positions_by_hash
-                    .get_mut(&block.content_hash)
+                    .get_mut(&block.block_id)
                     .and_then(VecDeque::pop_front)
             })
             .collect::<Vec<_>>();
@@ -698,7 +698,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
       for (let index = 0; index < nextChunks.length; index += 1) {
         const next = nextChunks[index];
         const current = chunks[index];
-        if (String(next.contentHash) === String(current.contentHash)) {
+        if (String(next.blockId) === String(current.blockId)) {
           const measuredHeight = current.start ? current.height : next.height;
           Object.assign(current, next);
           current.height = measuredHeight;
@@ -1629,7 +1629,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         let heading_bounds = heading_bounds(&body[start..end]);
         chunks.push(PreviewChunk {
             html: Arc::from(&body[start..end]),
-            content_hash: hash_source_markerless(&body[start..end]),
+            block_id: hash_source_markerless(&body[start..end]),
             source_start,
             source_end: source_end_for_chunk,
             source_anchors: source_markers(&body[start..end]).into(),
@@ -1644,8 +1644,8 @@ fn virtualize_document(html: String) -> PreviewDocument {
         .enumerate()
         .map(|(index, chunk)| {
             format!(
-                "{{\"index\":{index},\"contentHash\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
-                chunk.content_hash,
+                "{{\"index\":{index},\"blockId\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
+                chunk.block_id,
                 chunk.source_start,
                 chunk.source_end,
                 serde_json::to_string(&chunk.source_anchors[..])
@@ -1695,7 +1695,7 @@ fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
             let end = pair[1];
             (start < end).then(|| PreviewChunk {
                 html: Arc::from(&body[start..end]),
-                content_hash: hash_source_markerless(&body[start..end]),
+                block_id: hash_source_markerless(&body[start..end]),
                 source_start: source_marker_at(body, start).unwrap_or(0.0),
                 source_end: source_marker_at(body, end).unwrap_or(0.0),
                 source_anchors: source_markers(&body[start..end]).into(),
@@ -2571,7 +2571,7 @@ mod tests {
                 .virtual_manifest
                 .as_ref()
                 .unwrap()
-                .contains("contentHash")
+                .contains("blockId")
         );
         assert!(
             preview
@@ -2766,7 +2766,7 @@ mod tests {
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("/manifest?revision="));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("const patch = async"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("refreshChunkAnchors"));
-        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("contentHash"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("blockId"));
     }
 
     #[test]
