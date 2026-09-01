@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pulldown_cmark::{CowStr, Event, Tag, TagEnd, html};
+use crate::markdown::{is_block_tag, is_block_tag_end};
+use pulldown_cmark::{CowStr, Event, Tag, html};
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
@@ -1483,9 +1484,15 @@ fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block)
             == matches!(new, crate::markdown::Block::Heading { .. })
 }
 
-fn top_level_event_slices(
-    document: &crate::markdown::ParsedDocument,
-) -> Option<Vec<(usize, usize, usize, usize)>> {
+#[derive(Debug, Clone, Copy)]
+struct BlockSlice {
+    event_start: usize,
+    event_end: usize,
+    source_start: usize,
+    source_end: usize,
+}
+
+fn top_level_event_slices(document: &crate::markdown::ParsedDocument) -> Option<Vec<BlockSlice>> {
     let mut depth = 0usize;
     let mut start = None;
     let mut slices = Vec::new();
@@ -1501,11 +1508,21 @@ fn top_level_event_slices(
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
                     let (event_start, source_start) = start.take()?;
-                    slices.push((event_start, index + 1, source_start, item.range.end));
+                    slices.push(BlockSlice {
+                        event_start,
+                        event_end: index + 1,
+                        source_start,
+                        source_end: item.range.end,
+                    });
                 }
             }
             Event::Rule if depth == 0 => {
-                slices.push((index, index + 1, item.range.start, item.range.end));
+                slices.push(BlockSlice {
+                    event_start: index,
+                    event_end: index + 1,
+                    source_start: item.range.start,
+                    source_end: item.range.end,
+                });
             }
             _ => {}
         }
@@ -1516,16 +1533,21 @@ fn top_level_event_slices(
 fn render_incremental_block(
     document: &crate::markdown::ParsedDocument,
     index: usize,
-    slice: &(usize, usize, usize, usize),
+    slice: &BlockSlice,
     source_start: f32,
     base_directory: Option<&Path>,
 ) -> Option<String> {
+    if slice.source_start > slice.source_end
+        || slice.source_end > document.normalized_source().len()
+    {
+        return None;
+    }
     let mut events = vec![Event::Html(source_anchor(source_start).into())];
     let mut heading_index = document.blocks()[..index]
         .iter()
         .filter(|block| matches!(block, crate::markdown::Block::Heading { .. }))
         .count();
-    for item in &document.events()[slice.0..slice.1] {
+    for item in &document.events()[slice.event_start..slice.event_end] {
         let mut event = item.event.clone();
         if let Event::Start(Tag::Heading { id, .. }) = &mut event {
             *id = Some(format!("md-heading-{heading_index}").into());
@@ -1878,38 +1900,6 @@ fn source_line_at_byte(line_starts: &[usize], byte_offset: usize) -> f32 {
     line_starts
         .partition_point(|start| *start <= byte_offset)
         .saturating_sub(1) as f32
-}
-
-fn is_block_tag(tag: &Tag<'_>) -> bool {
-    matches!(
-        tag,
-        Tag::Paragraph
-            | Tag::Heading { .. }
-            | Tag::BlockQuote(_)
-            | Tag::CodeBlock(_)
-            | Tag::HtmlBlock
-            | Tag::List(_)
-            | Tag::FootnoteDefinition(_)
-            | Tag::DefinitionList
-            | Tag::Table(_)
-            | Tag::MetadataBlock(_)
-    )
-}
-
-fn is_block_tag_end(tag: TagEnd) -> bool {
-    matches!(
-        tag,
-        TagEnd::Paragraph
-            | TagEnd::Heading(_)
-            | TagEnd::BlockQuote(_)
-            | TagEnd::CodeBlock
-            | TagEnd::HtmlBlock
-            | TagEnd::List(_)
-            | TagEnd::FootnoteDefinition
-            | TagEnd::DefinitionList
-            | TagEnd::Table
-            | TagEnd::MetadataBlock(_)
-    )
 }
 
 fn custom_protocol_url(scheme: &str, path: &str) -> String {

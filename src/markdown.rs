@@ -445,7 +445,7 @@ fn is_incremental_block_safe(block: &Block) -> bool {
     )
 }
 
-fn is_block_tag(tag: &Tag<'_>) -> bool {
+pub(crate) fn is_block_tag(tag: &Tag<'_>) -> bool {
     matches!(
         tag,
         Tag::Paragraph
@@ -461,7 +461,7 @@ fn is_block_tag(tag: &Tag<'_>) -> bool {
     )
 }
 
-fn is_block_tag_end(tag_end: TagEnd) -> bool {
+pub(crate) fn is_block_tag_end(tag_end: TagEnd) -> bool {
     matches!(
         tag_end,
         TagEnd::Paragraph
