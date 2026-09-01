@@ -45,14 +45,24 @@ pub struct PreviewDocument {
     total_bytes: usize,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct PreviewChunk {
     html: Arc<str>,
+    content_hash: u64,
     source_start: f32,
     source_end: f32,
+    source_anchors: Arc<[f32]>,
     estimated_height: f32,
     heading_start: Option<usize>,
     heading_end: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct BodyPatch {
+    start: usize,
+    delete_count: usize,
+    insert_count: usize,
+    old_block_count: usize,
 }
 
 impl PreviewDocument {
@@ -65,7 +75,7 @@ impl PreviewDocument {
         self.body_range.is_some()
             && next.body_range.is_some()
             && !self.blocks.is_empty()
-            && self.blocks.len() == next.blocks.len()
+            && !next.blocks.is_empty()
             && self.chrome_hash == next.chrome_hash
             && self.has_mermaid == next.has_mermaid
     }
@@ -81,22 +91,49 @@ impl PreviewDocument {
         self.can_patch_body_into(next) || self.can_patch_virtual_into(next)
     }
 
-    fn changed_block_indices(&self, next: &Self) -> Option<Vec<usize>> {
+    fn source_anchors(&self) -> Vec<f32> {
+        let mut anchors = self
+            .blocks
+            .iter()
+            .map(|block| block.source_start)
+            .collect::<Vec<_>>();
+        if let Some(last) = self.blocks.last() {
+            anchors.push(last.source_end);
+        }
+        anchors
+    }
+
+    fn body_patch_into(&self, next: &Self) -> Option<BodyPatch> {
         if !self.can_patch_body_into(next) {
             return None;
         }
-        Some(
-            self.blocks
-                .iter()
-                .zip(next.blocks.iter())
-                .enumerate()
-                .filter_map(|(index, (current, next))| {
-                    (preview_block_content(current.html.as_ref())
-                        != preview_block_content(next.html.as_ref()))
-                    .then_some(index)
-                })
-                .collect(),
-        )
+
+        let old_len = self.blocks.len();
+        let new_len = next.blocks.len();
+        let common_len = old_len.min(new_len);
+        let mut start = 0;
+        while start < common_len
+            && preview_block_content(self.blocks[start].html.as_ref())
+                == preview_block_content(next.blocks[start].html.as_ref())
+        {
+            start += 1;
+        }
+
+        let mut suffix = 0;
+        while suffix < old_len.saturating_sub(start)
+            && suffix < new_len.saturating_sub(start)
+            && preview_block_content(self.blocks[old_len - 1 - suffix].html.as_ref())
+                == preview_block_content(next.blocks[new_len - 1 - suffix].html.as_ref())
+        {
+            suffix += 1;
+        }
+
+        Some(BodyPatch {
+            start,
+            delete_count: old_len - start - suffix,
+            insert_count: new_len - start - suffix,
+            old_block_count: old_len,
+        })
     }
 }
 
@@ -205,10 +242,11 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     return { index, offset: anchorY(list[index]) - window.scrollY };
   };
 
-  const restoreViewportAnchor = (saved) => {
+  const restoreViewportAnchor = (saved, patch = null) => {
     if (!saved) return false;
     const list = anchors();
-    const anchor = list[Math.min(saved.index, Math.max(0, list.length - 1))];
+    const mappedIndex = mapPatchedAnchorIndex(saved.index, patch, Math.max(0, list.length - 1));
+    const anchor = list[Math.min(mappedIndex, Math.max(0, list.length - 1))];
     if (!anchor) return false;
     window.scrollTo(0, Math.max(0, anchorY(anchor) - saved.offset));
     return true;
@@ -306,7 +344,24 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     }
   };
 
-  window.__mdEditorPatchBody = async (revision, changedIndices = null) => {
+  const mapPatchedAnchorIndex = (index, patch, newBlockCount) => {
+    if (!patch) return Math.min(index, newBlockCount);
+    const oldSuffixStart = patch.start + patch.deleteCount;
+    if (index < patch.start) return index;
+    if (index >= oldSuffixStart) {
+      return patch.start + patch.insertCount + (index - oldSuffixStart);
+    }
+    return Math.min(patch.start, newBlockCount);
+  };
+
+  const replaceBody = async (revision) => {
+    const response = await fetch(`/body?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`preview body request failed: ${response.status}`);
+    document.body.innerHTML = await response.text();
+    anchorCache = null;
+  };
+
+  window.__mdEditorPatchBody = async (revision, patch = null) => {
     const patchRevision = ++navigationRevision;
     cancelSourceAnimation();
     suppressUntil = performance.now() + 500;
@@ -319,46 +374,51 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
         await window.__mdVirtualPreview.patch(revision, saved);
       } else {
         if (patchRevision !== navigationRevision) return;
-        const blocksResponse = await fetch(`/blocks?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
+        const blockQuery = patch
+          ? `&start=${encodeURIComponent(patch.start)}&count=${encodeURIComponent(patch.insertCount)}`
+          : '';
+        const blocksResponse = await fetch(`/blocks?revision=${encodeURIComponent(revision)}${blockQuery}`, { cache: 'no-store' });
         if (blocksResponse.ok) {
-          const blocks = await blocksResponse.json();
+          const blockPayload = await blocksResponse.json();
+          const blocks = Array.isArray(blockPayload) ? blockPayload : blockPayload.blocks;
+          const sourceAnchors = Array.isArray(blockPayload) ? null : blockPayload.sourceAnchors;
           const current = anchors();
-          if (current.length === blocks.length + 1) {
-            const indices = Array.isArray(changedIndices)
-              ? changedIndices.filter((index) => Number.isInteger(index) && index >= 0 && index < blocks.length)
-              : blocks.map((_, index) => index);
-            for (const index of indices.sort((a, b) => b - a)) {
-              const start = current[index]?.node;
-              const end = current[index + 1]?.node;
-              if (!start || !end) throw new Error('preview block anchors missing');
-              const range = document.createRange();
-              range.setStartBefore(start);
-              range.setEndBefore(end);
-              range.deleteContents();
-              const template = document.createElement('template');
-              template.innerHTML = blocks[index].html;
-              range.insertNode(template.content.cloneNode(true));
+          const patchStart = patch?.start ?? 0;
+          const patchDeleteCount = patch?.deleteCount ?? current.length - 1;
+          const oldBlockCount = patch?.oldBlockCount ?? current.length - 1;
+          if (current.length === oldBlockCount + 1
+              && current.length >= patchStart + patchDeleteCount + 1) {
+            const start = current[patchStart]?.node;
+            const end = current[patchStart + patchDeleteCount]?.node;
+            if (!start || !end) throw new Error('preview block anchors missing');
+            const range = document.createRange();
+            range.setStartBefore(start);
+            range.setEndBefore(end);
+            range.deleteContents();
+            const template = document.createElement('template');
+            template.innerHTML = blocks.map((block) => block.html).join('');
+            range.insertNode(template.content.cloneNode(true));
+            anchorCache = null;
+            if (sourceAnchors) {
+              const refreshed = anchors();
+              for (let index = 0; index < Math.min(refreshed.length, sourceAnchors.length); index += 1) {
+                refreshed[index].node.nodeValue = `md-source:${sourceAnchors[index]}`;
+              }
             }
             anchorCache = null;
             blockPatched = true;
           } else {
-            const bodyResponse = await fetch(`/body?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
-            if (!bodyResponse.ok) throw new Error(`preview body request failed: ${bodyResponse.status}`);
-            document.body.innerHTML = await bodyResponse.text();
-            anchorCache = null;
+            await replaceBody(revision);
           }
         } else {
-          const bodyResponse = await fetch(`/body?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
-          if (!bodyResponse.ok) throw new Error(`preview body request failed: ${bodyResponse.status}`);
-          document.body.innerHTML = await bodyResponse.text();
-          anchorCache = null;
+          await replaceBody(revision);
         }
         if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
       }
       await document.fonts.ready;
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       if (patchRevision !== navigationRevision) return;
-      const restoredViewportAnchor = blockPatched && restoreViewportAnchor(savedViewportAnchor);
+      const restoredViewportAnchor = blockPatched && restoreViewportAnchor(savedViewportAnchor, patch);
       window.name = `md-source:${saved}`;
       window.ipc.postMessage(`md-source:program:${saved}`);
       const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
@@ -513,6 +573,24 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     chunk.end = null;
   };
 
+  const nodeForChunk = (chunk) => chunk?.placeholder || chunk?.start || anchor;
+
+  const refreshChunkAnchors = (chunk) => {
+    if (!chunk.start || !chunk.end || !Array.isArray(chunk.sourceAnchors)) return;
+    let sourceIndex = 0;
+    let node = chunk.start;
+    while (node) {
+      if (node.nodeType === Node.COMMENT && /^md-source:[0-9.]+$/.test(node.nodeValue || '')) {
+        if (sourceIndex < chunk.sourceAnchors.length) {
+          node.nodeValue = `md-source:${chunk.sourceAnchors[sourceIndex]}`;
+        }
+        sourceIndex += 1;
+      }
+      if (node === chunk.end) break;
+      node = node.nextSibling;
+    }
+  };
+
   const load = (chunk) => {
     if (!chunk || chunk.start) return Promise.resolve();
     if (chunk.loading) return chunk.loading;
@@ -583,10 +661,35 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     if (!response.ok) throw new Error(`preview manifest request failed: ${response.status}`);
     const nextChunks = await response.json();
     if (requestRevision !== updateRevision) return;
-    for (const chunk of chunks) discard(chunk);
-    chunks = nextChunks;
     revision = String(nextRevision || '');
-    for (const chunk of chunks) anchor.before(placeholderFor(chunk));
+    const sameLayout = nextChunks.length === chunks.length
+      && nextChunks.every((next, index) => next.index === chunks[index].index);
+    if (!sameLayout) {
+      for (const chunk of chunks) discard(chunk);
+      chunks = nextChunks;
+      for (const chunk of chunks) anchor.before(placeholderFor(chunk));
+    } else {
+      const updated = [];
+      for (let index = 0; index < nextChunks.length; index += 1) {
+        const next = nextChunks[index];
+        const current = chunks[index];
+        if (String(next.contentHash) === String(current.contentHash)) {
+          const measuredHeight = current.start ? current.height : next.height;
+          Object.assign(current, next);
+          current.height = measuredHeight;
+          if (current.placeholder) current.placeholder.style.height = `${next.height}px`;
+          refreshChunkAnchors(current);
+          updated.push(current);
+          continue;
+        }
+        const reference = nodeForChunk(chunks[index + 1]);
+        discard(current);
+        const replacement = { ...next };
+        reference.before(placeholderFor(replacement));
+        updated.push(replacement);
+      }
+      chunks = updated;
+    }
     const target = findBySource(savedSource);
     if (target) await load(target);
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -743,10 +846,10 @@ impl BrowserPreview {
             return Ok(());
         }
 
-        let changed_block_indices = self
+        let body_patch = self
             .document_source
             .as_ref()
-            .and_then(|current| current.changed_block_indices(document));
+            .and_then(|current| current.body_patch_into(document));
         let patch_document = source_changed
             && self.document_source.as_ref().is_some_and(|current| {
                 current.can_patch_into(document) || current.can_patch_virtual_into(document)
@@ -767,11 +870,21 @@ impl BrowserPreview {
         }
         if source_changed {
             if patch_document {
-                let changed_blocks_json = serde_json::to_string(&changed_block_indices)
-                    .unwrap_or_else(|_| "null".to_string());
+                let patch_json = body_patch
+                    .as_ref()
+                    .map(|patch| {
+                        serde_json::json!({
+                            "start": patch.start,
+                            "deleteCount": patch.delete_count,
+                            "insertCount": patch.insert_count,
+                            "oldBlockCount": patch.old_block_count,
+                        })
+                    })
+                    .map(|patch| patch.to_string())
+                    .unwrap_or_else(|| "null".to_string());
                 webview
                     .evaluate_script(&format!(
-                        "window.__mdEditorPatchBody?.('{document_hash:016x}', {changed_blocks_json});"
+                        "window.__mdEditorPatchBody?.('{document_hash:016x}', {patch_json});"
                     ))
                     .map_err(|error| format!("无法更新浏览器预览内容：{error}"))?;
             } else {
@@ -1317,8 +1430,10 @@ fn virtualize_document(html: String) -> PreviewDocument {
         let heading_bounds = heading_bounds(&body[start..end]);
         chunks.push(PreviewChunk {
             html: Arc::from(&body[start..end]),
+            content_hash: hash_source_markerless(&body[start..end]),
             source_start,
             source_end: source_end_for_chunk,
+            source_anchors: source_markers(&body[start..end]).into(),
             estimated_height,
             heading_start: heading_bounds.map(|bounds| bounds.0),
             heading_end: heading_bounds.map(|bounds| bounds.1),
@@ -1330,9 +1445,12 @@ fn virtualize_document(html: String) -> PreviewDocument {
         .enumerate()
         .map(|(index, chunk)| {
             format!(
-                "{{\"index\":{index},\"sourceStart\":{},\"sourceEnd\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
+                "{{\"index\":{index},\"contentHash\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
+                chunk.content_hash,
                 chunk.source_start,
                 chunk.source_end,
+                serde_json::to_string(&chunk.source_anchors[..])
+                    .unwrap_or_else(|_| "[]".to_string()),
                 chunk.estimated_height,
                 chunk.heading_start.map_or("null".to_string(), |value| value.to_string()),
                 chunk.heading_end.map_or("null".to_string(), |value| value.to_string())
@@ -1377,8 +1495,10 @@ fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
             let end = pair[1];
             (start < end).then(|| PreviewChunk {
                 html: Arc::from(&body[start..end]),
+                content_hash: hash_source_markerless(&body[start..end]),
                 source_start: source_marker_at(body, start).unwrap_or(0.0),
                 source_end: source_marker_at(body, end).unwrap_or(0.0),
+                source_anchors: source_markers(&body[start..end]).into(),
                 estimated_height: 0.0,
                 heading_start: None,
                 heading_end: None,
@@ -1412,6 +1532,36 @@ fn image_tag_positions(html: &str) -> Vec<usize> {
 fn source_marker_at(body: &str, position: usize) -> Option<f32> {
     let marker = body.get(position..)?.strip_prefix("<!--md-source:")?;
     marker.split("-->").next()?.parse().ok()
+}
+
+fn source_markers(html: &str) -> Vec<f32> {
+    let mut markers = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative) = html[search_from..].find("<!--md-source:") {
+        let position = search_from + relative;
+        if let Some(value) = source_marker_at(html, position) {
+            markers.push(value);
+        }
+        search_from = position + "<!--md-source:".len();
+    }
+    markers
+}
+
+fn hash_source_markerless(html: &str) -> u64 {
+    let mut normalized = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while let Some(relative) = html[cursor..].find("<!--md-source:") {
+        let start = cursor + relative;
+        let Some(end_relative) = html[start..].find("-->") else {
+            break;
+        };
+        let end = start + end_relative + "-->".len();
+        normalized.push_str(&html[cursor..start]);
+        normalized.push_str("<!--md-source-->");
+        cursor = end;
+    }
+    normalized.push_str(&html[cursor..]);
+    hash(&normalized)
 }
 
 fn heading_bounds(html: &str) -> Option<(usize, usize)> {
@@ -1589,11 +1739,15 @@ fn preview_document_response(
         .ok()
         .and_then(|payload| payload.clone());
     let path = request.uri().path();
-    let requested_revision = request.uri().query().and_then(|query| {
-        query
-            .split('&')
-            .find_map(|part| part.strip_prefix("revision="))
-    });
+    let query_value = |key: &str| {
+        request.uri().query().and_then(|query| {
+            query.split('&').find_map(|part| {
+                part.strip_prefix(key)
+                    .and_then(|value| value.strip_prefix('='))
+            })
+        })
+    };
+    let requested_revision = query_value("revision");
     let revision_matches = payload.as_ref().is_some_and(|payload| {
         requested_revision.is_some_and(|revision| revision == format!("{:016x}", payload.hash))
     });
@@ -1617,9 +1771,18 @@ fn preview_document_response(
                     .map(|body| body.as_bytes().to_vec())
             } else if path == "/blocks" {
                 (!payload.blocks.is_empty()).then(|| {
+                    let start = query_value("start")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(payload.blocks.len());
+                    let count = query_value("count")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(payload.blocks.len().saturating_sub(start));
                     let blocks = payload
                         .blocks
                         .iter()
+                        .skip(start)
+                        .take(count)
                         .map(|block| {
                             serde_json::json!({
                                 "html": block.html.as_ref(),
@@ -1628,7 +1791,11 @@ fn preview_document_response(
                             })
                         })
                         .collect::<Vec<_>>();
-                    serde_json::to_vec(&blocks).unwrap_or_default()
+                    serde_json::to_vec(&serde_json::json!({
+                        "blocks": blocks,
+                        "sourceAnchors": payload.source_anchors(),
+                    }))
+                    .unwrap_or_default()
                 })
             } else if path == "/manifest" {
                 payload
@@ -2138,6 +2305,20 @@ mod tests {
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("scrollHeading"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("window.__mdRenderMermaid"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("unload(chunk)"));
+        assert!(
+            preview
+                .virtual_manifest
+                .as_ref()
+                .unwrap()
+                .contains("contentHash")
+        );
+        assert!(
+            preview
+                .virtual_manifest
+                .as_ref()
+                .unwrap()
+                .contains("sourceAnchors")
+        );
     }
 
     #[test]
@@ -2176,12 +2357,48 @@ mod tests {
         assert!(second.body_range.is_some());
         assert!(first.can_patch_body_into(&second));
         assert!(first.can_patch_into(&second));
-        assert_eq!(first.changed_block_indices(&second), Some(vec![1]));
+        let patch = first.body_patch_into(&second).expect("body patch");
+        assert_eq!(patch.start, 1);
+        assert_eq!(patch.insert_count, 1);
         assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorPatchBody"));
         assert!(SCROLL_SYNC_SCRIPT.contains("/blocks?revision="));
         assert!(SCROLL_SYNC_SCRIPT.contains("captureViewportAnchor"));
         assert!(SCROLL_SYNC_SCRIPT.contains("restoreViewportAnchor"));
         assert!(SCROLL_SYNC_SCRIPT.contains("blockPatched && restoreViewportAnchor"));
+    }
+
+    #[test]
+    fn source_only_shifts_refresh_anchors_without_replacing_unchanged_blocks() {
+        let first = crate::markdown::parse_document("# 标题\n\n第一段\n\n第二段");
+        let second = crate::markdown::parse_document("\n# 标题\n\n第一段\n\n第二段");
+        let first = super::preview_document(&first, "", None, None, None);
+        let second = super::preview_document(&second, "", None, None, None);
+
+        let patch = first
+            .body_patch_into(&second)
+            .expect("ordinary documents should support an in-place patch");
+
+        assert_eq!(patch.start, first.blocks.len());
+        assert_eq!(patch.delete_count, 0);
+        assert_eq!(patch.insert_count, 0);
+        assert_ne!(first.source_anchors(), second.source_anchors());
+    }
+
+    #[test]
+    fn inserted_blocks_patch_only_the_changed_middle_range() {
+        let first = crate::markdown::parse_document("# 标题\n\n第一段\n\n第三段");
+        let second = crate::markdown::parse_document("# 标题\n\n第一段\n\n第二段\n\n第三段");
+        let first = super::preview_document(&first, "", None, None, None);
+        let second = super::preview_document(&second, "", None, None, None);
+
+        let patch = first
+            .body_patch_into(&second)
+            .expect("ordinary documents should support an in-place patch");
+
+        assert_eq!(patch.delete_count, 0);
+        assert_eq!(patch.insert_count, 1);
+        assert!(patch.start > 0);
+        assert!(patch.start < second.blocks.len());
     }
 
     #[test]
@@ -2197,6 +2414,8 @@ mod tests {
         assert!(first.can_patch_into(&second));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("/manifest?revision="));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("const patch = async"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("refreshChunkAnchors"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("contentHash"));
     }
 
     #[test]
@@ -2249,6 +2468,29 @@ mod tests {
             "application/json; charset=utf-8"
         );
         assert_eq!(blocks.status(), 404);
+    }
+
+    #[test]
+    fn preview_protocol_returns_only_requested_blocks_and_all_source_anchors() {
+        let parsed = crate::markdown::parse_document("# 一\n\n甲\n\n# 二\n\n乙\n\n# 三\n\n丙");
+        let document = std::sync::Arc::new(super::preview_document(&parsed, "", None, None, None));
+        let payload = std::sync::Arc::new(std::sync::Mutex::new(Some(document.clone())));
+        let request = Request::builder()
+            .uri(format!(
+                "https://mdpreview.localhost/blocks?revision={:016x}&start=1&count=1",
+                document.hash
+            ))
+            .body(Vec::new())
+            .expect("sliced blocks request");
+
+        let response = super::preview_document_response(request, &payload);
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).expect("blocks JSON");
+        assert_eq!(body["blocks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["sourceAnchors"].as_array().unwrap().len(),
+            document.blocks.len() + 1
+        );
     }
 
     #[test]
