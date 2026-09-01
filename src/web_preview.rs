@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -64,6 +65,7 @@ struct BodyPatch {
     delete_count: usize,
     insert_count: usize,
     old_block_count: usize,
+    anchor_map: Vec<Option<usize>>,
 }
 
 impl PreviewDocument {
@@ -129,11 +131,30 @@ impl PreviewDocument {
             suffix += 1;
         }
 
+        let mut positions_by_hash = HashMap::<u64, VecDeque<usize>>::new();
+        for (index, block) in next.blocks.iter().enumerate() {
+            positions_by_hash
+                .entry(block.content_hash)
+                .or_default()
+                .push_back(index);
+        }
+        let mut anchor_map = self
+            .blocks
+            .iter()
+            .map(|block| {
+                positions_by_hash
+                    .get_mut(&block.content_hash)
+                    .and_then(VecDeque::pop_front)
+            })
+            .collect::<Vec<_>>();
+        anchor_map.push(Some(new_len));
+
         Some(BodyPatch {
             start,
             delete_count: old_len - start - suffix,
             insert_count: new_len - start - suffix,
             old_block_count: old_len,
+            anchor_map,
         })
     }
 }
@@ -347,6 +368,9 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
 
   const mapPatchedAnchorIndex = (index, patch, newBlockCount) => {
     if (!patch) return Math.min(index, newBlockCount);
+    if (Array.isArray(patch.anchorMap) && Number.isInteger(patch.anchorMap[index])) {
+      return Math.min(patch.anchorMap[index], newBlockCount);
+    }
     const oldSuffixStart = patch.start + patch.deleteCount;
     if (index < patch.start) return index;
     if (index >= oldSuffixStart) {
@@ -879,6 +903,7 @@ impl BrowserPreview {
                             "deleteCount": patch.delete_count,
                             "insertCount": patch.insert_count,
                             "oldBlockCount": patch.old_block_count,
+                            "anchorMap": patch.anchor_map,
                         })
                     })
                     .map(|patch| patch.to_string())
@@ -1635,7 +1660,21 @@ fn hash_source_markerless(html: &str) -> u64 {
         cursor = end;
     }
     normalized.push_str(&html[cursor..]);
-    hash(&normalized)
+    let mut stable = String::with_capacity(normalized.len());
+    let mut cursor = 0;
+    while let Some(relative) = normalized[cursor..].find("id=\"md-heading-") {
+        let start = cursor + relative;
+        stable.push_str(&normalized[cursor..start]);
+        stable.push_str("id=\"md-heading\"");
+        let digits_start = start + "id=\"md-heading-".len();
+        let Some(end_relative) = normalized[digits_start..].find('"') else {
+            cursor = start;
+            break;
+        };
+        cursor = digits_start + end_relative + 1;
+    }
+    stable.push_str(&normalized[cursor..]);
+    hash(&stable)
 }
 
 fn heading_bounds(html: &str) -> Option<(usize, usize)> {
@@ -2439,6 +2478,7 @@ mod tests {
         assert!(SCROLL_SYNC_SCRIPT.contains("captureViewportAnchor"));
         assert!(SCROLL_SYNC_SCRIPT.contains("restoreViewportAnchor"));
         assert!(SCROLL_SYNC_SCRIPT.contains("blockPatched && restoreViewportAnchor"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("patch.anchorMap"));
     }
 
     #[test]
@@ -2513,6 +2553,18 @@ mod tests {
         assert_eq!(patch.insert_count, 1);
         assert!(patch.start > 0);
         assert!(patch.start < second.blocks.len());
+    }
+
+    #[test]
+    fn body_patch_maps_unchanged_blocks_when_their_order_changes() {
+        let first = crate::markdown::parse_document("# 一\n\n甲\n\n# 二\n\n乙");
+        let second = crate::markdown::parse_document("# 二\n\n乙\n\n# 一\n\n甲");
+        let first = super::preview_document(&first, "", None, None, None);
+        let second = super::preview_document(&second, "", None, None, None);
+
+        let patch = first.body_patch_into(&second).expect("body patch");
+        assert_eq!(patch.anchor_map[1], Some(3));
+        assert_eq!(patch.anchor_map[3], Some(1));
     }
 
     #[test]
