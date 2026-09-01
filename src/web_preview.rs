@@ -2,7 +2,6 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -140,22 +139,28 @@ impl PreviewDocument {
             suffix += 1;
         }
 
-        let mut positions_by_hash = HashMap::<u64, VecDeque<usize>>::new();
-        for (index, block) in next.blocks.iter().enumerate() {
-            positions_by_hash
-                .entry(block.content_hash)
-                .or_default()
-                .push_back(index);
+        let mut used = vec![false; new_len];
+        let mut anchor_map = Vec::with_capacity(old_len + 1);
+        for (old_index, old_block) in self.blocks.iter().enumerate() {
+            let same_position = (old_index < new_len).then_some(old_index).filter(|index| {
+                !used[*index]
+                    && old_block.block_id == next.blocks[*index].block_id
+                    && old_block.content_hash == next.blocks[*index].content_hash
+            });
+            let match_index = same_position.or_else(|| {
+                next.blocks
+                    .iter()
+                    .enumerate()
+                    .find(|(index, block)| {
+                        !used[*index] && block.content_hash == old_block.content_hash
+                    })
+                    .map(|(index, _)| index)
+            });
+            if let Some(index) = match_index {
+                used[index] = true;
+            }
+            anchor_map.push(match_index);
         }
-        let mut anchor_map = self
-            .blocks
-            .iter()
-            .map(|block| {
-                positions_by_hash
-                    .get_mut(&block.content_hash)
-                    .and_then(VecDeque::pop_front)
-            })
-            .collect::<Vec<_>>();
         anchor_map.push(Some(new_len));
 
         Some(BodyPatch {
@@ -724,7 +729,8 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     if (requestRevision !== updateRevision) return false;
     revision = String(nextRevision || '');
     const sameLayout = nextChunks.length === chunks.length
-      && nextChunks.every((next, index) => next.index === chunks[index].index);
+      && nextChunks.every((next, index) => next.index === chunks[index].index
+        && next.sourceAnchors.length === chunks[index].sourceAnchors.length);
     if (!sameLayout) {
       for (const chunk of chunks) discard(chunk);
       chunks = nextChunks;
@@ -752,7 +758,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
       }
       chunks = updated;
     }
-    const restored = await restoreVirtualViewportAnchor(savedAnchor);
+    const restored = sameLayout && await restoreVirtualViewportAnchor(savedAnchor);
     if (!restored) {
       const target = findBySource(savedSource);
       if (target) await load(target);
@@ -1580,7 +1586,7 @@ pub fn preview_document_virtual_incremental(
     let anchors = document_source_anchors(document);
     let mut marker_cursor = 0usize;
     let mut chunks = Vec::with_capacity(previous_preview.chunks.len());
-    for old_chunk in previous_preview.chunks.iter() {
+    for (chunk_index, old_chunk) in previous_preview.chunks.iter().enumerate() {
         let marker_count = old_chunk.source_anchors.len();
         let marker_ranges = source_marker_ranges(&old_chunk.html);
         if marker_count == 0 || marker_ranges.len() != marker_count {
@@ -1616,7 +1622,11 @@ pub fn preview_document_virtual_incremental(
         let values = anchors.get(marker_cursor..chunk_end)?;
         let replaced = replace_source_markers_with_values(&html, values)?;
         html = replaced;
-        if !virtual_chunk_boundary_stable(&old_chunk.html, &html) {
+        if !virtual_chunk_boundary_stable(
+            &old_chunk.html,
+            &html,
+            chunk_index + 1 < previous_preview.chunks.len(),
+        ) {
             return None;
         }
         let source_start = values.first().copied()?;
@@ -1865,7 +1875,11 @@ fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
 /// virtual chunk threshold.  Keeping the old grouping in that case would make
 /// the manifest's source ranges disagree with a full render, so the caller
 /// falls back to rebuilding the virtual document.
-fn virtual_chunk_boundary_stable(old_html: &str, new_html: &str) -> bool {
+fn virtual_chunk_boundary_stable(
+    old_html: &str,
+    new_html: &str,
+    has_following_boundary: bool,
+) -> bool {
     let old_markers = source_marker_ranges(old_html);
     let new_markers = source_marker_ranges(new_html);
     if old_markers.len() != new_markers.len() {
@@ -1885,6 +1899,17 @@ fn virtual_chunk_boundary_stable(old_html: &str, new_html: &str) -> bool {
             old_bytes >= VIRTUAL_CHUNK_TARGET_BYTES || old_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
         let new_crosses =
             new_bytes >= VIRTUAL_CHUNK_TARGET_BYTES || new_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
+        if new_crosses != old_crosses {
+            return false;
+        }
+    }
+    if has_following_boundary {
+        let old_images = image_count_before(old_html, old_html.len());
+        let new_images = image_count_before(new_html, new_html.len());
+        let old_crosses = old_html.len() >= VIRTUAL_CHUNK_TARGET_BYTES
+            || old_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
+        let new_crosses = new_html.len() >= VIRTUAL_CHUNK_TARGET_BYTES
+            || new_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
         if new_crosses != old_crosses {
             return false;
         }
@@ -3056,7 +3081,7 @@ mod tests {
             "a".repeat(100 * 1024)
         );
 
-        assert!(!super::virtual_chunk_boundary_stable(&old, &new));
+        assert!(!super::virtual_chunk_boundary_stable(&old, &new, true));
     }
 
     #[test]
