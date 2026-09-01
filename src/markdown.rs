@@ -319,6 +319,16 @@ pub fn parse_document_incremental(
         if !safe_line_edit(old, prefix, old_end) {
             return None;
         }
+        let ranges = top_level_block_ranges(previous)?;
+        if ranges.len() != previous.blocks.len()
+            || ranges.iter().zip(&previous.blocks).any(|(range, block)| {
+                let edit_inside_block = (range.start < prefix && prefix < range.end)
+                    || (range.start < old_end && old_end < range.end);
+                edit_inside_block && !is_line_edit_block_safe(block)
+            })
+        {
+            return None;
+        }
         let shift = |offset: usize| {
             if offset <= prefix {
                 offset
@@ -442,6 +452,13 @@ fn is_incremental_block_safe(block: &Block) -> bool {
     matches!(
         block,
         Block::Heading { .. } | Block::Paragraph(_) | Block::Code { .. } | Block::Rule
+    )
+}
+
+fn is_line_edit_block_safe(block: &Block) -> bool {
+    matches!(
+        block,
+        Block::Heading { .. } | Block::Paragraph(_) | Block::Rule
     )
 }
 
@@ -1054,6 +1071,14 @@ mod tests {
     fn incremental_parse_falls_back_for_cross_block_list_semantics() {
         let previous = parse_document("- 一\n- 二\n");
         assert!(parse_document_incremental(&previous, "- 一\n- 修改后的二\n").is_none());
+    }
+
+    #[test]
+    fn incremental_parse_falls_back_for_blank_line_inside_code_block() {
+        let previous = parse_document("```text\na\n\nb\n```\n");
+        let next = "```text\na\n\n\nb\n```\n";
+
+        assert!(parse_document_incremental(&previous, next).is_none());
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
