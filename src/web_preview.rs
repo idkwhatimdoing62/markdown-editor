@@ -1534,6 +1534,7 @@ pub fn preview_document_incremental(
     let body_range = previous_preview.body_range?;
     if previous_preview.virtual_manifest.is_some()
         || previous_preview.has_mermaid != document.has_mermaid()
+        || heading_count(previous_document.blocks()) != heading_count(document.blocks())
         || previous_document.blocks().len() != document.blocks().len()
         || previous_preview.blocks.len() != document.blocks().len() + 1
     {
@@ -1610,6 +1611,7 @@ pub fn preview_document_virtual_incremental(
     let previous_document = previous_document?;
     if previous_preview.virtual_manifest.is_none()
         || previous_preview.has_mermaid != document.has_mermaid()
+        || heading_count(previous_document.blocks()) != heading_count(document.blocks())
         || previous_document.blocks().len() != document.blocks().len()
     {
         return None;
@@ -1743,19 +1745,28 @@ pub fn preview_document_virtual_incremental(
 }
 
 fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block) -> bool {
-    let simple = |block: &crate::markdown::Block| {
-        matches!(
-            block,
-            crate::markdown::Block::Heading { .. }
-                | crate::markdown::Block::Paragraph(_)
-                | crate::markdown::Block::Code { .. }
-                | crate::markdown::Block::Rule
-        )
-    };
-    simple(old)
-        && simple(new)
-        && matches!(old, crate::markdown::Block::Heading { .. })
-            == matches!(new, crate::markdown::Block::Heading { .. })
+    // Re-rendering one complete top-level block is still local, even when the
+    // block contains a list, quote, table or image. Raw HTML remains on the
+    // conservative full-render path because it may contain arbitrary sibling
+    // nodes that do not map one-to-one to our source anchors.
+    !matches!(
+        (old, new),
+        (crate::markdown::Block::Raw(_), _) | (_, crate::markdown::Block::Raw(_))
+    ) && std::mem::discriminant(old) == std::mem::discriminant(new)
+}
+
+fn heading_count(blocks: &[crate::markdown::Block]) -> usize {
+    blocks
+        .iter()
+        .map(|block| match block {
+            crate::markdown::Block::Heading { .. } => 1,
+            crate::markdown::Block::List { items, .. } => {
+                items.iter().map(|item| heading_count(item)).sum()
+            }
+            crate::markdown::Block::Quote(children) => heading_count(children),
+            _ => 0,
+        })
+        .sum()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3080,6 +3091,64 @@ mod tests {
 
         assert_eq!(incremental.shell, full.shell);
         assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_rebuilds_changed_table_block_without_navigation() {
+        let first_document = crate::markdown::parse_document(
+            "# 标题\n\n| 字段 | 值 |\n| --- | --- |\n| 一 | 旧 |\n",
+        );
+        let next_document = crate::markdown::parse_document(
+            "# 标题\n\n| 字段 | 值 |\n| --- | --- |\n| 一 | 新 |\n",
+        );
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("table edit should reuse the preview shell");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert!(incremental.shell.contains("<td>新</td>"));
+        assert!(incremental.body_patch_into(&full).is_some());
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_rebuilds_changed_list_block_without_navigation() {
+        let first_document = crate::markdown::parse_document("# 标题\n\n- 第一项\n- 旧内容\n");
+        let next_document = crate::markdown::parse_document("# 标题\n\n- 第一项\n- 新内容\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("list edit should reuse the preview shell");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn nested_heading_count_change_still_forces_full_preview_rendering() {
+        let first_document = crate::markdown::parse_document("> # 嵌套标题\n");
+        let next_document = crate::markdown::parse_document("> 正文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        assert!(
+            super::preview_document_incremental(
+                Some(&first_preview),
+                Some(&first_document),
+                &next_document,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
