@@ -300,6 +300,7 @@ impl BrowserDocumentKey {
 struct BrowserDocumentCache {
     key: BrowserDocumentKey,
     document: Arc<web_preview::PreviewDocument>,
+    parsed_document: Arc<ParsedDocument>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -307,6 +308,7 @@ struct RenderRequest {
     key: BrowserDocumentKey,
     document: ParsedDocument,
     previous: Option<Arc<web_preview::PreviewDocument>>,
+    previous_parsed: Option<Arc<ParsedDocument>>,
     css: String,
     base_directory: Option<PathBuf>,
     font_size_override: Option<f32>,
@@ -317,6 +319,7 @@ struct RenderRequest {
 struct RenderResult {
     key: BrowserDocumentKey,
     document: Arc<web_preview::PreviewDocument>,
+    parsed_document: Arc<ParsedDocument>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -335,11 +338,20 @@ impl RenderWorker {
                 while let Ok(newer) = request_receiver.try_recv() {
                     request = newer;
                 }
+                let parsed_document = Arc::new(request.document.clone());
                 let document = Arc::new(
-                    web_preview::preview_document_with_previous(
+                    web_preview::preview_document_incremental(
                         request.previous.as_deref(),
+                        request.previous_parsed.as_deref(),
                         &request.document,
+                        request.base_directory.as_deref(),
                     )
+                    .or_else(|| {
+                        web_preview::preview_document_with_previous(
+                            request.previous.as_deref(),
+                            &request.document,
+                        )
+                    })
                     .unwrap_or_else(|| {
                         web_preview::preview_document(
                             &request.document,
@@ -354,6 +366,7 @@ impl RenderWorker {
                     .send(RenderResult {
                         key: request.key,
                         document,
+                        parsed_document,
                     })
                     .is_err()
                 {
@@ -1392,6 +1405,7 @@ impl MdEditorApp {
         &self,
         key: BrowserDocumentKey,
         previous: Option<Arc<web_preview::PreviewDocument>>,
+        previous_parsed: Option<Arc<ParsedDocument>>,
     ) -> RenderRequest {
         let built_in = ThemePackage::built_in_sspai();
         let package = self.theme_package.as_ref().unwrap_or(&built_in);
@@ -1407,6 +1421,7 @@ impl MdEditorApp {
             key,
             document: self.document.clone(),
             previous,
+            previous_parsed,
             css: base_css,
             base_directory: self
                 .path
@@ -1423,12 +1438,18 @@ impl MdEditorApp {
         if self.render_pending.as_ref() == Some(&key) {
             return;
         }
-        let previous = self
+        let (previous, previous_parsed) = self
             .browser_document_cache
             .as_ref()
-            .map(|cache| Arc::clone(&cache.document));
+            .map(|cache| {
+                (
+                    Some(Arc::clone(&cache.document)),
+                    Some(Arc::clone(&cache.parsed_document)),
+                )
+            })
+            .unwrap_or((None, None));
         self.render_worker
-            .submit(self.make_render_request(key.clone(), previous));
+            .submit(self.make_render_request(key.clone(), previous, previous_parsed));
         self.render_pending = Some(key);
     }
 
@@ -1441,6 +1462,7 @@ impl MdEditorApp {
                 self.browser_document_cache = Some(BrowserDocumentCache {
                     key: result.key.clone(),
                     document: result.document,
+                    parsed_document: result.parsed_document,
                 });
                 if self.render_pending.as_ref() == Some(&result.key) {
                     self.render_pending = None;
@@ -1479,7 +1501,7 @@ impl MdEditorApp {
             return document;
         }
 
-        let request = self.make_render_request(key.clone(), None);
+        let request = self.make_render_request(key.clone(), None, None);
         let document = Arc::new(web_preview::preview_document(
             &request.document,
             &request.css,
@@ -1490,6 +1512,7 @@ impl MdEditorApp {
         self.browser_document_cache = Some(BrowserDocumentCache {
             key,
             document: Arc::clone(&document),
+            parsed_document: Arc::new(request.document),
         });
         self.render_pending = None;
         document

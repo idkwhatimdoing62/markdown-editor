@@ -1385,6 +1385,154 @@ pub fn preview_document_with_previous(
     Some(preview)
 }
 
+/// Rebuild only changed simple top-level blocks while retaining the previous
+/// document shell and unchanged block HTML. This keeps theme CSS, image bases,
+/// and browser state stable; callers must provide the parsed document that
+/// produced `previous` so block identity can be compared without rendering
+/// every block again.
+pub fn preview_document_incremental(
+    previous_preview: Option<&PreviewDocument>,
+    previous_document: Option<&crate::markdown::ParsedDocument>,
+    document: &crate::markdown::ParsedDocument,
+    base_directory: Option<&Path>,
+) -> Option<PreviewDocument> {
+    let previous_preview = previous_preview?;
+    let previous_document = previous_document?;
+    let body_range = previous_preview.body_range?;
+    if previous_preview.virtual_manifest.is_some()
+        || previous_preview.has_mermaid != document.has_mermaid()
+        || previous_document.blocks().len() != document.blocks().len()
+        || previous_preview.blocks.len() != document.blocks().len() + 1
+    {
+        return None;
+    }
+
+    let changed = previous_document
+        .blocks()
+        .iter()
+        .zip(document.blocks())
+        .enumerate()
+        .filter_map(|(index, (old, new))| (old != new).then_some(index))
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return preview_document_with_previous(Some(previous_preview), document);
+    }
+    if changed.iter().any(|index| {
+        !simple_block_pair(
+            &previous_document.blocks()[*index],
+            &document.blocks()[*index],
+        )
+    }) {
+        return None;
+    }
+
+    let slices = top_level_event_slices(document)?;
+    if slices.len() != document.blocks().len() {
+        return None;
+    }
+    let anchors = document_source_anchors(document);
+    if anchors.len() != document.blocks().len() + 2 {
+        return None;
+    }
+
+    let mut body = String::with_capacity(previous_preview.shell.len());
+    for (chunk_index, old_chunk) in previous_preview.blocks.iter().enumerate() {
+        let block_index = chunk_index.checked_sub(1);
+        if let Some(index) = block_index.filter(|index| changed.binary_search(index).is_ok()) {
+            body.push_str(&render_incremental_block(
+                document,
+                index,
+                &slices[index],
+                anchors[index + 1],
+                base_directory,
+            )?);
+        } else {
+            body.push_str(&old_chunk.html);
+        }
+    }
+    body.push_str(&source_anchor(*anchors.last()?));
+    let mut html = String::with_capacity(previous_preview.shell.len() + body.len());
+    html.push_str(&previous_preview.shell[..body_range.0]);
+    html.push_str(&body);
+    html.push_str(&previous_preview.shell[body_range.1..]);
+    let html = replace_source_markers(&html, &anchors);
+    let mut preview = virtualize_document(html);
+    preview.block_fingerprint = block_fingerprint(document);
+    Some(preview)
+}
+
+fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block) -> bool {
+    let simple = |block: &crate::markdown::Block| {
+        matches!(
+            block,
+            crate::markdown::Block::Heading { .. }
+                | crate::markdown::Block::Paragraph(_)
+                | crate::markdown::Block::Code { .. }
+                | crate::markdown::Block::Rule
+        )
+    };
+    simple(old)
+        && simple(new)
+        && matches!(old, crate::markdown::Block::Heading { .. })
+            == matches!(new, crate::markdown::Block::Heading { .. })
+}
+
+fn top_level_event_slices(
+    document: &crate::markdown::ParsedDocument,
+) -> Option<Vec<(usize, usize, usize, usize)>> {
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut slices = Vec::new();
+    for (index, item) in document.events().iter().enumerate() {
+        match &item.event {
+            Event::Start(tag) if is_block_tag(tag) => {
+                if depth == 0 {
+                    start = Some((index, item.range.start));
+                }
+                depth += 1;
+            }
+            Event::End(tag_end) if is_block_tag_end(*tag_end) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let (event_start, source_start) = start.take()?;
+                    slices.push((event_start, index + 1, source_start, item.range.end));
+                }
+            }
+            Event::Rule if depth == 0 => {
+                slices.push((index, index + 1, item.range.start, item.range.end));
+            }
+            _ => {}
+        }
+    }
+    (depth == 0 && start.is_none()).then_some(slices)
+}
+
+fn render_incremental_block(
+    document: &crate::markdown::ParsedDocument,
+    index: usize,
+    slice: &(usize, usize, usize, usize),
+    source_start: f32,
+    base_directory: Option<&Path>,
+) -> Option<String> {
+    let mut events = vec![Event::Html(source_anchor(source_start).into())];
+    let mut heading_index = document.blocks()[..index]
+        .iter()
+        .filter(|block| matches!(block, crate::markdown::Block::Heading { .. }))
+        .count();
+    for item in &document.events()[slice.0..slice.1] {
+        let mut event = item.event.clone();
+        if let Event::Start(Tag::Heading { id, .. }) = &mut event {
+            *id = Some(format!("md-heading-{heading_index}").into());
+            heading_index += 1;
+        }
+        events.push(rewrite_local_image_event(event, base_directory));
+    }
+    let mut html = String::new();
+    html::push_html(&mut html, events.into_iter());
+    annotate_code_languages(&mut html);
+    Some(html)
+}
+
 fn virtualize_document(html: String) -> PreviewDocument {
     const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
     const VIRTUALIZE_AT_IMAGES: usize = 8;
@@ -2510,6 +2658,43 @@ mod tests {
             let parsed = crate::markdown::parse_document("\n# 标题\n\n第一段\n\n第二段");
             super::preview_document(&parsed, "", None, None, None).source_anchors()
         });
+    }
+
+    #[test]
+    fn incremental_preview_rebuilds_only_changed_simple_block() {
+        let first_document =
+            crate::markdown::parse_document("# 标题\n\n第一段\n\n```rust\nlet a = 1;\n```\n");
+        let next_document =
+            crate::markdown::parse_document("# 标题\n\n修改后的段落\n\n```rust\nlet a = 1;\n```\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("simple block edit should reuse the preview shell");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_falls_back_when_block_kind_changes() {
+        let first_document = crate::markdown::parse_document("正文\n");
+        let next_document = crate::markdown::parse_document("# 标题\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        assert!(
+            super::preview_document_incremental(
+                Some(&first_preview),
+                Some(&first_document),
+                &next_document,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
