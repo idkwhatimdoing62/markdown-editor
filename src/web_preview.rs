@@ -36,6 +36,7 @@ pub struct BrowserPreview {
 pub struct PreviewDocument {
     shell: Arc<str>,
     body_range: Option<(usize, usize)>,
+    virtual_manifest: Option<Arc<str>>,
     chunks: Arc<[PreviewChunk]>,
     hash: u64,
     chrome_hash: u64,
@@ -64,6 +65,17 @@ impl PreviewDocument {
             && next.body_range.is_some()
             && self.chrome_hash == next.chrome_hash
             && self.has_mermaid == next.has_mermaid
+    }
+
+    fn can_patch_virtual_into(&self, next: &Self) -> bool {
+        self.virtual_manifest.is_some()
+            && next.virtual_manifest.is_some()
+            && self.chrome_hash == next.chrome_hash
+            && self.has_mermaid == next.has_mermaid
+    }
+
+    fn can_patch_into(&self, next: &Self) -> bool {
+        self.can_patch_body_into(next) || self.can_patch_virtual_into(next)
     }
 }
 
@@ -260,14 +272,18 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     const match = /^md-source:([0-9.]+)$/.exec(window.name || '');
     const saved = match ? Number(match[1]) : 0;
     try {
-      const url = new URL(`/body?revision=${encodeURIComponent(revision)}`, location.origin);
-      const response = await fetch(url, { cache: 'no-store' });
-      if (!response.ok) throw new Error(`preview body request failed: ${response.status}`);
-      const body = await response.text();
-      if (patchRevision !== navigationRevision) return;
-      document.body.innerHTML = body;
-      anchorCache = null;
-      if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+      if (window.__mdVirtualPreview) {
+        await window.__mdVirtualPreview.patch(revision, saved);
+      } else {
+        const url = new URL(`/body?revision=${encodeURIComponent(revision)}`, location.origin);
+        const response = await fetch(url, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`preview body request failed: ${response.status}`);
+        const body = await response.text();
+        if (patchRevision !== navigationRevision) return;
+        document.body.innerHTML = body;
+        anchorCache = null;
+        if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+      }
       await document.fonts.ready;
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       if (patchRevision !== navigationRevision) return;
@@ -323,8 +339,9 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
 (() => {
   const manifestNode = document.getElementById('md-virtual-manifest');
   if (!manifestNode) return;
-  const chunks = JSON.parse(manifestNode.textContent || '[]');
-  const revision = new URL(location.href).searchParams.get('revision') || '';
+  let chunks = JSON.parse(manifestNode.textContent || '[]');
+  let revision = new URL(location.href).searchParams.get('revision') || '';
+  let updateRevision = 0;
   let scheduled = false;
 
   const placeholderFor = (chunk) => {
@@ -408,6 +425,22 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     chunk.end = null;
   };
 
+  const discard = (chunk) => {
+    chunk.placeholder?.remove();
+    chunk.placeholder = null;
+    if (!chunk.start || !chunk.end) return;
+    let node = chunk.start;
+    while (node) {
+      const next = node.nextSibling;
+      const finished = node === chunk.end;
+      node.remove();
+      if (finished) break;
+      node = next;
+    }
+    chunk.start = null;
+    chunk.end = null;
+  };
+
   const load = (chunk) => {
     if (!chunk || chunk.start) return Promise.resolve();
     if (chunk.loading) return chunk.loading;
@@ -463,11 +496,39 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
   };
 
   const scriptNode = document.currentScript;
-  const reference = manifestNode;
-  for (const chunk of chunks) reference.before(placeholderFor(chunk));
+  const anchor = document.createElement('span');
+  anchor.id = 'md-virtual-anchor';
+  anchor.hidden = true;
+  manifestNode.before(anchor);
+  for (const chunk of chunks) anchor.before(placeholderFor(chunk));
   manifestNode.remove();
   if (scriptNode) scriptNode.remove();
-  window.__mdVirtualPreview = { yForSource, sourceForY, scrollHeading, loadSource: (source) => load(findBySource(source)) };
+
+  const patch = async (nextRevision, savedSource) => {
+    const requestRevision = ++updateRevision;
+    const manifestUrl = new URL(`/manifest?revision=${encodeURIComponent(nextRevision)}`, location.origin);
+    const response = await fetch(manifestUrl, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`preview manifest request failed: ${response.status}`);
+    const nextChunks = await response.json();
+    if (requestRevision !== updateRevision) return;
+    for (const chunk of chunks) discard(chunk);
+    chunks = nextChunks;
+    revision = String(nextRevision || '');
+    for (const chunk of chunks) anchor.before(placeholderFor(chunk));
+    const target = findBySource(savedSource);
+    if (target) await load(target);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    window.scrollTo(0, yForSource(savedSource));
+    schedule();
+  };
+
+  window.__mdVirtualPreview = {
+    yForSource,
+    sourceForY,
+    scrollHeading,
+    loadSource: (source) => load(findBySource(source)),
+    patch,
+  };
   window.addEventListener('scroll', schedule, { passive: true });
   window.addEventListener('resize', schedule, { passive: true });
 
@@ -610,13 +671,13 @@ impl BrowserPreview {
             return Ok(());
         }
 
-        let patch_body = source_changed
+        let patch_document = source_changed
             && self
                 .document_source
                 .as_ref()
-                .is_some_and(|current| current.can_patch_body_into(document));
+                .is_some_and(|current| current.can_patch_into(document));
         if source_changed {
-            if !patch_body {
+            if !patch_document {
                 self.reset_scroll_bridge_for_document();
             }
             self.store_document(document);
@@ -630,7 +691,7 @@ impl BrowserPreview {
             self.bounds = Some(bounds);
         }
         if source_changed {
-            if patch_body {
+            if patch_document {
                 webview
                     .evaluate_script(&format!(
                         "window.__mdEditorPatchBody?.('{document_hash:016x}');"
@@ -1098,6 +1159,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         return PreviewDocument {
             shell: html.into(),
             body_range: None,
+            virtual_manifest: None,
             chunks: Arc::from([]),
             hash: document_hash,
             chrome_hash: document_hash,
@@ -1110,6 +1172,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         return PreviewDocument {
             shell: html.into(),
             body_range: None,
+            virtual_manifest: None,
             chunks: Arc::from([]),
             hash: document_hash,
             chrome_hash: document_hash,
@@ -1125,6 +1188,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         return PreviewDocument {
             shell: html.into(),
             body_range: Some((body_start, body_end)),
+            virtual_manifest: None,
             chunks: Arc::from([]),
             hash: document_hash,
             chrome_hash,
@@ -1195,8 +1259,9 @@ fn virtualize_document(html: String) -> PreviewDocument {
         })
         .collect::<Vec<_>>()
         .join(",");
+    let manifest = format!("[{manifest}]");
     let virtual_script = format!(
-        "<script id=\"md-virtual-manifest\" type=\"application/json\">[{manifest}]</script><script defer src=\"{}\"></script>",
+        "<script id=\"md-virtual-manifest\" type=\"application/json\">{manifest}</script><script defer src=\"{}\"></script>",
         custom_protocol_url("mdfont", "virtual-preview.js")
     );
     let mut shell = String::with_capacity(html.len() - body.len() + virtual_script.len());
@@ -1206,6 +1271,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
     PreviewDocument {
         shell: shell.into(),
         body_range: None,
+        virtual_manifest: Some(manifest.into()),
         chunks: chunks.into(),
         hash: document_hash,
         chrome_hash,
@@ -1410,6 +1476,22 @@ fn preview_document_response(
         .ok()
         .and_then(|payload| payload.clone());
     let path = request.uri().path();
+    let requested_revision = request.uri().query().and_then(|query| {
+        query
+            .split('&')
+            .find_map(|part| part.strip_prefix("revision="))
+    });
+    let revision_matches = payload.as_ref().is_some_and(|payload| {
+        requested_revision.is_some_and(|revision| revision == format!("{:016x}", payload.hash))
+    });
+    if !revision_matches {
+        return Response::builder()
+            .status(409)
+            .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(CACHE_CONTROL, "no-store")
+            .body(Cow::Borrowed(&b"stale preview revision"[..]))
+            .expect("valid stale preview response");
+    }
     let bytes = payload
         .as_ref()
         .and_then(|payload| {
@@ -1420,6 +1502,11 @@ fn preview_document_response(
                     .body_range
                     .and_then(|(start, end)| payload.shell.get(start..end))
                     .map(|body| body.as_bytes().to_vec())
+            } else if path == "/manifest" {
+                payload
+                    .virtual_manifest
+                    .as_ref()
+                    .map(|manifest| manifest.as_bytes().to_vec())
             } else {
                 path.strip_prefix("/chunk/")
                     .and_then(|index| index.parse::<usize>().ok())
@@ -1431,7 +1518,14 @@ fn preview_document_response(
     let status = if bytes.is_empty() { 404 } else { 200 };
     Response::builder()
         .status(status)
-        .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(
+            CONTENT_TYPE,
+            if path == "/manifest" {
+                "application/json; charset=utf-8"
+            } else {
+                "text/html; charset=utf-8"
+            },
+        )
         .header("X-Content-Type-Options", "nosniff")
         .header(CACHE_CONTROL, "no-store")
         .body(Cow::Owned(bytes))
@@ -1953,7 +2047,23 @@ mod tests {
         assert!(first.body_range.is_some());
         assert!(second.body_range.is_some());
         assert!(first.can_patch_body_into(&second));
+        assert!(first.can_patch_into(&second));
         assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorPatchBody"));
+    }
+
+    #[test]
+    fn virtual_documents_can_update_their_manifest_without_navigation() {
+        let first = crate::markdown::parse_document(&"## 第一版\n\n正文。\n\n".repeat(30_000));
+        let second = crate::markdown::parse_document(&"## 第二版\n\n正文。\n\n".repeat(30_000));
+        let first = super::preview_document(&first, "body { color: black; }", None, None, None);
+        let second = super::preview_document(&second, "body { color: black; }", None, None, None);
+
+        assert!(first.virtual_manifest.is_some());
+        assert!(second.virtual_manifest.is_some());
+        assert!(first.can_patch_virtual_into(&second));
+        assert!(first.can_patch_into(&second));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("/manifest?revision="));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("const patch = async"));
     }
 
     #[test]
@@ -1962,7 +2072,41 @@ mod tests {
         let first = super::preview_document(&parsed, "body { color: black; }", None, None, None);
         let second = super::preview_document(&parsed, "body { color: white; }", None, None, None);
 
-        assert!(!first.can_patch_body_into(&second));
+        assert!(!first.can_patch_into(&second));
+    }
+
+    #[test]
+    fn preview_protocol_rejects_stale_virtual_chunk_revisions() {
+        let parsed = crate::markdown::parse_document(&"## 章节\n\n正文。\n\n".repeat(30_000));
+        let document = std::sync::Arc::new(super::preview_document(
+            &parsed,
+            "body { color: black; }",
+            None,
+            None,
+            None,
+        ));
+        let payload = std::sync::Arc::new(std::sync::Mutex::new(Some(document.clone())));
+        let stale_request = Request::builder()
+            .uri("https://mdpreview.localhost/chunk/0?revision=0000000000000000")
+            .body(Vec::new())
+            .expect("stale chunk request");
+        let current_request = Request::builder()
+            .uri(format!(
+                "https://mdpreview.localhost/manifest?revision={:016x}",
+                document.hash
+            ))
+            .body(Vec::new())
+            .expect("current manifest request");
+
+        let stale = super::preview_document_response(stale_request, &payload);
+        let current = super::preview_document_response(current_request, &payload);
+
+        assert_eq!(stale.status(), 409);
+        assert_eq!(current.status(), 200);
+        assert_eq!(
+            current.headers().get("content-type").unwrap(),
+            "application/json; charset=utf-8"
+        );
     }
 
     #[test]
