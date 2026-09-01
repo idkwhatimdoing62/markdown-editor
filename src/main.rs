@@ -302,6 +302,71 @@ struct BrowserDocumentCache {
     document: Arc<web_preview::PreviewDocument>,
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct RenderRequest {
+    key: BrowserDocumentKey,
+    document: ParsedDocument,
+    css: String,
+    base_directory: Option<PathBuf>,
+    font_size_override: Option<f32>,
+    dark_mode_css: Option<String>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct RenderResult {
+    key: BrowserDocumentKey,
+    document: Arc<web_preview::PreviewDocument>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct RenderWorker {
+    requests: Sender<RenderRequest>,
+    results: Receiver<RenderResult>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl RenderWorker {
+    fn new() -> Self {
+        let (request_sender, request_receiver) = mpsc::channel::<RenderRequest>();
+        let (result_sender, result_receiver) = mpsc::channel::<RenderResult>();
+        std::thread::spawn(move || {
+            while let Ok(mut request) = request_receiver.recv() {
+                while let Ok(newer) = request_receiver.try_recv() {
+                    request = newer;
+                }
+                let document = Arc::new(web_preview::preview_document(
+                    &request.document,
+                    &request.css,
+                    request.base_directory.as_deref(),
+                    request.font_size_override,
+                    request.dark_mode_css.as_deref(),
+                ));
+                if result_sender
+                    .send(RenderResult {
+                        key: request.key,
+                        document,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests: request_sender,
+            results: result_receiver,
+        }
+    }
+
+    fn submit(&self, request: RenderRequest) {
+        let _ = self.requests.send(request);
+    }
+
+    fn try_recv(&self) -> Result<RenderResult, mpsc::TryRecvError> {
+        self.results.try_recv()
+    }
+}
+
 struct ParseRequest {
     tab_id: u64,
     revision: u64,
@@ -867,6 +932,10 @@ struct MdEditorApp {
     benchmark_probe: Option<BenchmarkProbe>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     browser_document_cache: Option<BrowserDocumentCache>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    render_worker: RenderWorker,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    render_pending: Option<BrowserDocumentKey>,
 }
 
 impl std::ops::Deref for MdEditorApp {
@@ -946,6 +1015,10 @@ impl MdEditorApp {
             benchmark_probe: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_document_cache: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            render_worker: RenderWorker::new(),
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            render_pending: None,
         }
     }
 
@@ -1281,22 +1354,84 @@ impl MdEditorApp {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn browser_document(
-        &mut self,
-        defer_document_refresh: bool,
-    ) -> Arc<web_preview::PreviewDocument> {
+    fn current_browser_document_key(&self) -> BrowserDocumentKey {
         let base_directory = self
             .path
             .as_deref()
             .and_then(std::path::Path::parent)
             .map(Path::to_path_buf);
-        let key = BrowserDocumentKey {
+        BrowserDocumentKey {
             tab_id: self.tabs.get(self.active_tab).map_or(0, |tab| tab.id),
             document_revision: self.document_revision,
             theme_revision: self.theme_revision,
             body_font_size_bits: self.body_font_size.to_bits(),
-            base_directory: base_directory.clone(),
-        };
+            base_directory,
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn make_render_request(&self, key: BrowserDocumentKey) -> RenderRequest {
+        let built_in = ThemePackage::built_in_sspai();
+        let package = self.theme_package.as_ref().unwrap_or(&built_in);
+        let base_css = package
+            .browser_css()
+            .unwrap_or(theme::BUILT_IN_SSPAI_CSS)
+            .to_string();
+        let dark_mode_css = self.dark.then(|| theme::dark_mode_css(&self.theme_spec()));
+        let default_size = package.recommended_body_font_size();
+        let font_size_override =
+            ((self.body_font_size - default_size).abs() > 0.01).then_some(self.body_font_size);
+        RenderRequest {
+            key,
+            document: self.document.clone(),
+            css: base_css,
+            base_directory: self
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+            font_size_override,
+            dark_mode_css,
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn queue_browser_render(&mut self, key: BrowserDocumentKey) {
+        if self.render_pending.as_ref() == Some(&key) {
+            return;
+        }
+        self.render_worker
+            .submit(self.make_render_request(key.clone()));
+        self.render_pending = Some(key);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn poll_browser_render_results(&mut self, ctx: &egui::Context) {
+        let current_key = self.current_browser_document_key();
+        let mut changed = false;
+        while let Ok(result) = self.render_worker.try_recv() {
+            if result.key == current_key {
+                self.browser_document_cache = Some(BrowserDocumentCache {
+                    key: result.key.clone(),
+                    document: result.document,
+                });
+                if self.render_pending.as_ref() == Some(&result.key) {
+                    self.render_pending = None;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            ctx.request_repaint();
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn browser_document(
+        &mut self,
+        defer_document_refresh: bool,
+    ) -> Arc<web_preview::PreviewDocument> {
+        let key = self.current_browser_document_key();
         if let Some(cache) = &self.browser_document_cache
             && cache.key == key
         {
@@ -1309,24 +1444,27 @@ impl MdEditorApp {
             return Arc::clone(&cache.document);
         }
 
-        let built_in = ThemePackage::built_in_sspai();
-        let package = self.theme_package.as_ref().unwrap_or(&built_in);
-        let base_css = package.browser_css().unwrap_or(theme::BUILT_IN_SSPAI_CSS);
-        let dark_css = self.dark.then(|| theme::dark_mode_css(&self.theme_spec()));
-        let default_size = package.recommended_body_font_size();
-        let font_override =
-            ((self.body_font_size - default_size).abs() > 0.01).then_some(self.body_font_size);
+        if let Some(cache) = &self.browser_document_cache
+            && cache.key.same_render_context(&key)
+        {
+            let document = Arc::clone(&cache.document);
+            self.queue_browser_render(key);
+            return document;
+        }
+
+        let request = self.make_render_request(key.clone());
         let document = Arc::new(web_preview::preview_document(
-            &self.document,
-            base_css,
-            base_directory.as_deref(),
-            font_override,
-            dark_css.as_deref(),
+            &request.document,
+            &request.css,
+            request.base_directory.as_deref(),
+            request.font_size_override,
+            request.dark_mode_css.as_deref(),
         ));
         self.browser_document_cache = Some(BrowserDocumentCache {
             key,
             document: Arc::clone(&document),
         });
+        self.render_pending = None;
         document
     }
 
@@ -1334,6 +1472,7 @@ impl MdEditorApp {
     fn release_browser_preview(&mut self) {
         self.browser_preview.close();
         self.browser_document_cache = None;
+        self.render_pending = None;
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -3296,6 +3435,7 @@ impl eframe::App for MdEditorApp {
             } else if browser_rect.is_none() {
                 self.release_browser_preview();
             } else if let Some(rect) = browser_rect {
+                self.poll_browser_render_results(&ctx);
                 self.browser_preview.discard_frozen_frame();
                 let preview_refresh_remaining = (self.view_mode == ViewMode::Split
                     && self.last_edit_time.is_finite())
@@ -3791,7 +3931,7 @@ mod app_tests {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
-    fn split_editing_reuses_the_previous_preview_during_debounce() {
+    fn split_editing_queues_background_preview_after_debounce() {
         let mut app = app_with_two_tabs();
         let initial = app.browser_document(false);
         app.text = "# 已更新\n".to_string();
@@ -3802,7 +3942,8 @@ mod app_tests {
         assert!(std::sync::Arc::ptr_eq(&initial, &deferred));
 
         let refreshed = app.browser_document(false);
-        assert!(!std::sync::Arc::ptr_eq(&initial, &refreshed));
+        assert!(std::sync::Arc::ptr_eq(&initial, &refreshed));
+        assert!(app.render_pending.is_some());
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -3883,6 +4024,10 @@ mod app_tests {
             benchmark_probe: None,
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             browser_document_cache: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            render_worker: RenderWorker::new(),
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            render_pending: None,
         }
     }
 
