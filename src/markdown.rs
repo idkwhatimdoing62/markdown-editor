@@ -215,7 +215,7 @@ pub struct ParsedDocument {
     events: Vec<SpannedEvent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SpannedEvent {
     pub event: Event<'static>,
     pub range: Range<usize>,
@@ -280,9 +280,9 @@ pub fn parse_document(markdown: &str) -> ParsedDocument {
     }
 }
 
-/// Reuse a parsed document when an edit only adds or removes line breaks at a
-/// block-safe boundary. All other edits return `None` and must use
-/// [`parse_document`] so Markdown context is re-evaluated conservatively.
+/// Reuse a parsed document for edits whose Markdown context is provably local.
+/// Line-only edits reuse all blocks; textual edits reparse one simple
+/// top-level block. Structural blocks conservatively fall back to a full parse.
 pub fn parse_document_incremental(
     previous: &ParsedDocument,
     markdown: &str,
@@ -307,9 +307,6 @@ pub fn parse_document_incremental(
     let new_mid = &new[prefix..new_end];
     let line_only =
         |slice: &[u8]| !slice.is_empty() && slice.iter().all(|byte| matches!(byte, b'\r' | b'\n'));
-    if !(line_only(old_mid) || line_only(new_mid)) || !safe_line_edit(old, prefix, old_end) {
-        return None;
-    }
     if !matches!(normalize_compat_markdown(markdown), Cow::Borrowed(_)) {
         return None;
     }
@@ -317,29 +314,167 @@ pub fn parse_document_incremental(
     let old_mid_len = old_end - prefix;
     let new_mid_len = new_end - prefix;
     let delta = new_mid_len as isize - old_mid_len as isize;
-    let shift = |offset: usize| {
-        if offset <= prefix {
-            offset
-        } else if offset >= old_end {
-            offset.saturating_add_signed(delta)
-        } else {
-            prefix + new_mid_len
+
+    if line_only(old_mid) || line_only(new_mid) {
+        if !safe_line_edit(old, prefix, old_end) {
+            return None;
         }
-    };
-    let events = previous
-        .events
+        let shift = |offset: usize| {
+            if offset <= prefix {
+                offset
+            } else if offset >= old_end {
+                offset.saturating_add_signed(delta)
+            } else {
+                prefix + new_mid_len
+            }
+        };
+        let events = previous
+            .events
+            .iter()
+            .map(|item| SpannedEvent {
+                event: item.event.clone(),
+                range: shift(item.range.start)..shift(item.range.end),
+            })
+            .collect();
+        return Some(ParsedDocument {
+            source: markdown.to_string(),
+            normalized: None,
+            blocks: previous.blocks.clone(),
+            events,
+        });
+    }
+
+    let ranges = top_level_block_ranges(previous)?;
+    if ranges.len() != previous.blocks.len()
+        || previous
+            .blocks
+            .iter()
+            .any(|block| !is_incremental_block_safe(block))
+    {
+        return None;
+    }
+    let block_index = ranges
         .iter()
-        .map(|item| SpannedEvent {
-            event: item.event.clone(),
-            range: shift(item.range.start)..shift(item.range.end),
-        })
-        .collect();
+        .position(|range| prefix >= range.start && old_end <= range.end)?;
+    if ranges
+        .iter()
+        .enumerate()
+        .any(|(index, range)| index != block_index && prefix >= range.start && old_end <= range.end)
+    {
+        return None;
+    }
+    let old_range = &ranges[block_index];
+    let new_block_end = old_range.end.checked_add_signed(delta)?;
+    if new_block_end < old_range.start || new_block_end > markdown.len() {
+        return None;
+    }
+    let reparsed = parse_document(&markdown[old_range.start..new_block_end]);
+    if reparsed.normalized.is_some()
+        || reparsed.blocks.len() != 1
+        || !is_incremental_block_safe(&reparsed.blocks[0])
+        || reparsed
+            .events
+            .iter()
+            .any(|item| item.range.end > new_block_end - old_range.start)
+    {
+        return None;
+    }
+
+    let mut blocks = previous.blocks.clone();
+    blocks[block_index] = reparsed.blocks[0].clone();
+    let mut events = Vec::with_capacity(previous.events.len() + reparsed.events.len());
+    events.extend(
+        previous
+            .events
+            .iter()
+            .filter(|item| item.range.end <= old_range.start)
+            .cloned(),
+    );
+    events.extend(reparsed.events.into_iter().map(|item| SpannedEvent {
+        event: item.event,
+        range: (old_range.start + item.range.start)..(old_range.start + item.range.end),
+    }));
+    events.extend(
+        previous
+            .events
+            .iter()
+            .filter(|item| item.range.start >= old_range.end)
+            .map(|item| SpannedEvent {
+                event: item.event.clone(),
+                range: item.range.start.saturating_add_signed(delta)
+                    ..item.range.end.saturating_add_signed(delta),
+            }),
+    );
     Some(ParsedDocument {
         source: markdown.to_string(),
         normalized: None,
-        blocks: previous.blocks.clone(),
+        blocks,
         events,
     })
+}
+
+fn top_level_block_ranges(document: &ParsedDocument) -> Option<Vec<Range<usize>>> {
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut ranges = Vec::new();
+    for item in &document.events {
+        match &item.event {
+            Event::Start(tag) if is_block_tag(tag) => {
+                if depth == 0 {
+                    start = Some(item.range.start);
+                }
+                depth += 1;
+            }
+            Event::End(tag_end) if is_block_tag_end(*tag_end) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    ranges.push(start.take()?..item.range.end);
+                }
+            }
+            Event::Rule if depth == 0 => ranges.push(item.range.clone()),
+            _ => {}
+        }
+    }
+    (depth == 0 && start.is_none()).then_some(ranges)
+}
+
+fn is_incremental_block_safe(block: &Block) -> bool {
+    matches!(
+        block,
+        Block::Heading { .. } | Block::Paragraph(_) | Block::Code { .. } | Block::Rule
+    )
+}
+
+fn is_block_tag(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::HtmlBlock
+            | Tag::List(_)
+            | Tag::FootnoteDefinition(_)
+            | Tag::DefinitionList
+            | Tag::Table(_)
+            | Tag::MetadataBlock(_)
+    )
+}
+
+fn is_block_tag_end(tag_end: TagEnd) -> bool {
+    matches!(
+        tag_end,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::HtmlBlock
+            | TagEnd::List(_)
+            | TagEnd::FootnoteDefinition
+            | TagEnd::DefinitionList
+            | TagEnd::Table
+            | TagEnd::MetadataBlock(_)
+    )
 }
 
 fn safe_line_edit(source: &[u8], start: usize, end: usize) -> bool {
@@ -868,7 +1003,29 @@ mod tests {
     #[test]
     fn incremental_parse_falls_back_when_text_content_changes() {
         let previous = parse_document("# 标题\n\n正文\n");
-        assert!(parse_document_incremental(&previous, "# 标题\n\n修改后的正文\n").is_none());
+        let next = parse_document_incremental(&previous, "# 标题\n\n修改后的正文\n");
+        assert!(
+            next.is_some(),
+            "a single paragraph should use block-level parsing"
+        );
+        assert_eq!(next.unwrap().source(), "# 标题\n\n修改后的正文\n");
+    }
+
+    #[test]
+    fn incremental_parse_reparses_only_the_edited_top_level_block() {
+        let previous = parse_document("# 一\n\n甲\n\n# 二\n\n乙\n");
+        let next = parse_document_incremental(&previous, "# 一\n\n修改后的甲\n\n# 二\n\n乙\n")
+            .expect("single paragraph edit should be incremental");
+        let full = parse_document("# 一\n\n修改后的甲\n\n# 二\n\n乙\n");
+
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
+    fn incremental_parse_falls_back_for_cross_block_list_semantics() {
+        let previous = parse_document("- 一\n- 二\n");
+        assert!(parse_document_incremental(&previous, "- 一\n- 修改后的二\n").is_none());
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
