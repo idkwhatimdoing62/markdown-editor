@@ -16,7 +16,9 @@ mod web_preview;
 mod window_close;
 mod window_session;
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -277,10 +279,11 @@ struct BenchmarkProbe {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BrowserDocumentKey {
     tab_id: u64,
     document_revision: u64,
+    document_source_hash: u64,
     theme_revision: u64,
     body_font_size_bits: u32,
     base_directory: Option<PathBuf>,
@@ -294,6 +297,13 @@ impl BrowserDocumentKey {
             && self.body_font_size_bits == other.body_font_size_bits
             && self.base_directory == other.base_directory
     }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn source_hash(source: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1106,6 +1116,10 @@ impl MdEditorApp {
             }
             tab.document = result.document;
             tab.parse_pending = false;
+            if index == self.active_tab {
+                self.browser_document_cache = None;
+                self.render_pending = None;
+            }
             active_document_changed |= index == self.active_tab;
         }
         if active_document_changed {
@@ -1402,6 +1416,7 @@ impl MdEditorApp {
         BrowserDocumentKey {
             tab_id: self.tabs.get(self.active_tab).map_or(0, |tab| tab.id),
             document_revision: self.document_revision,
+            document_source_hash: source_hash(&self.text),
             theme_revision: self.theme_revision,
             body_font_size_bits: self.body_font_size.to_bits(),
             base_directory,
@@ -1501,11 +1516,14 @@ impl MdEditorApp {
             return Arc::clone(&cache.document);
         }
 
+        let document_ready = self.text == self.document.source();
         if let Some(cache) = &self.browser_document_cache
             && cache.key.same_render_context(&key)
         {
             let document = Arc::clone(&cache.document);
-            self.queue_browser_render(key);
+            if document_ready {
+                self.queue_browser_render(key);
+            }
             return document;
         }
 
@@ -2161,6 +2179,8 @@ impl MdEditorApp {
                     self.document = markdown::parse_document(&self.text);
                     self.document_revision = self.document_revision.wrapping_add(1);
                     self.parse_pending = false;
+                    self.browser_document_cache = None;
+                    self.render_pending = None;
                     self.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
                     if let Err(error) = self.persist_draft_session() {
@@ -4012,6 +4032,19 @@ mod app_tests {
         let second = app.browser_document(true);
 
         assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn browser_key_tracks_source_while_parse_is_pending() {
+        let mut app = app_with_two_tabs();
+        let initial = app.current_browser_document_key();
+        app.text.push_str("\n追加内容");
+        app.document_revision = app.document_revision.wrapping_add(1);
+        let pending = app.current_browser_document_key();
+
+        assert_ne!(initial.document_source_hash, pending.document_source_hash);
+        assert_ne!(initial, pending);
     }
 
     #[test]
