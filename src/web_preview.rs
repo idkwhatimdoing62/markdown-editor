@@ -51,6 +51,8 @@ pub struct PreviewDocument {
 
 const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
 const VIRTUALIZE_AT_IMAGES: usize = 8;
+const VIRTUAL_CHUNK_TARGET_BYTES: usize = 96 * 1024;
+const VIRTUAL_CHUNK_TARGET_IMAGES: usize = 4;
 const ESTIMATED_IMAGE_HEIGHT: f32 = 480.0;
 
 #[derive(Debug, Clone)]
@@ -399,11 +401,17 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     suppressUntil = performance.now() + 500;
     const match = /^md-source:([0-9.]+)$/.exec(window.name || '');
     const saved = match ? Number(match[1]) : 0;
-    const savedViewportAnchor = captureViewportAnchor();
+    const savedVirtualViewportAnchor = window.__mdVirtualPreview?.captureViewportAnchor?.() || null;
+    const savedViewportAnchor = savedVirtualViewportAnchor ? null : captureViewportAnchor();
     let blockPatched = false;
+    let virtualPatched = false;
     try {
       if (window.__mdVirtualPreview) {
-        await window.__mdVirtualPreview.patch(revision, saved);
+        virtualPatched = await window.__mdVirtualPreview.patch(
+          revision,
+          saved,
+          savedVirtualViewportAnchor,
+        );
       } else {
         if (patchRevision !== navigationRevision) return;
         const blockQuery = patch
@@ -450,7 +458,8 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
       await document.fonts.ready;
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       if (patchRevision !== navigationRevision) return;
-      const restoredViewportAnchor = blockPatched && restoreViewportAnchor(savedViewportAnchor, patch);
+      const restoredViewportAnchor = virtualPatched
+        || (blockPatched && restoreViewportAnchor(savedViewportAnchor, patch));
       window.name = `md-source:${saved}`;
       window.ipc.postMessage(`md-source:program:${saved}`);
       const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
@@ -564,6 +573,26 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     if (!chunk) return 0;
     const ratio = Math.min(1, Math.max(0, (y - chunkTop(chunk)) / Math.max(1, chunk.height)));
     return chunk.sourceStart + ratio * (chunk.sourceEnd - chunk.sourceStart);
+  };
+
+  const captureVirtualViewportAnchor = () => {
+    const chunk = findByY(window.scrollY);
+    if (!chunk) return null;
+    return {
+      blockId: chunk.blockId,
+      offset: window.scrollY - chunkTop(chunk),
+      source: sourceForY(window.scrollY),
+    };
+  };
+
+  const restoreVirtualViewportAnchor = async (saved) => {
+    if (!saved) return false;
+    const chunk = chunks.find((candidate) => String(candidate.blockId) === String(saved.blockId));
+    if (!chunk) return false;
+    await load(chunk);
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    window.scrollTo(0, Math.max(0, chunkTop(chunk) + Number(saved.offset || 0)));
+    return true;
   };
 
   const scrollHeading = async (index) => {
@@ -686,13 +715,13 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
   manifestNode.remove();
   if (scriptNode) scriptNode.remove();
 
-  const patch = async (nextRevision, savedSource) => {
+  const patch = async (nextRevision, savedSource, savedAnchor = null) => {
     const requestRevision = ++updateRevision;
     const manifestUrl = new URL(`/manifest?revision=${encodeURIComponent(nextRevision)}`, location.origin);
     const response = await fetch(manifestUrl, { cache: 'no-store' });
     if (!response.ok) throw new Error(`preview manifest request failed: ${response.status}`);
     const nextChunks = await response.json();
-    if (requestRevision !== updateRevision) return;
+    if (requestRevision !== updateRevision) return false;
     revision = String(nextRevision || '');
     const sameLayout = nextChunks.length === chunks.length
       && nextChunks.every((next, index) => next.index === chunks[index].index);
@@ -723,11 +752,15 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
       }
       chunks = updated;
     }
-    const target = findBySource(savedSource);
-    if (target) await load(target);
-    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    window.scrollTo(0, yForSource(savedSource));
+    const restored = await restoreVirtualViewportAnchor(savedAnchor);
+    if (!restored) {
+      const target = findBySource(savedSource);
+      if (target) await load(target);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      window.scrollTo(0, yForSource(savedSource));
+    }
     schedule();
+    return restored;
   };
 
   window.__mdVirtualPreview = {
@@ -735,6 +768,8 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     sourceForY,
     scrollHeading,
     loadSource: (source) => load(findBySource(source)),
+    captureViewportAnchor: captureVirtualViewportAnchor,
+    restoreViewportAnchor: restoreVirtualViewportAnchor,
     patch,
   };
   window.addEventListener('scroll', schedule, { passive: true });
@@ -1373,6 +1408,38 @@ pub fn preview_document(
     preview
 }
 
+/// Lightweight document used while the first background render is running.
+/// Keeping the shell themed avoids blocking the UI thread on a long parse or
+/// HTML generation pass; the worker result replaces this document shortly
+/// afterwards.
+pub fn preview_document_placeholder(
+    css: &str,
+    font_size_override: Option<f32>,
+    dark_mode_css: Option<&str>,
+) -> PreviewDocument {
+    let font_override = font_size_override
+        .map(|size| crate::theme::font_size_override_css(css, size))
+        .unwrap_or_default();
+    let editor_font = editor_font_css();
+    let dark_mode_css = dark_mode_css.unwrap_or_default();
+    let shell = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{dark_mode_css}</style></head><body><div class=\"md-render-pending\">正在渲染…</div></body></html>"
+    );
+    let hash = hash(&shell);
+    PreviewDocument {
+        shell: shell.into(),
+        body_range: None,
+        virtual_manifest: None,
+        blocks: Arc::from([]),
+        chunks: Arc::from([]),
+        hash,
+        chrome_hash: hash,
+        has_mermaid: false,
+        total_bytes: 0,
+        block_fingerprint: 0,
+    }
+}
+
 pub fn preview_document_with_previous(
     previous: Option<&PreviewDocument>,
     document: &crate::markdown::ParsedDocument,
@@ -1549,6 +1616,9 @@ pub fn preview_document_virtual_incremental(
         let values = anchors.get(marker_cursor..chunk_end)?;
         let replaced = replace_source_markers_with_values(&html, values)?;
         html = replaced;
+        if !virtual_chunk_boundary_stable(&old_chunk.html, &html) {
+            return None;
+        }
         let source_start = values.first().copied()?;
         let source_end = anchors
             .get(chunk_end)
@@ -1584,6 +1654,7 @@ pub fn preview_document_virtual_incremental(
     let mut hash_input = shell.clone();
     for chunk in &chunks {
         hash_input.push_str(&chunk.block_id.to_string());
+        hash_input.push_str(&chunk.content_hash.to_string());
     }
     let previous_body_bytes = previous_preview
         .chunks
@@ -1790,9 +1861,38 @@ fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
     format!("[{manifest}]")
 }
 
+/// Return false when a changed chunk can move the first marker that crosses a
+/// virtual chunk threshold.  Keeping the old grouping in that case would make
+/// the manifest's source ranges disagree with a full render, so the caller
+/// falls back to rebuilding the virtual document.
+fn virtual_chunk_boundary_stable(old_html: &str, new_html: &str) -> bool {
+    let old_markers = source_marker_ranges(old_html);
+    let new_markers = source_marker_ranges(new_html);
+    if old_markers.len() != new_markers.len() {
+        return false;
+    }
+    let image_count_before = |html: &str, position: usize| {
+        image_tag_positions(html).partition_point(|image_position| *image_position < position)
+    };
+    for index in 1..old_markers.len() {
+        let old_marker = &old_markers[index];
+        let new_marker = &new_markers[index];
+        let old_bytes = old_marker.start;
+        let new_bytes = new_marker.start;
+        let old_images = image_count_before(old_html, old_bytes);
+        let new_images = image_count_before(new_html, new_bytes);
+        let old_crosses =
+            old_bytes >= VIRTUAL_CHUNK_TARGET_BYTES || old_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
+        let new_crosses =
+            new_bytes >= VIRTUAL_CHUNK_TARGET_BYTES || new_images >= VIRTUAL_CHUNK_TARGET_IMAGES;
+        if new_crosses != old_crosses {
+            return false;
+        }
+    }
+    true
+}
+
 fn virtualize_document(html: String) -> PreviewDocument {
-    const TARGET_CHUNK_BYTES: usize = 96 * 1024;
-    const TARGET_CHUNK_IMAGES: usize = 4;
     let document_hash = hash(&html);
     let total_bytes = html.len();
     let Some(body_start_tag) = html.find("<body>") else {
@@ -1856,8 +1956,8 @@ fn virtualize_document(html: String) -> PreviewDocument {
         {
             image_cursor += 1;
         }
-        if position.saturating_sub(chunk_start) >= TARGET_CHUNK_BYTES
-            || image_cursor.saturating_sub(chunk_image_start) >= TARGET_CHUNK_IMAGES
+        if position.saturating_sub(chunk_start) >= VIRTUAL_CHUNK_TARGET_BYTES
+            || image_cursor.saturating_sub(chunk_image_start) >= VIRTUAL_CHUNK_TARGET_IMAGES
         {
             boundaries.push(position);
             chunk_start = position;
@@ -2946,6 +3046,20 @@ mod tests {
     }
 
     #[test]
+    fn virtual_chunk_boundary_drift_forces_full_rebuild() {
+        let old = format!(
+            "<!--md-source:0-->{}<!--md-source:1-->tail",
+            "a".repeat(95 * 1024)
+        );
+        let new = format!(
+            "<!--md-source:0-->{}<!--md-source:1-->tail",
+            "a".repeat(100 * 1024)
+        );
+
+        assert!(!super::virtual_chunk_boundary_stable(&old, &new));
+    }
+
+    #[test]
     fn incremental_preview_falls_back_when_block_kind_changes() {
         let first_document = crate::markdown::parse_document("正文\n");
         let next_document = crate::markdown::parse_document("# 标题\n");
@@ -3052,6 +3166,10 @@ mod tests {
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("const patch = async"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("refreshChunkAnchors"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("blockId"));
+        assert!(
+            VIRTUAL_PREVIEW_SCRIPT.contains("captureViewportAnchor: captureVirtualViewportAnchor")
+        );
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("restoreVirtualViewportAnchor"));
     }
 
     #[test]

@@ -1510,19 +1510,17 @@ impl MdEditorApp {
         }
 
         let request = self.make_render_request(key.clone(), None, None);
-        let document = Arc::new(web_preview::preview_document(
-            &request.document,
+        let document = Arc::new(web_preview::preview_document_placeholder(
             &request.css,
-            request.base_directory.as_deref(),
             request.font_size_override,
             request.dark_mode_css.as_deref(),
         ));
+        self.queue_browser_render(key.clone());
         self.browser_document_cache = Some(BrowserDocumentCache {
             key,
             document: Arc::clone(&document),
-            parsed_document: Arc::new(request.document),
+            parsed_document: Arc::new(self.document.clone()),
         });
-        self.render_pending = None;
         document
     }
 
