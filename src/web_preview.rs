@@ -143,7 +143,7 @@ impl PreviewDocument {
         let mut positions_by_hash = HashMap::<u64, VecDeque<usize>>::new();
         for (index, block) in next.blocks.iter().enumerate() {
             positions_by_hash
-                .entry(block.block_id)
+                .entry(block.content_hash)
                 .or_default()
                 .push_back(index);
         }
@@ -152,7 +152,7 @@ impl PreviewDocument {
             .iter()
             .map(|block| {
                 positions_by_hash
-                    .get_mut(&block.block_id)
+                    .get_mut(&block.content_hash)
                     .and_then(VecDeque::pop_front)
             })
             .collect::<Vec<_>>();
