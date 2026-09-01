@@ -80,6 +80,24 @@ impl PreviewDocument {
     fn can_patch_into(&self, next: &Self) -> bool {
         self.can_patch_body_into(next) || self.can_patch_virtual_into(next)
     }
+
+    fn changed_block_indices(&self, next: &Self) -> Option<Vec<usize>> {
+        if !self.can_patch_body_into(next) {
+            return None;
+        }
+        Some(
+            self.blocks
+                .iter()
+                .zip(next.blocks.iter())
+                .enumerate()
+                .filter_map(|(index, (current, next))| {
+                    (preview_block_content(current.html.as_ref())
+                        != preview_block_content(next.html.as_ref()))
+                    .then_some(index)
+                })
+                .collect(),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -288,7 +306,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     }
   };
 
-  window.__mdEditorPatchBody = async (revision) => {
+  window.__mdEditorPatchBody = async (revision, changedIndices = null) => {
     const patchRevision = ++navigationRevision;
     cancelSourceAnimation();
     suppressUntil = performance.now() + 500;
@@ -306,7 +324,10 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
           const blocks = await blocksResponse.json();
           const current = anchors();
           if (current.length === blocks.length + 1) {
-            for (let index = blocks.length - 1; index >= 0; index -= 1) {
+            const indices = Array.isArray(changedIndices)
+              ? changedIndices.filter((index) => Number.isInteger(index) && index >= 0 && index < blocks.length)
+              : blocks.map((_, index) => index);
+            for (const index of indices.sort((a, b) => b - a)) {
               const start = current[index]?.node;
               const end = current[index + 1]?.node;
               if (!start || !end) throw new Error('preview block anchors missing');
@@ -722,11 +743,14 @@ impl BrowserPreview {
             return Ok(());
         }
 
+        let changed_block_indices = self
+            .document_source
+            .as_ref()
+            .and_then(|current| current.changed_block_indices(document));
         let patch_document = source_changed
-            && self
-                .document_source
-                .as_ref()
-                .is_some_and(|current| current.can_patch_into(document));
+            && self.document_source.as_ref().is_some_and(|current| {
+                current.can_patch_into(document) || current.can_patch_virtual_into(document)
+            });
         if source_changed {
             if !patch_document {
                 self.reset_scroll_bridge_for_document();
@@ -743,9 +767,11 @@ impl BrowserPreview {
         }
         if source_changed {
             if patch_document {
+                let changed_blocks_json = serde_json::to_string(&changed_block_indices)
+                    .unwrap_or_else(|_| "null".to_string());
                 webview
                     .evaluate_script(&format!(
-                        "window.__mdEditorPatchBody?.('{document_hash:016x}');"
+                        "window.__mdEditorPatchBody?.('{document_hash:016x}', {changed_blocks_json});"
                     ))
                     .map_err(|error| format!("无法更新浏览器预览内容：{error}"))?;
             } else {
@@ -1359,6 +1385,12 @@ fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
             })
         })
         .collect()
+}
+
+fn preview_block_content(html: &str) -> &str {
+    html.strip_prefix("<!--md-source:")
+        .and_then(|rest| rest.split_once("-->").map(|(_, content)| content))
+        .unwrap_or(html)
 }
 
 fn image_tag_positions(html: &str) -> Vec<usize> {
@@ -2144,6 +2176,7 @@ mod tests {
         assert!(second.body_range.is_some());
         assert!(first.can_patch_body_into(&second));
         assert!(first.can_patch_into(&second));
+        assert_eq!(first.changed_block_indices(&second), Some(vec![1]));
         assert!(SCROLL_SYNC_SCRIPT.contains("window.__mdEditorPatchBody"));
         assert!(SCROLL_SYNC_SCRIPT.contains("/blocks?revision="));
         assert!(SCROLL_SYNC_SCRIPT.contains("captureViewportAnchor"));
