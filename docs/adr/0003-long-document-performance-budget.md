@@ -73,6 +73,8 @@ Mermaid 预览使用 `scripts/benchmark-mermaid-preview.ps1` 单独记录首屏�
 
 WebView 字体协议会记录四种字重的请求次数和总字节。100 KiB 中文语料使用原始 TTF 时，首屏会请求 JetBrains Mono Regular/Bold 与霞鹜文楷 Lite Regular/Medium 共 26.82 MiB；三次运行的中位就绪时间约 665 ms、峰值工作集约 669 MiB、峰值私有内存约 805 MiB。完整字形转换为 WOFF 后，请求降为 15.91 MiB，中位就绪约 596 ms、峰值工作集约 646 MiB、峰值私有内存约 782 MiB；发布二进制同时由约 90.8 MB 降为 79.4 MB。WOFF2 虽把请求进一步降至 10.58 MiB，但中位就绪回退到约 776 ms，因此未保留。`scripts/build-web-fonts.ps1` 从原始 TTF 可重复生成 WOFF；编辑区字体和 HTML/PDF 导出继续使用原始 TTF，不改变字形或字重。
 
+使用 `scripts/benchmark-native-memory.ps1` 测试过 Windows/macOS 原生界面是否可以不常驻中文 Medium 字体。三次空窗口稳态工作集约 153.8 MiB、私有内存约 478.4 MiB，移除前后均在同一范围内，判定为无收益并回退；原生预览的粗体回退因此保持原样。
+
 本次优化把代码语言标注从反复插入原字符串改为一次线性重建，避免长文档 HTML 生成的平方级复制；同时修复了基准二进制缺少 `theme` 和 `storage` 模块、导致脚本无法启动的问题。`-EnforceBudgets` 已成功完成三档检查。
 
 基准建立和 P1 优化过程中修复了四项真实问题：
