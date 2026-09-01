@@ -47,6 +47,9 @@ pub struct PreviewDocument {
     block_fingerprint: u64,
 }
 
+const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
+const VIRTUALIZE_AT_IMAGES: usize = 8;
+
 #[derive(Debug, Clone)]
 struct PreviewChunk {
     html: Arc<str>,
@@ -1456,6 +1459,9 @@ pub fn preview_document_incremental(
     html.push_str(&body);
     html.push_str(&previous_preview.shell[body_range.1..]);
     let html = replace_source_markers(&html, &anchors);
+    if requires_virtualization(&html) {
+        return None;
+    }
     let mut preview = virtualize_document(html);
     preview.block_fingerprint = block_fingerprint(document);
     Some(preview)
@@ -1534,8 +1540,6 @@ fn render_incremental_block(
 }
 
 fn virtualize_document(html: String) -> PreviewDocument {
-    const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
-    const VIRTUALIZE_AT_IMAGES: usize = 8;
     const TARGET_CHUNK_BYTES: usize = 96 * 1024;
     const TARGET_CHUNK_IMAGES: usize = 4;
     const ESTIMATED_IMAGE_HEIGHT: f32 = 480.0;
@@ -1678,6 +1682,20 @@ fn virtualize_document(html: String) -> PreviewDocument {
         total_bytes,
         block_fingerprint: 0,
     }
+}
+
+fn requires_virtualization(html: &str) -> bool {
+    if html.len() >= VIRTUALIZE_AT_BYTES {
+        return true;
+    }
+    let Some(body_start_tag) = html.find("<body>") else {
+        return false;
+    };
+    let body_start = body_start_tag + "<body>".len();
+    let Some(body_end) = html.rfind("</body>") else {
+        return false;
+    };
+    image_tag_positions(&html[body_start..body_end]).len() > VIRTUALIZE_AT_IMAGES
 }
 
 fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
@@ -2686,6 +2704,26 @@ mod tests {
         let next_document = crate::markdown::parse_document("# 标题\n");
         let first_preview = super::preview_document(&first_document, "", None, None, None);
 
+        assert!(
+            super::preview_document_incremental(
+                Some(&first_preview),
+                Some(&first_document),
+                &next_document,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn incremental_preview_falls_back_when_edit_crosses_virtualization_threshold() {
+        let first_source = format!("{}\n", "a".repeat(500 * 1024));
+        let next_source = format!("{}{}\n", "a".repeat(500 * 1024), "b".repeat(32 * 1024));
+        let first_document = crate::markdown::parse_document(&first_source);
+        let next_document = crate::markdown::parse_document(&next_source);
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        assert!(first_preview.virtual_manifest.is_none());
         assert!(
             super::preview_document_incremental(
                 Some(&first_preview),
