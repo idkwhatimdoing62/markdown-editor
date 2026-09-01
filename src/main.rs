@@ -1465,20 +1465,36 @@ impl MdEditorApp {
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn queue_browser_render(&mut self, key: BrowserDocumentKey) {
-        if self.render_pending.as_ref() == Some(&key) {
-            return;
-        }
-        let (previous, previous_parsed) = self
-            .browser_document_cache
+    fn previous_browser_render_documents(
+        &self,
+        key: &BrowserDocumentKey,
+    ) -> (
+        Option<Arc<web_preview::PreviewDocument>>,
+        Option<Arc<ParsedDocument>>,
+    ) {
+        self.browser_document_cache
             .as_ref()
+            // Incremental preview functions deliberately reuse the previous HTML shell.
+            // That shell contains the theme CSS, so it is only safe when the render
+            // context is unchanged.  In particular, a light/dark toggle increments
+            // `theme_revision`; carrying the old document across that boundary would
+            // silently put the previous appearance back into the WebView.
+            .filter(|cache| cache.key.same_render_context(key))
             .map(|cache| {
                 (
                     Some(Arc::clone(&cache.document)),
                     Some(Arc::clone(&cache.parsed_document)),
                 )
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None))
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn queue_browser_render(&mut self, key: BrowserDocumentKey) {
+        if self.render_pending.as_ref() == Some(&key) {
+            return;
+        }
+        let (previous, previous_parsed) = self.previous_browser_render_documents(&key);
         self.render_worker
             .submit(self.make_render_request(key.clone(), previous, previous_parsed));
         self.render_pending = Some(key);
@@ -4078,6 +4094,20 @@ mod app_tests {
 
         assert_ne!(initial.body_font_size_bits, changed.body_font_size_bits);
         assert!(initial.same_render_context(&changed));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn appearance_change_does_not_reuse_previous_themed_shell() {
+        let mut app = app_with_two_tabs();
+        let _ = app.browser_document(false);
+        let mut changed = app.current_browser_document_key();
+        changed.theme_revision = changed.theme_revision.wrapping_add(1);
+
+        let (previous, previous_parsed) = app.previous_browser_render_documents(&changed);
+
+        assert!(previous.is_none());
+        assert!(previous_parsed.is_none());
     }
 
     #[test]
