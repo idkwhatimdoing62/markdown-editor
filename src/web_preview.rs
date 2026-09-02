@@ -2366,6 +2366,12 @@ fn render_incremental_block_content(
     block_id: u64,
     base_directory: Option<&Path>,
 ) -> Option<String> {
+    // Raw HTML also carries footnote definitions and other structures that
+    // require document-level normalization. Rendering them in isolation can
+    // diverge from the full document output, so keep this boundary conservative.
+    if matches!(document.blocks()[index], crate::markdown::Block::Raw(_)) {
+        return None;
+    }
     if slice.source_start > slice.source_end
         || slice.source_end > document.normalized_source().len()
     {
@@ -2928,16 +2934,10 @@ fn hash_source_markerless(html: &str) -> u64 {
 
     let mut stable = String::with_capacity(markerless.len());
     let mut cursor = 0;
-    while let Some(relative) = markerless[cursor..].find("id=\"md-heading-") {
-        let start = cursor + relative;
+    for (start, end) in heading_id_ranges(&markerless) {
         stable.push_str(&markerless[cursor..start]);
         stable.push_str("id=\"md-heading\"");
-        let digits_start = start + "id=\"md-heading-".len();
-        let Some(end_relative) = markerless[digits_start..].find('"') else {
-            cursor = start;
-            break;
-        };
-        cursor = digits_start + end_relative + 1;
+        cursor = end;
     }
     stable.push_str(&markerless[cursor..]);
     hash(&stable)
@@ -2952,16 +2952,14 @@ fn block_anchor(id: u64) -> String {
 }
 
 fn heading_bounds(html: &str) -> Option<(usize, usize)> {
-    let mut search_from = 0usize;
+    let marker = "id=\"md-heading-";
     let mut first = None;
     let mut last = None;
-    while let Some(relative) = html[search_from..].find("id=\"md-heading-") {
-        let start = search_from + relative + "id=\"md-heading-".len();
-        let end = start + html[start..].find('"')?;
-        let index = html[start..end].parse::<usize>().ok()?;
+    for (start, end) in heading_id_ranges(html) {
+        let digits_start = start + marker.len();
+        let index = html[digits_start..end - 1].parse::<usize>().ok()?;
         first.get_or_insert(index);
         last = Some(index + 1);
-        search_from = end + 1;
     }
     first.zip(last)
 }
@@ -2970,31 +2968,55 @@ fn rewrite_heading_ids(html: &str, mut heading_index: usize) -> String {
     let marker = "id=\"md-heading-";
     let mut output = String::with_capacity(html.len());
     let mut cursor = 0usize;
-    while let Some(relative) = html[cursor..].find(marker) {
-        let start = cursor + relative;
-        let digits_start = start + marker.len();
-        let Some(digits_end) = html[digits_start..]
-            .find('"')
-            .map(|offset| digits_start + offset)
-        else {
-            break;
-        };
-        if html[digits_start..digits_end]
-            .chars()
-            .any(|character| !character.is_ascii_digit())
-        {
-            cursor = digits_end + 1;
-            continue;
-        }
+    for (start, end) in heading_id_ranges(html) {
         output.push_str(&html[cursor..start]);
         output.push_str(marker);
         output.push_str(&heading_index.to_string());
         output.push('"');
         heading_index += 1;
-        cursor = digits_end + 1;
+        cursor = end;
     }
     output.push_str(&html[cursor..]);
     output
+}
+
+/// Find generated heading IDs without touching arbitrary IDs in raw HTML.
+fn heading_id_ranges(html: &str) -> Vec<(usize, usize)> {
+    const MARKER: &str = "id=\"md-heading-";
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = html[cursor..].find("<h") {
+        let tag_start = cursor + relative;
+        let bytes = html.as_bytes();
+        if tag_start + 2 >= bytes.len() || !matches!(bytes[tag_start + 2], b'1'..=b'6') {
+            cursor = tag_start + 2;
+            continue;
+        }
+        let Some(tag_end_relative) = html[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_relative;
+        let tag = &html[tag_start..=tag_end];
+        let Some(marker_relative) = tag.find(MARKER) else {
+            cursor = tag_end + 1;
+            continue;
+        };
+        let start = tag_start + marker_relative;
+        let digits_start = start + MARKER.len();
+        let Some(quote_relative) = html[digits_start..=tag_end].find('"') else {
+            cursor = tag_end + 1;
+            continue;
+        };
+        let end = digits_start + quote_relative + 1;
+        if html[digits_start..end - 1]
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        {
+            ranges.push((start, end));
+        }
+        cursor = tag_end + 1;
+    }
+    ranges
 }
 
 fn source_anchor(source_line: f32) -> String {
@@ -3985,23 +4007,59 @@ mod tests {
     }
 
     #[test]
-    fn incremental_preview_supports_raw_html_block_conversion() {
+    fn incremental_preview_falls_back_for_raw_html_block_conversion() {
         let first_document = crate::markdown::parse_document("<div>旧内容</div>\n\n后文\n");
         let next_document =
             crate::markdown::parse_document("<div><span>新内容</span></div>\n\n后文\n");
         let first_preview = super::preview_document(&first_document, "", None, None, None);
 
+        assert!(
+            super::preview_document_incremental(
+                Some(&first_preview),
+                Some(&first_document),
+                &next_document,
+                None,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn incremental_preview_preserves_raw_html_ids_when_reusing_unchanged_block() {
+        let first_document = crate::markdown::parse_document(
+            "<div id=\"md-heading-99\">内容</div>\n\n# 标题\n\n旧段落\n",
+        );
+        let next_document = crate::markdown::parse_document(
+            "<div id=\"md-heading-99\">内容</div>\n\n# 标题\n\n新段落\n",
+        );
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
         let incremental = super::preview_document_incremental(
             Some(&first_preview),
             Some(&first_document),
             &next_document,
             None,
         )
-        .expect("raw HTML block edits should patch the changed block locally");
+        .expect("unrelated raw HTML should be safely reused");
         let full = super::preview_document(&next_document, "", None, None, None);
 
         assert_eq!(incremental.shell, full.shell);
-        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_falls_back_for_footnote_definition_edits() {
+        let first_document = crate::markdown::parse_document("正文[^1]\n\n[^1]: 旧脚注\n\n后文\n");
+        let next_document = crate::markdown::parse_document("正文[^1]\n\n[^1]: 新脚注\n\n后文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        assert!(
+            super::preview_document_incremental(
+                Some(&first_preview),
+                Some(&first_document),
+                &next_document,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]
