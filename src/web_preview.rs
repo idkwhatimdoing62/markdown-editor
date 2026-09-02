@@ -285,7 +285,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     return sibling;
   };
 
-  const replaceBlock = (id, html, sourceStart) => {
+  const replaceBlock = (id, html, sourceStart, sourceEnd) => {
     const marker = blockMarkers().get(String(id));
     const element = elementAfter(marker);
     if (!marker || !element) return false;
@@ -300,6 +300,9 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     if (source && /^md-source:[0-9.]+$/.test(source.nodeValue || '') && Number.isFinite(Number(sourceStart))) {
       source.nodeValue = `md-source:${sourceStart}`;
     }
+    // Keep the full source range in the public contract even though the end
+    // marker is refreshed from the complete anchor list below.
+    void sourceEnd;
     anchorCache = null;
     return true;
   };
@@ -591,7 +594,12 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
             const payload = await response.json();
             const blocks = Array.isArray(payload) ? payload : payload.blocks;
             idPatched = Array.isArray(blocks) && blocks.length === patch.blockIds.length
-              && blocks.every((block) => replaceBlock(block.id, block.html, block.sourceStart));
+              && blocks.every((block) => replaceBlock(
+                block.id,
+                block.html,
+                block.sourceStart,
+                block.sourceEnd,
+              ));
             if (idPatched) {
               const sourceAnchors = Array.isArray(payload) ? null : payload.sourceAnchors;
               if (sourceAnchors) {
@@ -3877,6 +3885,9 @@ mod tests {
         assert!(SCROLL_SYNC_SCRIPT.contains("cancelAnimationFrame"));
         assert!(SCROLL_SYNC_SCRIPT.contains("requestAnimationFrame(report)"));
         assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorReplaceBlock"));
+        assert!(
+            SCROLL_SYNC_SCRIPT.contains("const replaceBlock = (id, html, sourceStart, sourceEnd)")
+        );
         assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorSetBlockAnchor"));
         let ready = parse_ready_message("md-ready:8400.5:720:1234").unwrap();
         assert_eq!(ready.content_height, 8400.5);

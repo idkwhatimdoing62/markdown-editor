@@ -407,11 +407,15 @@ fn reconcile_block_ids(previous: &ParsedDocument, next: &mut ParsedDocument) {
         old_used[old_index] = true;
         new_used[new_index] = true;
         next.block_index[new_index].id = previous.block_index[old_index].id;
-        next.block_index[new_index].rendered_height = previous.block_index[old_index].rendered_height;
+        next.block_index[new_index].rendered_height =
+            previous.block_index[old_index].rendered_height;
     }
 }
 
-pub fn parse_document_with_previous(previous: Option<&ParsedDocument>, markdown: &str) -> ParsedDocument {
+pub fn parse_document_with_previous(
+    previous: Option<&ParsedDocument>,
+    markdown: &str,
+) -> ParsedDocument {
     let mut next = parse_document(markdown);
     if let Some(previous) = previous {
         reconcile_block_ids(previous, &mut next);
@@ -460,42 +464,46 @@ pub fn parse_document_incremental(
             return None;
         }
         let ranges = top_level_block_ranges(previous)?;
-        if ranges.len() != previous.blocks.len()
+        let structural_line_edit = ranges.len() != previous.blocks.len()
             || ranges.iter().zip(&previous.blocks).any(|(range, block)| {
                 let edit_inside_block = (range.start < prefix && prefix < range.end)
                     || (range.start < old_end && old_end < range.end);
                 edit_inside_block && !is_line_edit_block_safe(block)
-            })
-        {
-            return None;
+            });
+        if structural_line_edit {
+            // A newline inside a list, quote, table, or fenced code block can
+            // change the parent block's children. Let the parent-aware path
+            // below reparse that complete boundary instead of shifting stale
+            // events in place.
+        } else {
+            let shift = |offset: usize| {
+                if offset <= prefix {
+                    offset
+                } else if offset >= old_end {
+                    offset.saturating_add_signed(delta)
+                } else {
+                    prefix + new_mid_len
+                }
+            };
+            let events: Vec<SpannedEvent> = previous
+                .events
+                .iter()
+                .map(|item| SpannedEvent {
+                    event: item.event.clone(),
+                    range: shift(item.range.start)..shift(item.range.end),
+                })
+                .collect();
+            let blocks = previous.blocks.clone();
+            let mut next = ParsedDocument {
+                source: markdown.to_string(),
+                normalized: None,
+                block_index: build_block_index(&blocks, &events),
+                blocks,
+                events,
+            };
+            reconcile_block_ids(previous, &mut next);
+            return Some(next);
         }
-        let shift = |offset: usize| {
-            if offset <= prefix {
-                offset
-            } else if offset >= old_end {
-                offset.saturating_add_signed(delta)
-            } else {
-                prefix + new_mid_len
-            }
-        };
-        let events: Vec<SpannedEvent> = previous
-            .events
-            .iter()
-            .map(|item| SpannedEvent {
-                event: item.event.clone(),
-                range: shift(item.range.start)..shift(item.range.end),
-            })
-            .collect();
-        let blocks = previous.blocks.clone();
-        let mut next = ParsedDocument {
-            source: markdown.to_string(),
-            normalized: None,
-            block_index: build_block_index(&blocks, &events),
-            blocks,
-            events,
-        };
-        reconcile_block_ids(previous, &mut next);
-        return Some(next);
     }
 
     let ranges = top_level_block_ranges(previous)?;
@@ -640,7 +648,8 @@ pub(crate) fn is_block_tag_end(tag_end: TagEnd) -> bool {
 }
 
 fn safe_line_edit(source: &[u8], start: usize, end: usize) -> bool {
-    start == 0
+    (start == end && (start == 0 || start == source.len() || source[start - 1] == b'\n'))
+        || start == 0
         || end == source.len()
         || (start > 0 && source[start - 1] == b'\n' && end < source.len() && source[end] == b'\n')
 }
@@ -1271,11 +1280,40 @@ mod tests {
     }
 
     #[test]
-    fn incremental_parse_falls_back_for_blank_line_inside_code_block() {
+    fn incremental_parse_reparses_blank_line_inside_code_block_boundary() {
         let previous = parse_document("```text\na\n\nb\n```\n");
         let next = "```text\na\n\n\nb\n```\n";
 
-        assert!(parse_document_incremental(&previous, next).is_none());
+        let next = parse_document_incremental(&previous, next)
+            .expect("the fenced code parent should be reparsed as one boundary");
+        assert_eq!(
+            next.blocks(),
+            parse_document("```text\na\n\n\nb\n```\n").blocks()
+        );
+    }
+
+    #[test]
+    fn incremental_parse_keeps_nested_parent_boundaries() {
+        let cases = [
+            (
+                "- 外层\n  - 内层一\n  - 内层二\n\n后文\n",
+                "- 外层\n  - 内层一\n  - 修改后的内层二\n\n后文\n",
+            ),
+            (
+                "> 引用\n> 第二行\n\n后文\n",
+                "> 引用\n> 修改后的第二行\n\n后文\n",
+            ),
+            (
+                "| 名称 | 状态 |\n| --- | --- |\n| A | 可用 |\n\n后文\n",
+                "| 名称 | 状态 |\n| --- | --- |\n| A | 已完成 |\n\n后文\n",
+            ),
+        ];
+        for (previous_source, next_source) in cases {
+            let previous = parse_document(previous_source);
+            let next = parse_document_incremental(&previous, next_source)
+                .expect("nested parent edits should stay within one boundary");
+            assert_eq!(next.blocks(), parse_document(next_source).blocks());
+        }
     }
 
     #[derive(Debug, Default, PartialEq, Eq)]
