@@ -543,35 +543,58 @@ pub fn parse_document_incremental(
         .rev()
         .find(|(_, range)| range.start <= old_end && range.end >= prefix)
         .map_or(first_touched + 1, |(index, _)| index + 1);
-    let window_start = first_touched.saturating_sub(1);
-    let window_end = (last_touched_exclusive + 1).min(ranges.len());
-    if ranges[window_start..window_end]
-        .iter()
-        .enumerate()
-        .any(|(offset, _)| !is_incremental_block_safe(&previous.blocks[window_start + offset]))
-    {
-        return None;
-    }
-    let old_window_start = ranges[window_start].start;
-    let old_window_end = ranges[window_end - 1].end;
-    let new_window_end = old_window_end.checked_add_signed(delta)?;
-    if new_window_end < old_window_start || new_window_end > next_source.len() {
-        return None;
-    }
-    let reparsed_source = &next_source[old_window_start..new_window_end];
-    let reparsed = parse_normalized_document(reparsed_source);
-    if (reparsed.blocks.is_empty() && !reparsed_source.is_empty())
-        || reparsed
-            .blocks
+    let mut window_start = first_touched.saturating_sub(1);
+    let mut window_end = (last_touched_exclusive + 1).min(ranges.len());
+    // A local parser window can be ambiguous at a boundary (for example when
+    // a delimiter changes whether the next paragraph belongs to a list or a
+    // quote). Expand both sides until the reparsed structure is valid. This
+    // keeps the common path local while avoiding a second full parse merely
+    // because the first one-block context was too narrow.
+    let (old_window_start, old_window_end, reparsed) = loop {
+        let old_window_start = ranges[window_start].start;
+        let old_window_end = ranges[window_end - 1].end;
+        let old_blocks_safe = ranges[window_start..window_end]
             .iter()
-            .any(|block| !is_incremental_block_safe(block))
-        || reparsed
-            .events
-            .iter()
-            .any(|item| item.range.end > new_window_end - old_window_start)
-    {
-        return None;
-    }
+            .enumerate()
+            .all(|(offset, _)| is_incremental_block_safe(&previous.blocks[window_start + offset]));
+        let Some(new_window_end) = old_window_end.checked_add_signed(delta) else {
+            if window_start == 0 && window_end == ranges.len() {
+                return None;
+            }
+            window_start = window_start.saturating_sub(1);
+            if window_end < ranges.len() {
+                window_end += 1;
+            }
+            continue;
+        };
+        let reparsed_source = (old_blocks_safe
+            && new_window_end >= old_window_start
+            && new_window_end <= next_source.len())
+        .then(|| parse_normalized_document(&next_source[old_window_start..new_window_end]));
+        let valid = reparsed_source.as_ref().is_some_and(|reparsed| {
+            let source = &next_source[old_window_start..new_window_end];
+            (source.is_empty() || !reparsed.blocks.is_empty())
+                && reparsed.blocks.iter().all(is_incremental_block_safe)
+                && reparsed
+                    .events
+                    .iter()
+                    .all(|item| item.range.end <= new_window_end - old_window_start)
+        });
+        if valid {
+            break (
+                old_window_start,
+                old_window_end,
+                reparsed_source.expect("validated reparsed window"),
+            );
+        }
+        if window_start == 0 && window_end == ranges.len() {
+            return None;
+        }
+        window_start = window_start.saturating_sub(1);
+        if window_end < ranges.len() {
+            window_end += 1;
+        }
+    };
 
     let mut blocks = previous.blocks.clone();
     blocks.splice(window_start..window_end, reparsed.blocks);
