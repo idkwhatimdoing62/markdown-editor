@@ -510,22 +510,22 @@ pub fn parse_document_incremental(
     if ranges.len() != previous.blocks.len() {
         return None;
     }
-    let block_index = ranges
+    // Reparse the blocks touched by the edit together with their immediate
+    // neighbors.  The reparsed window may contain a different number of
+    // blocks, which covers inserting or deleting a paragraph without forcing
+    // a full-document parse.
+    let first_touched = ranges
         .iter()
-        .position(|range| prefix >= range.start && old_end <= range.end)?;
-    if ranges
+        .position(|range| range.end >= prefix && range.start <= old_end)
+        .unwrap_or_else(|| ranges.len().saturating_sub(1));
+    let last_touched_exclusive = ranges
         .iter()
         .enumerate()
-        .any(|(index, range)| index != block_index && prefix >= range.start && old_end <= range.end)
-    {
-        return None;
-    }
-    // Reparse the edited block together with its immediate neighbors. This
-    // gives block-level syntax a small amount of context while still keeping
-    // the common edit path local. If either neighbor is a structural block,
-    // the conservative full-parse path below remains the fallback.
-    let window_start = block_index.saturating_sub(1);
-    let window_end = (block_index + 2).min(ranges.len());
+        .rev()
+        .find(|(_, range)| range.start <= old_end && range.end >= prefix)
+        .map_or(first_touched + 1, |(index, _)| index + 1);
+    let window_start = first_touched.saturating_sub(1);
+    let window_end = (last_touched_exclusive + 1).min(ranges.len());
     if ranges[window_start..window_end]
         .iter()
         .enumerate()
@@ -541,7 +541,7 @@ pub fn parse_document_incremental(
     }
     let reparsed = parse_document(&markdown[old_window_start..new_window_end]);
     if reparsed.normalized.is_some()
-        || reparsed.blocks.len() != window_end - window_start
+        || reparsed.blocks.is_empty()
         || reparsed
             .blocks
             .iter()
@@ -1189,6 +1189,38 @@ mod tests {
             .expect("single paragraph edit should be incremental");
         let full = parse_document("# 一\n\n修改后的甲\n\n# 二\n\n乙\n");
 
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
+    fn incremental_parse_supports_inserting_a_top_level_block() {
+        let previous = parse_document("# 一\n\n甲\n\n乙\n");
+        let next_source = "# 一\n\n甲\n\n新增\n\n乙\n";
+        let next = parse_document_incremental(&previous, next_source)
+            .expect("inserting a paragraph should stay incremental");
+
+        assert_eq!(next.source(), next_source);
+        assert_eq!(next.blocks().len(), 4);
+        assert_eq!(next.blocks()[1], previous.blocks()[1]);
+        assert_eq!(next.blocks()[3], previous.blocks()[2]);
+        let full = parse_document(next_source);
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
+    fn incremental_parse_supports_deleting_a_top_level_block() {
+        let previous = parse_document("# 一\n\n甲\n\n删除\n\n乙\n");
+        let next_source = "# 一\n\n甲\n\n乙\n";
+        let next = parse_document_incremental(&previous, next_source)
+            .expect("deleting a paragraph should stay incremental");
+
+        assert_eq!(next.source(), next_source);
+        assert_eq!(next.blocks().len(), 3);
+        assert_eq!(next.blocks()[1], previous.blocks()[1]);
+        assert_eq!(next.blocks()[2], previous.blocks()[3]);
+        let full = parse_document(next_source);
         assert_eq!(next.blocks(), full.blocks());
         assert_eq!(next.events(), full.events());
     }
