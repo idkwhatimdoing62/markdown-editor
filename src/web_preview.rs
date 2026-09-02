@@ -2024,7 +2024,6 @@ pub fn preview_document_incremental(
     let body_range = previous_preview.body_range?;
     if previous_preview.virtual_manifest.is_some()
         || previous_preview.has_mermaid != document.has_mermaid()
-        || heading_count(previous_document.blocks()) != heading_count(document.blocks())
         || previous_document.blocks().len() != document.blocks().len()
         || previous_preview.blocks.len() != document.blocks().len() + 1
     {
@@ -2050,6 +2049,37 @@ pub fn preview_document_incremental(
         return None;
     }
 
+    // Heading IDs are assigned in document order. A block that becomes (or
+    // stops being) a heading shifts IDs for later heading-containing blocks,
+    // so include only those later blocks in the local render set. Unchanged
+    // non-heading blocks can still reuse their existing HTML.
+    let heading_count_changed =
+        heading_count(previous_document.blocks()) != heading_count(document.blocks());
+    if heading_count_changed
+        && changed.iter().any(|index| {
+            contains_nested_heading(&previous_document.blocks()[*index])
+                || contains_nested_heading(&document.blocks()[*index])
+        })
+    {
+        // Nested headings can change the numbering of descendants in a list
+        // or quote in ways that are not represented by one top-level HTML
+        // block. Keep the conservative full-render fallback for that case.
+        return None;
+    }
+
+    let mut render_indices = changed.clone();
+    if heading_count_changed {
+        let first_changed = *changed.first()?;
+        render_indices.extend(
+            (first_changed + 1..document.blocks().len()).filter(|index| {
+                block_heading_count(&previous_document.blocks()[*index]) > 0
+                    || block_heading_count(&document.blocks()[*index]) > 0
+            }),
+        );
+        render_indices.sort_unstable();
+        render_indices.dedup();
+    }
+
     let slices = top_level_event_slices(document)?;
     if slices.len() != document.blocks().len() {
         return None;
@@ -2063,7 +2093,8 @@ pub fn preview_document_incremental(
     let block_ids = stable_top_level_block_ids(document);
     for (chunk_index, old_chunk) in previous_preview.blocks.iter().enumerate() {
         let block_index = chunk_index.checked_sub(1);
-        if let Some(index) = block_index.filter(|index| changed.binary_search(index).is_ok()) {
+        if let Some(index) = block_index.filter(|index| render_indices.binary_search(index).is_ok())
+        {
             body.push_str(&render_incremental_block(
                 document,
                 index,
@@ -2247,14 +2278,15 @@ pub fn preview_document_virtual_incremental(
 }
 
 fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block) -> bool {
-    // Re-rendering one complete top-level block is still local, even when the
-    // block contains a list, quote, table or image. Raw HTML remains on the
-    // conservative full-render path because it may contain arbitrary sibling
-    // nodes that do not map one-to-one to our source anchors.
+    // Re-rendering one complete top-level block is still local when its
+    // parsed kind changes: the event slice and source anchor for that block
+    // are replaced together, while the surrounding blocks remain intact.
+    // Raw HTML remains on the conservative full-render path because it may
+    // contain arbitrary sibling nodes that do not map one-to-one to anchors.
     !matches!(
         (old, new),
         (crate::markdown::Block::Raw(_), _) | (_, crate::markdown::Block::Raw(_))
-    ) && std::mem::discriminant(old) == std::mem::discriminant(new)
+    )
 }
 
 fn enriched_block_index(
@@ -2282,6 +2314,24 @@ fn heading_count(blocks: &[crate::markdown::Block]) -> usize {
             _ => 0,
         })
         .sum()
+}
+
+fn block_heading_count(block: &crate::markdown::Block) -> usize {
+    heading_count(std::slice::from_ref(block))
+}
+
+fn contains_nested_heading(block: &crate::markdown::Block) -> bool {
+    match block {
+        crate::markdown::Block::List { items, .. } => items.iter().flatten().any(|child| {
+            matches!(child, crate::markdown::Block::Heading { .. })
+                || contains_nested_heading(child)
+        }),
+        crate::markdown::Block::Quote(children) => children.iter().any(|child| {
+            matches!(child, crate::markdown::Block::Heading { .. })
+                || contains_nested_heading(child)
+        }),
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2363,10 +2413,7 @@ fn render_incremental_block_content(
         return None;
     }
     let mut events = Vec::new();
-    let mut heading_index = document.blocks()[..index]
-        .iter()
-        .filter(|block| matches!(block, crate::markdown::Block::Heading { .. }))
-        .count();
+    let mut heading_index = heading_count(&document.blocks()[..index]);
     for item in &document.events()[slice.event_start..slice.event_end] {
         let mut event = item.event.clone();
         if let Event::Start(Tag::Heading { id, .. }) = &mut event {
@@ -2377,7 +2424,20 @@ fn render_incremental_block_content(
     }
     let mut html = String::new();
     html::push_html(&mut html, events.into_iter());
-    html.insert_str(0, &format!("{}\n", block_anchor(block_id)));
+    // Keep the same boundary formatting as the full document renderer. The
+    // Markdown HTML writer emits a leading newline for most block tags, but
+    // starts tables directly after the marker. Mirror that small formatting
+    // distinction so a local replacement is byte-for-byte compatible with a
+    // full render.
+    let separator = if matches!(
+        document.blocks()[index],
+        crate::markdown::Block::Table { .. }
+    ) {
+        ""
+    } else {
+        "\n"
+    };
+    html.insert_str(0, &format!("{}{separator}", block_anchor(block_id)));
     annotate_code_languages(&mut html);
     Some(html)
 }
@@ -3853,6 +3913,86 @@ mod tests {
     }
 
     #[test]
+    fn incremental_preview_supports_paragraph_to_list_conversion() {
+        let first_document = crate::markdown::parse_document("前文\n\n原始段落\n\n后文\n");
+        let next_document = crate::markdown::parse_document("前文\n\n- 第一项\n- 第二项\n\n后文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("paragraph-to-list conversion should patch the changed block locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_supports_paragraph_to_quote_conversion() {
+        let first_document = crate::markdown::parse_document("前文\n\n原始段落\n\n后文\n");
+        let next_document = crate::markdown::parse_document("前文\n\n> 引用段落\n\n后文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("paragraph-to-quote conversion should patch the changed block locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_supports_paragraph_to_table_conversion() {
+        let first_document = crate::markdown::parse_document("前文\n\n原始段落\n\n后文\n");
+        let next_document = crate::markdown::parse_document(
+            "前文\n\n| 字段 | 值 |\n| --- | --- |\n| 一 | 新 |\n\n后文\n",
+        );
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("paragraph-to-table conversion should patch the changed block locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_supports_paragraph_to_heading_conversion_and_updates_following_ids() {
+        let first_document =
+            crate::markdown::parse_document("前文\n\n原始段落\n\n## 后续章节\n\n后文\n");
+        let next_document =
+            crate::markdown::parse_document("前文\n\n# 新章节\n\n## 后续章节\n\n后文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("paragraph-to-heading conversion should patch affected heading blocks locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
     fn nested_heading_count_change_still_forces_full_preview_rendering() {
         let first_document = crate::markdown::parse_document("> # 嵌套标题\n");
         let next_document = crate::markdown::parse_document("> 正文\n");
@@ -3924,9 +4064,9 @@ mod tests {
     }
 
     #[test]
-    fn incremental_preview_falls_back_when_block_kind_changes() {
-        let first_document = crate::markdown::parse_document("正文\n");
-        let next_document = crate::markdown::parse_document("# 标题\n");
+    fn incremental_preview_falls_back_when_raw_html_block_changes() {
+        let first_document = crate::markdown::parse_document("<div>旧内容</div>\n");
+        let next_document = crate::markdown::parse_document("<div>新内容</div>\n");
         let first_preview = super::preview_document(&first_document, "", None, None, None);
 
         assert!(
