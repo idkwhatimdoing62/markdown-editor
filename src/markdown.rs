@@ -1,6 +1,9 @@
 //! 把 Markdown 解析为可渲染的块模型。
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -213,6 +216,21 @@ pub struct ParsedDocument {
     normalized: Option<String>,
     blocks: Vec<Block>,
     events: Vec<SpannedEvent>,
+    block_index: Vec<BlockIndexEntry>,
+}
+
+/// Shared metadata for one top-level Markdown block.
+///
+/// The parser owns the source range and stable identity.  Preview code fills
+/// `rendered_height` when it has measured or estimated the corresponding DOM
+/// block; the native editor uses the same entry to map a scroll position back
+/// to a source block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockIndexEntry {
+    pub id: u64,
+    pub source_range: Range<usize>,
+    pub rendered_height: f32,
+    pub heading_level: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -236,6 +254,10 @@ impl ParsedDocument {
 
     pub fn events(&self) -> &[SpannedEvent] {
         &self.events
+    }
+
+    pub fn block_index(&self) -> &[BlockIndexEntry] {
+        &self.block_index
     }
 
     pub fn has_mermaid(&self) -> bool {
@@ -272,12 +294,129 @@ pub fn parse_document(markdown: &str) -> ParsedDocument {
         Cow::Borrowed(_) => None,
         Cow::Owned(value) => Some(value),
     };
+    let blocks = builder.finish();
+    let block_index = build_block_index(&blocks, &events);
     ParsedDocument {
         source: markdown.to_string(),
         normalized,
-        blocks: builder.finish(),
+        blocks,
         events,
+        block_index,
     }
+}
+
+fn build_block_index(blocks: &[Block], events: &[SpannedEvent]) -> Vec<BlockIndexEntry> {
+    let ranges = top_level_block_ranges_from_events(events).unwrap_or_default();
+    let mut occurrences = HashMap::<u64, usize>::new();
+    blocks
+        .iter()
+        .zip(ranges)
+        .map(|(block, source_range)| {
+            let mut hasher = DefaultHasher::new();
+            "markdown-preview-block".hash(&mut hasher);
+            block.hash(&mut hasher);
+            let content_hash = hasher.finish();
+            let occurrence = occurrences.entry(content_hash).or_default();
+            let id = stable_block_id(content_hash, *occurrence);
+            *occurrence += 1;
+            BlockIndexEntry {
+                id,
+                source_range,
+                rendered_height: 0.0,
+                heading_level: match block {
+                    Block::Heading { level, .. } => Some(*level),
+                    _ => None,
+                },
+            }
+        })
+        .collect()
+}
+
+fn stable_block_id(content_hash: u64, occurrence: usize) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    format!("markdown-preview-block:{content_hash}:{occurrence}").hash(&mut hasher);
+    hasher.finish()
+}
+
+fn top_level_block_ranges_from_events(events: &[SpannedEvent]) -> Option<Vec<Range<usize>>> {
+    let mut depth = 0usize;
+    let mut start = None;
+    let mut ranges = Vec::new();
+    for item in events {
+        match &item.event {
+            Event::Start(tag) if is_block_tag(tag) => {
+                if depth == 0 {
+                    start = Some(item.range.start);
+                }
+                depth += 1;
+            }
+            Event::End(tag_end) if is_block_tag_end(*tag_end) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    ranges.push(start.take()?..item.range.end);
+                }
+            }
+            Event::Rule if depth == 0 => ranges.push(item.range.clone()),
+            _ => {}
+        }
+    }
+    (depth == 0 && start.is_none()).then_some(ranges)
+}
+
+/// Preserve logical block IDs across edits. Matching requires content, source
+/// overlap, or an unchanged neighbouring block plus the same block kind. A
+/// position by itself is deliberately not sufficient.
+fn reconcile_block_ids(previous: &ParsedDocument, next: &mut ParsedDocument) {
+    if previous.block_index.is_empty() || next.block_index.is_empty() {
+        return;
+    }
+    let mut candidates = Vec::new();
+    for (new_index, new_block) in next.blocks.iter().enumerate() {
+        for (old_index, old_block) in previous.blocks.iter().enumerate() {
+            if std::mem::discriminant(old_block) != std::mem::discriminant(new_block) {
+                continue;
+            }
+            let old_range = &previous.block_index[old_index].source_range;
+            let new_range = &next.block_index[new_index].source_range;
+            let overlap = old_range.start.max(new_range.start) < old_range.end.min(new_range.end);
+            let exact = old_block == new_block;
+            let previous_neighbour = new_index > 0
+                && old_index > 0
+                && previous.blocks[old_index - 1] == next.blocks[new_index - 1];
+            let next_neighbour = old_index + 1 < previous.blocks.len()
+                && new_index + 1 < next.blocks.len()
+                && previous.blocks[old_index + 1] == next.blocks[new_index + 1];
+            if !(exact || overlap || previous_neighbour || next_neighbour) {
+                continue;
+            }
+            let score = (exact as i64) * 1_000_000
+                + (overlap as i64) * 10_000
+                + (previous_neighbour as i64) * 2_000
+                + (next_neighbour as i64) * 2_000
+                - (old_index.abs_diff(new_index) as i64);
+            candidates.push((score, old_index, new_index));
+        }
+    }
+    candidates.sort_unstable_by(|left, right| right.cmp(left));
+    let mut old_used = vec![false; previous.blocks.len()];
+    let mut new_used = vec![false; next.blocks.len()];
+    for (_, old_index, new_index) in candidates {
+        if old_used[old_index] || new_used[new_index] {
+            continue;
+        }
+        old_used[old_index] = true;
+        new_used[new_index] = true;
+        next.block_index[new_index].id = previous.block_index[old_index].id;
+        next.block_index[new_index].rendered_height = previous.block_index[old_index].rendered_height;
+    }
+}
+
+pub fn parse_document_with_previous(previous: Option<&ParsedDocument>, markdown: &str) -> ParsedDocument {
+    let mut next = parse_document(markdown);
+    if let Some(previous) = previous {
+        reconcile_block_ids(previous, &mut next);
+    }
+    next
 }
 
 /// Reuse a parsed document for edits whose Markdown context is provably local.
@@ -339,7 +478,7 @@ pub fn parse_document_incremental(
                 prefix + new_mid_len
             }
         };
-        let events = previous
+        let events: Vec<SpannedEvent> = previous
             .events
             .iter()
             .map(|item| SpannedEvent {
@@ -347,12 +486,16 @@ pub fn parse_document_incremental(
                 range: shift(item.range.start)..shift(item.range.end),
             })
             .collect();
-        return Some(ParsedDocument {
+        let blocks = previous.blocks.clone();
+        let mut next = ParsedDocument {
             source: markdown.to_string(),
             normalized: None,
-            blocks: previous.blocks.clone(),
+            block_index: build_block_index(&blocks, &events),
+            blocks,
             events,
-        });
+        };
+        reconcile_block_ids(previous, &mut next);
+        return Some(next);
     }
 
     let ranges = top_level_block_ranges(previous)?;
@@ -428,37 +571,20 @@ pub fn parse_document_incremental(
                     ..item.range.end.saturating_add_signed(delta),
             }),
     );
-    Some(ParsedDocument {
+    let block_index = build_block_index(&blocks, &events);
+    let mut next = ParsedDocument {
         source: markdown.to_string(),
         normalized: None,
         blocks,
         events,
-    })
+        block_index,
+    };
+    reconcile_block_ids(previous, &mut next);
+    Some(next)
 }
 
 fn top_level_block_ranges(document: &ParsedDocument) -> Option<Vec<Range<usize>>> {
-    let mut depth = 0usize;
-    let mut start = None;
-    let mut ranges = Vec::new();
-    for item in &document.events {
-        match &item.event {
-            Event::Start(tag) if is_block_tag(tag) => {
-                if depth == 0 {
-                    start = Some(item.range.start);
-                }
-                depth += 1;
-            }
-            Event::End(tag_end) if is_block_tag_end(*tag_end) => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    ranges.push(start.take()?..item.range.end);
-                }
-            }
-            Event::Rule if depth == 0 => ranges.push(item.range.clone()),
-            _ => {}
-        }
-    }
-    (depth == 0 && start.is_none()).then_some(ranges)
+    top_level_block_ranges_from_events(&document.events)
 }
 
 fn is_incremental_block_safe(block: &Block) -> bool {
@@ -1122,6 +1248,26 @@ mod tests {
             assert_eq!(next.blocks(), full.blocks());
             assert_eq!(next.events(), full.events());
         }
+    }
+
+    #[test]
+    fn block_ids_follow_logical_blocks_when_text_changes() {
+        let previous = parse_document("# 一\n\n甲\n\n乙\n");
+        let next = parse_document_with_previous(Some(&previous), "# 一\n\n修改后的甲\n\n乙\n");
+
+        assert_eq!(next.block_index()[0].id, previous.block_index()[0].id);
+        assert_eq!(next.block_index()[1].id, previous.block_index()[1].id);
+        assert_eq!(next.block_index()[2].id, previous.block_index()[2].id);
+    }
+
+    #[test]
+    fn block_ids_do_not_relabel_same_kind_blocks_by_index() {
+        let previous = parse_document("甲\n\n乙\n\n丙\n");
+        let next = parse_document_with_previous(Some(&previous), "新块\n\n甲\n\n乙\n");
+
+        assert_eq!(next.block_index()[1].id, previous.block_index()[0].id);
+        assert_eq!(next.block_index()[2].id, previous.block_index()[1].id);
+        assert_ne!(next.block_index()[0].id, previous.block_index()[0].id);
     }
 
     #[test]

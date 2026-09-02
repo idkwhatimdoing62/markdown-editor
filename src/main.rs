@@ -441,7 +441,12 @@ impl ParseWorker {
                     .and_then(|previous| {
                         markdown::parse_document_incremental(previous, &request.text)
                     })
-                    .unwrap_or_else(|| markdown::parse_document(&request.text));
+                    .unwrap_or_else(|| {
+                        markdown::parse_document_with_previous(
+                            request.previous.as_ref(),
+                            &request.text,
+                        )
+                    });
                 let result = ParseResult {
                     tab_id: request.tab_id,
                     revision: request.revision,

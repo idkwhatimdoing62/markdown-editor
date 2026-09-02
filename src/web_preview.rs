@@ -1,7 +1,6 @@
 //! 使用系统浏览器引擎执行主题 CSS 的 Markdown 预览。
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -2285,42 +2284,26 @@ fn block_fingerprint(document: &crate::markdown::ParsedDocument) -> u64 {
     hasher.finish()
 }
 
-/// Assign IDs from block content plus a duplicate ordinal. Inserting or
-/// deleting unrelated blocks therefore does not renumber the remaining IDs.
+/// Read the IDs assigned by the shared parser block index. Keeping the ID
+/// ownership in `ParsedDocument` means the editor and preview use one identity
+/// source instead of independently hashing blocks.
 fn stable_top_level_block_ids(document: &crate::markdown::ParsedDocument) -> Vec<u64> {
-    let mut occurrences = HashMap::<u64, usize>::new();
     document
-        .blocks()
+        .block_index()
         .iter()
-        .map(|block| {
-            let mut content_hasher = DefaultHasher::new();
-            "markdown-preview-block".hash(&mut content_hasher);
-            block.hash(&mut content_hasher);
-            let content_hash = content_hasher.finish();
-            let occurrence = occurrences.entry(content_hash).or_default();
-            let id = hash(&format!(
-                "markdown-preview-block:{content_hash}:{occurrence}"
-            ));
-            *occurrence += 1;
-            id
-        })
+        .map(|entry| entry.id)
         .collect()
 }
 
 fn reconcile_top_level_block_ids(
-    previous: &PreviewDocument,
+    _previous: &PreviewDocument,
     document: &crate::markdown::ParsedDocument,
 ) -> Vec<u64> {
-    let mut ids = stable_top_level_block_ids(document);
-    if previous.block_ids.len() != document.blocks().len() {
-        return ids;
-    }
-    ids.iter_mut().enumerate().for_each(|(index, id)| {
-        if index < previous.block_ids.len() {
-            *id = previous.block_ids[index];
-        }
-    });
-    ids
+    // Identity reconciliation happens while producing ParsedDocument, where
+    // both old and new source ranges and neighbouring blocks are available.
+    // Never copy IDs by index here: that would relabel blocks after an
+    // insertion or deletion when the total block count happens to match.
+    stable_top_level_block_ids(document)
 }
 
 fn replace_source_markers(html: &str, values: &[f32]) -> String {
