@@ -281,8 +281,9 @@ pub fn parse_document(markdown: &str) -> ParsedDocument {
 }
 
 /// Reuse a parsed document for edits whose Markdown context is provably local.
-/// Line-only edits reuse all blocks; textual edits reparse one simple
-/// top-level block. Structural blocks conservatively fall back to a full parse.
+/// Line-only edits reuse all blocks; textual edits reparse the edited block and
+/// its immediate safe neighbors. A list, quote, or table is parsed as one
+/// top-level block, so edits inside it stay local to that block.
 pub fn parse_document_incremental(
     previous: &ParsedDocument,
     markdown: &str,
@@ -463,7 +464,13 @@ fn top_level_block_ranges(document: &ParsedDocument) -> Option<Vec<Range<usize>>
 fn is_incremental_block_safe(block: &Block) -> bool {
     matches!(
         block,
-        Block::Heading { .. } | Block::Paragraph(_) | Block::Code { .. } | Block::Rule
+        Block::Heading { .. }
+            | Block::Paragraph(_)
+            | Block::Code { .. }
+            | Block::List { .. }
+            | Block::Quote(_)
+            | Block::Table { .. }
+            | Block::Rule
     )
 }
 
@@ -1090,9 +1097,31 @@ mod tests {
     }
 
     #[test]
-    fn incremental_parse_falls_back_for_cross_block_list_semantics() {
-        let previous = parse_document("- 一\n- 二\n");
-        assert!(parse_document_incremental(&previous, "- 一\n- 修改后的二\n").is_none());
+    fn incremental_parse重解析整个列表块() {
+        let previous = parse_document("前文\n\n- 一\n- 二\n\n后文\n");
+        let next = parse_document_incremental(&previous, "前文\n\n- 一\n- 修改后的二\n\n后文\n")
+            .expect("列表块内部的文字修改应保持局部解析");
+        let full = parse_document("前文\n\n- 一\n- 修改后的二\n\n后文\n");
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
+    fn incremental_parse重解析引用和表格块() {
+        for (previous_source, next_source) in [
+            ("> 说明\n> 原文\n\n后文\n", "> 说明\n> 修改后\n\n后文\n"),
+            (
+                "| 名称 | 状态 |\n| --- | --- |\n| 编辑 | 可用 |\n\n后文\n",
+                "| 名称 | 状态 |\n| --- | --- |\n| 编辑 | 已完成 |\n\n后文\n",
+            ),
+        ] {
+            let previous = parse_document(previous_source);
+            let next = parse_document_incremental(&previous, next_source)
+                .expect("引用和表格块内部的文字修改应保持局部解析");
+            let full = parse_document(next_source);
+            assert_eq!(next.blocks(), full.blocks());
+            assert_eq!(next.events(), full.events());
+        }
     }
 
     #[test]
