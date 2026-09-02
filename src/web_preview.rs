@@ -862,6 +862,86 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     }
   };
 
+  const blockIdFromComment = (node) => {
+    if (!node || node.nodeType !== Node.COMMENT_NODE) return null;
+    const match = /^md-block:(\d+)$/.exec(node.nodeValue || '');
+    return match ? match[1] : null;
+  };
+
+  const nextElementSibling = (node, boundary) => {
+    let current = node?.nextSibling || null;
+    while (current && current !== boundary) {
+      if (current.nodeType === Node.ELEMENT_NODE) return current;
+      current = current.nextSibling;
+    }
+    return null;
+  };
+
+  const loadedBlockElements = (chunk) => {
+    const elements = new Map();
+    if (!chunk?.start || !chunk?.end) return elements;
+    let node = chunk.start.nextSibling;
+    while (node && node !== chunk.end) {
+      const id = blockIdFromComment(node);
+      if (id !== null) {
+        const element = nextElementSibling(node, chunk.end);
+        if (element) elements.set(id, element);
+      }
+      node = node.nextSibling;
+    }
+    return elements;
+  };
+
+  const templateBlockElements = (template) => {
+    const elements = new Map();
+    const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_COMMENT);
+    let node = walker.nextNode();
+    while (node) {
+      const id = blockIdFromComment(node);
+      if (id !== null) {
+        const element = nextElementSibling(node, null);
+        if (element) elements.set(id, element);
+      }
+      node = walker.nextNode();
+    }
+    return elements;
+  };
+
+  const patchLoadedChunkBlocks = async (current, next) => {
+    if (!current?.start || !current.end
+        || !Array.isArray(current.blockIds) || !Array.isArray(next.blockIds)
+        || !Array.isArray(current.blockHashes) || !Array.isArray(next.blockHashes)
+        || current.blockIds.length !== next.blockIds.length
+        || current.blockHashes.length !== next.blockHashes.length
+        || current.blockIds.some((id, index) => String(id) !== String(next.blockIds[index]))) {
+      return false;
+    }
+    const chunkUrl = new URL(`/chunk/${next.index}?revision=${encodeURIComponent(revision)}`, location.origin);
+    const response = await fetch(chunkUrl, { cache: 'no-store' });
+    if (!response.ok) return false;
+    const template = document.createElement('template');
+    template.innerHTML = await response.text();
+    const oldElements = loadedBlockElements(current);
+    const newElements = templateBlockElements(template);
+    if (oldElements.size !== current.blockIds.length || newElements.size !== next.blockIds.length) {
+      return false;
+    }
+    for (let index = 0; index < next.blockIds.length; index += 1) {
+      if (String(current.blockHashes[index]) === String(next.blockHashes[index])) continue;
+      const id = String(next.blockIds[index]);
+      const oldElement = oldElements.get(id);
+      const newElement = newElements.get(id);
+      if (!oldElement || !newElement) return false;
+      oldElement.replaceWith(newElement.cloneNode(true));
+    }
+    Object.assign(current, next);
+    refreshChunkAnchors(current);
+    if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    current.height = Math.max(1, current.end.offsetTop - current.start.offsetTop);
+    return true;
+  };
+
   const load = (chunk) => {
     if (!chunk || chunk.start) return Promise.resolve();
     if (chunk.loading) return chunk.loading;
@@ -952,6 +1032,10 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
           current.height = measuredHeight;
           if (current.placeholder) current.placeholder.style.height = `${next.height}px`;
           refreshChunkAnchors(current);
+          updated.push(current);
+          continue;
+        }
+        if (await patchLoadedChunkBlocks(current, next)) {
           updated.push(current);
           continue;
         }
@@ -3809,6 +3893,9 @@ mod tests {
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("/manifest?revision="));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("const patch = async"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("refreshChunkAnchors"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("patchLoadedChunkBlocks"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("loadedBlockElements"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("blockHashes"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("blockId"));
         assert!(
             VIRTUAL_PREVIEW_SCRIPT.contains("captureViewportAnchor: captureVirtualViewportAnchor")
