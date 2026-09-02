@@ -1917,6 +1917,7 @@ pub fn preview_document_virtual_incremental(
     let anchors = document_source_anchors(document);
     let block_ids = stable_top_level_block_ids(document);
     let mut marker_cursor = 0usize;
+    let mut block_cursor = 0usize;
     let mut chunks = Vec::with_capacity(previous_preview.chunks.len());
     for (chunk_index, old_chunk) in previous_preview.chunks.iter().enumerate() {
         let marker_count = old_chunk.source_anchors.len();
@@ -1954,7 +1955,7 @@ pub fn preview_document_virtual_incremental(
         }
         let values = anchors.get(marker_cursor..chunk_end)?;
         let replaced = replace_source_markers_with_values(&html, values)?;
-        html = replaced;
+        html = replace_block_markers_with_ids(&replaced, block_cursor, &block_ids)?;
         if !virtual_chunk_boundary_stable(
             &old_chunk.html,
             &html,
@@ -1976,6 +1977,7 @@ pub fn preview_document_virtual_incremental(
             .max(96.0);
         let heading_bounds = heading_bounds(&html);
         let source_anchors = source_markers(&html);
+        let block_count = virtual_block_marker_ranges(&html).len();
         chunks.push(PreviewChunk {
             block_id: old_chunk.block_id,
             content_hash: hash_source_markerless(&html),
@@ -1988,6 +1990,7 @@ pub fn preview_document_virtual_incremental(
             heading_end: heading_bounds.map(|bounds| bounds.1),
         });
         marker_cursor = chunk_end;
+        block_cursor = block_cursor.saturating_add(block_count);
     }
     if marker_cursor != anchors.len() {
         return None;
@@ -2211,9 +2214,12 @@ fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
         .iter()
         .enumerate()
         .map(|(index, chunk)| {
+            let (block_ids, block_hashes) = virtual_chunk_block_metadata(&chunk.html);
             format!(
-                "{{\"index\":{index},\"blockId\":\"{}\",\"contentHash\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
+                "{{\"index\":{index},\"blockId\":\"{}\",\"blockIds\":{},\"blockHashes\":{},\"contentHash\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
                 chunk.block_id,
+                serde_json::to_string(&block_ids).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&block_hashes).unwrap_or_else(|_| "[]".to_string()),
                 chunk.content_hash,
                 chunk.source_start,
                 chunk.source_end,
@@ -2231,6 +2237,77 @@ fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{manifest}]")
+}
+
+/// Return the stable top-level block IDs and markerless content hashes carried
+/// by one virtual chunk.  The browser uses these parallel arrays to decide
+/// whether a loaded chunk can be patched block-by-block instead of discarded.
+fn virtual_chunk_block_metadata(html: &str) -> (Vec<u64>, Vec<u64>) {
+    let mut markers = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = html[cursor..].find("<!--md-block:") {
+        let start = cursor + relative;
+        let id_start = start + "<!--md-block:".len();
+        let Some(relative_end) = html[id_start..].find("-->") else {
+            break;
+        };
+        let end = id_start + relative_end + "-->".len();
+        if let Ok(id) = html[id_start..id_start + relative_end].parse::<u64>() {
+            markers.push((start..end, id));
+        }
+        cursor = end;
+    }
+
+    let mut ids = Vec::with_capacity(markers.len());
+    let mut hashes = Vec::with_capacity(markers.len());
+    for (index, (range, id)) in markers.iter().enumerate() {
+        let content_end = markers
+            .get(index + 1)
+            .map_or(html.len(), |(next, _)| next.start);
+        ids.push(*id);
+        hashes.push(hash_source_markerless(&html[range.end..content_end]));
+    }
+    (ids, hashes)
+}
+
+fn replace_block_markers_with_ids(
+    html: &str,
+    block_start: usize,
+    block_ids: &[u64],
+) -> Option<String> {
+    let block_markers = virtual_block_marker_ranges(html);
+    if block_markers.is_empty() {
+        return Some(html.to_string());
+    }
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    for (local_index, (range, _)) in block_markers.iter().enumerate() {
+        let block_index = block_start.checked_add(local_index)?;
+        let id = *block_ids.get(block_index)?;
+        output.push_str(&html[cursor..range.start]);
+        output.push_str(&block_anchor(id));
+        cursor = range.end;
+    }
+    output.push_str(&html[cursor..]);
+    Some(output)
+}
+
+fn virtual_block_marker_ranges(html: &str) -> Vec<(std::ops::Range<usize>, u64)> {
+    let mut markers = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(relative) = html[cursor..].find("<!--md-block:") {
+        let start = cursor + relative;
+        let id_start = start + "<!--md-block:".len();
+        let Some(relative_end) = html[id_start..].find("-->") else {
+            break;
+        };
+        let end = id_start + relative_end + "-->".len();
+        if let Ok(id) = html[id_start..id_start + relative_end].parse::<u64>() {
+            markers.push((start..end, id));
+        }
+        cursor = end;
+    }
+    markers
 }
 
 /// Return false when a changed chunk can move the first marker that crosses a
@@ -3737,6 +3814,23 @@ mod tests {
             VIRTUAL_PREVIEW_SCRIPT.contains("captureViewportAnchor: captureVirtualViewportAnchor")
         );
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("restoreVirtualViewportAnchor"));
+        assert!(first.virtual_manifest.as_deref().is_some_and(|manifest| {
+            manifest.contains("\"blockIds\"") && manifest.contains("\"blockHashes\"")
+        }));
+    }
+
+    #[test]
+    fn virtual_chunk_manifest_exposes_stable_block_metadata() {
+        let html = "<!--md-source:0--><!--md-block:11--><p>A</p><!--md-source:1--><!--md-block:22--><p>B</p>";
+        let (ids, hashes) = super::virtual_chunk_block_metadata(html);
+
+        assert_eq!(ids, vec![11, 22]);
+        assert_eq!(hashes.len(), ids.len());
+        assert_ne!(hashes[0], hashes[1]);
+        assert_eq!(
+            hashes[0],
+            super::hash_source_markerless("<p>A</p><!--md-source:1-->")
+        );
     }
 
     #[test]
