@@ -788,6 +788,19 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
   const captureVirtualViewportAnchor = () => {
     const chunk = findByY(window.scrollY);
     if (!chunk) return null;
+    const loaded = loadedBlockElements(chunk);
+    for (const [blockId, element] of loaded) {
+      const rect = element.getBoundingClientRect();
+      const top = rect.top + window.scrollY;
+      const bottom = rect.bottom + window.scrollY;
+      if (bottom > window.scrollY && top <= window.scrollY + 1) {
+        return {
+          blockId,
+          offset: Math.min(1, Math.max(0, (window.scrollY - top) / Math.max(1, rect.height))),
+          source: sourceForY(window.scrollY),
+        };
+      }
+    }
     return {
       blockId: chunk.blockId,
       offset: window.scrollY - chunkTop(chunk),
@@ -797,10 +810,18 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
 
   const restoreVirtualViewportAnchor = async (saved) => {
     if (!saved) return false;
-    const chunk = chunks.find((candidate) => String(candidate.blockId) === String(saved.blockId));
+    const chunk = chunks.find((candidate) => String(candidate.blockId) === String(saved.blockId)
+      || candidate.blockIds?.some((blockId) => String(blockId) === String(saved.blockId)));
     if (!chunk) return false;
     await load(chunk);
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    const element = loadedBlockElements(chunk).get(String(saved.blockId));
+    if (element) {
+      const rect = element.getBoundingClientRect();
+      const top = rect.top + window.scrollY;
+      window.scrollTo(0, Math.max(0, top + Number(saved.offset || 0) * Math.max(1, rect.height)));
+      return true;
+    }
     window.scrollTo(0, Math.max(0, chunkTop(chunk) + Number(saved.offset || 0)));
     return true;
   };
@@ -2299,6 +2320,14 @@ fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
         .enumerate()
         .map(|(index, chunk)| {
             let (block_ids, block_hashes) = virtual_chunk_block_metadata(&chunk.html);
+            let block_ids = block_ids
+                .into_iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>();
+            let block_hashes = block_hashes
+                .into_iter()
+                .map(|hash| hash.to_string())
+                .collect::<Vec<_>>();
             format!(
                 "{{\"index\":{index},\"blockId\":\"{}\",\"blockIds\":{},\"blockHashes\":{},\"contentHash\":\"{}\",\"sourceStart\":{},\"sourceEnd\":{},\"sourceAnchors\":{},\"height\":{},\"headingStart\":{},\"headingEnd\":{}}}",
                 chunk.block_id,
@@ -3895,6 +3924,8 @@ mod tests {
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("refreshChunkAnchors"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("patchLoadedChunkBlocks"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("loadedBlockElements"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("candidate.blockIds?.some"));
+        assert!(VIRTUAL_PREVIEW_SCRIPT.contains("rect.height"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("blockHashes"));
         assert!(VIRTUAL_PREVIEW_SCRIPT.contains("blockId"));
         assert!(
