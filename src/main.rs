@@ -2978,6 +2978,21 @@ impl MdEditorApp {
         // Only a user-originated WebView scroll is allowed to drive the editor.
         // Page reloads and scrollTo calls also emit browser scroll events; treating
         // those as input would make both panes repeatedly pull each other around.
+        if let Some(anchor) = self.browser_preview.take_user_scroll_anchor() {
+            let source_position = anchor.source_position;
+            self.preview_source_position = source_position;
+            let mut state = editor.state;
+            state.offset.y = editor_offset_for_source_position(editor, &self.text, source_position);
+            state.store(ctx, editor.id);
+            self.prev_editor_ratio = if max_editor > 0.0 {
+                state.offset.y / max_editor
+            } else {
+                0.0
+            };
+            self.prev_preview_ratio = self.prev_editor_ratio;
+            return Ok(());
+        }
+
         if let Some(source_position) = self.browser_preview.take_user_source_position() {
             self.preview_source_position = source_position;
             let mut state = editor.state;
@@ -3000,13 +3015,48 @@ impl MdEditorApp {
             .source_position()
             .is_none_or(|preview_position| (preview_position - source_position).abs() > 0.1);
         if force_preview || editor_changed || preview_out_of_sync {
-            self.browser_preview
-                .scroll_to_source_position(source_position, !force_preview)?;
+            if let Some(anchor) = self.block_anchor_for_source(source_position) {
+                self.browser_preview
+                    .scroll_to_block_anchor(&anchor, !force_preview)?;
+            } else {
+                self.browser_preview
+                    .scroll_to_source_position(source_position, !force_preview)?;
+            }
         }
         self.preview_source_position = source_position;
         self.prev_editor_ratio = editor_ratio;
         self.prev_preview_ratio = editor_ratio;
         Ok(())
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    fn block_anchor_for_source(&self, source_position: f32) -> Option<web_preview::ScrollAnchor> {
+        let source = &self.text;
+        let line_at = |byte: usize| {
+            source
+                .as_bytes()
+                .get(..byte.min(source.len()))
+                .unwrap_or_default()
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count() as f32
+        };
+        let index = self
+            .document
+            .block_index()
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| line_at(entry.source_range.start) <= source_position)
+            .map(|(index, _)| index)
+            .next_back()?;
+        let entry = &self.document.block_index()[index];
+        let start = line_at(entry.source_range.start);
+        let end = line_at(entry.source_range.end).max(start + 1.0);
+        Some(web_preview::ScrollAnchor {
+            block_id: entry.id,
+            offset: ((source_position - start) / (end - start)).clamp(0.0, 1.0),
+            source_position,
+        })
     }
 
     fn conflict_window(&mut self, ctx: &egui::Context) {
@@ -3580,12 +3630,16 @@ impl eframe::App for MdEditorApp {
                         self.pending_preview_restore =
                             Some((self.id, self.preview_source_position));
                     }
-                    if self.view_mode == ViewMode::Preview
-                        && let Some(source_position) =
+                    if self.view_mode == ViewMode::Preview {
+                        if let Some(anchor) = self.browser_preview.take_user_scroll_anchor() {
+                            self.preview_source_position = anchor.source_position;
+                            self.pending_preview_restore = None;
+                        } else if let Some(source_position) =
                             self.browser_preview.take_user_source_position()
-                    {
-                        self.preview_source_position = source_position;
-                        self.pending_preview_restore = None;
+                        {
+                            self.preview_source_position = source_position;
+                            self.pending_preview_restore = None;
+                        }
                     }
                     if let Some(index) = preview_heading_target.take() {
                         match self.browser_preview.scroll_to_heading(index) {

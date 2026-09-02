@@ -79,6 +79,7 @@ struct BodyPatch {
     insert_count: usize,
     old_block_count: usize,
     anchor_map: Vec<Option<usize>>,
+    block_ids: Vec<u64>,
 }
 
 impl PreviewDocument {
@@ -204,6 +205,10 @@ impl PreviewDocument {
             insert_count: new_len - start - suffix,
             old_block_count: old_len,
             anchor_map,
+            block_ids: next.blocks[start..start + (new_len - start - suffix)]
+                .iter()
+                .map(|block| block.block_id)
+                .collect(),
         })
     }
 }
@@ -212,8 +217,17 @@ impl PreviewDocument {
 struct ScrollBridge {
     source_position: Option<f32>,
     user_source_position: Option<f32>,
+    user_anchor: Option<ScrollAnchor>,
     dropped_paths: Vec<PathBuf>,
     ready: Option<WebViewReady>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollAnchor {
+    pub block_id: u64,
+    /// Normalized position inside the block (0 = top, 1 = bottom).
+    pub offset: f32,
+    pub source_position: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +267,60 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
       if (match) anchorCache.push({ source: Number(match[1]), node: walker.currentNode });
     }
     return anchorCache;
+  };
+
+  const blockMarkers = () => {
+    const result = new Map();
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
+    while (walker.nextNode()) {
+      const match = /^md-block:(\d+)$/.exec(walker.currentNode.nodeValue || '');
+      if (match) result.set(match[1], walker.currentNode);
+    }
+    return result;
+  };
+
+  const elementAfter = (node) => {
+    let sibling = node?.nextSibling;
+    while (sibling && sibling.nodeType !== Node.ELEMENT_NODE) sibling = sibling.nextSibling;
+    return sibling;
+  };
+
+  const replaceBlock = (id, html, sourceStart) => {
+    const marker = blockMarkers().get(String(id));
+    const element = elementAfter(marker);
+    if (!marker || !element) return false;
+    const template = document.createElement('template');
+    template.innerHTML = String(html || '');
+    const range = document.createRange();
+    range.selectNode(element);
+    range.deleteContents();
+    range.insertNode(template.content.cloneNode(true));
+    let source = marker.previousSibling;
+    while (source && source.nodeType !== Node.COMMENT) source = source.previousSibling;
+    if (source && /^md-source:[0-9.]+$/.test(source.nodeValue || '') && Number.isFinite(Number(sourceStart))) {
+      source.nodeValue = `md-source:${sourceStart}`;
+    }
+    anchorCache = null;
+    return true;
+  };
+
+  window.__mdEditorReplaceBlock = replaceBlock;
+
+  const blockAnchorForY = (y) => {
+    const markers = [...blockMarkers().entries()];
+    let selected = null;
+    for (const [blockId, marker] of markers) {
+      const element = elementAfter(marker);
+      if (!element) continue;
+      const top = Math.max(0, element.getBoundingClientRect().top + window.scrollY);
+      if (top <= y + 1) {
+        const height = Math.max(1, element.getBoundingClientRect().height);
+        selected = { blockId, offset: Math.min(1, Math.max(0, (y - top) / height)) };
+      } else if (selected) {
+        break;
+      }
+    }
+    return selected;
   };
 
   const maxScroll = () => Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
@@ -303,6 +371,8 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   };
 
   const captureViewportAnchor = () => {
+    const block = blockAnchorForY(window.scrollY);
+    if (block) return { ...block, source: sourceForY(window.scrollY) };
     const list = anchors();
     if (!list.length) return null;
     let index = 0;
@@ -315,6 +385,16 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
 
   const restoreViewportAnchor = (saved, patch = null) => {
     if (!saved) return false;
+    if (saved.blockId !== undefined) {
+      const marker = blockMarkers().get(String(saved.blockId));
+      const element = elementAfter(marker);
+      if (element) {
+        const top = element.getBoundingClientRect().top + window.scrollY;
+        const offset = Math.min(1, Math.max(0, Number(saved.offset) || 0));
+        window.scrollTo(0, Math.max(0, top + offset * Math.max(1, element.getBoundingClientRect().height)));
+        return true;
+      }
+    }
     const list = anchors();
     const mappedIndex = mapPatchedAnchorIndex(saved.index, patch, Math.max(0, list.length - 1));
     const anchor = list[Math.min(mappedIndex, Math.max(0, list.length - 1))];
@@ -348,9 +428,15 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   const report = () => {
     scheduled = false;
     const sourcePosition = sourceForY(window.scrollY);
-    window.name = `md-source:${sourcePosition}`;
     const source = performance.now() > suppressUntil ? 'user' : 'program';
-    window.ipc.postMessage(`md-source:${source}:${sourcePosition}`);
+    const block = blockAnchorForY(window.scrollY);
+    if (block) {
+      window.name = `md-anchor:${block.blockId}:${block.offset}:${sourcePosition}`;
+      window.ipc.postMessage(`md-anchor:${source}:${block.blockId}:${block.offset}:${sourcePosition}`);
+    } else {
+      window.name = `md-source:${sourcePosition}`;
+      window.ipc.postMessage(`md-source:${source}:${sourcePosition}`);
+    }
   };
 
   window.__mdEditorSuppressScroll = (milliseconds) => {
@@ -391,6 +477,39 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
       window.scrollTo(0, yForSource(sourcePosition));
     } else if (!animationFrame) {
       animationFrame = window.requestAnimationFrame(animateToTarget);
+    }
+  };
+
+  window.__mdEditorSetBlockAnchor = (blockId, offset, fallbackSource = 0, smooth = true) => {
+    beginNavigation();
+    const marker = blockMarkers().get(String(blockId));
+    const element = elementAfter(marker);
+    const normalizedOffset = Math.min(1, Math.max(0, Number(offset) || 0));
+    if (!element) {
+      window.__mdEditorSetSourcePosition?.(fallbackSource, smooth);
+      return;
+    }
+    const top = element.getBoundingClientRect().top + window.scrollY;
+    targetSource = Number(fallbackSource) || 0;
+    const target = top + normalizedOffset * Math.max(1, element.getBoundingClientRect().height);
+    suppressUntil = performance.now() + (smooth ? 600 : 180);
+    window.name = `md-anchor:${blockId}:${normalizedOffset}:${targetSource}`;
+    if (!smooth) {
+      cancelSourceAnimation();
+      window.scrollTo(0, Math.max(0, target));
+    } else {
+      cancelSourceAnimation();
+      const animate = () => {
+        const distance = target - window.scrollY;
+        if (Math.abs(distance) < 0.75) {
+          window.scrollTo(0, target);
+          animationFrame = 0;
+          return;
+        }
+        window.scrollTo(0, window.scrollY + distance * 0.38);
+        animationFrame = window.requestAnimationFrame(animate);
+      };
+      animationFrame = window.requestAnimationFrame(animate);
     }
   };
 
@@ -461,6 +580,33 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
         );
       } else {
         if (patchRevision !== navigationRevision) return;
+        let idPatched = false;
+        if (patch && Array.isArray(patch.blockIds)
+            && patch.deleteCount === patch.insertCount
+            && patch.blockIds.length === patch.insertCount
+            && patch.blockIds.length > 0) {
+          const ids = patch.blockIds.join(',');
+          const response = await fetch(`/blocks?revision=${encodeURIComponent(revision)}&ids=${encodeURIComponent(ids)}`, { cache: 'no-store' });
+          if (response.ok) {
+            const payload = await response.json();
+            const blocks = Array.isArray(payload) ? payload : payload.blocks;
+            idPatched = Array.isArray(blocks) && blocks.length === patch.blockIds.length
+              && blocks.every((block) => replaceBlock(block.id, block.html, block.sourceStart));
+            if (idPatched) {
+              const sourceAnchors = Array.isArray(payload) ? null : payload.sourceAnchors;
+              if (sourceAnchors) {
+                const refreshed = anchors();
+                for (let index = 0; index < Math.min(refreshed.length, sourceAnchors.length); index += 1) {
+                  refreshed[index].node.nodeValue = `md-source:${sourceAnchors[index]}`;
+                }
+              }
+              blockPatched = true;
+            }
+          }
+        }
+        if (idPatched) {
+          if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+        } else {
         const blockQuery = patch
           ? `&start=${encodeURIComponent(patch.start)}&count=${encodeURIComponent(patch.insertCount)}`
           : '';
@@ -501,6 +647,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
           await replaceBody(revision);
         }
         if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+        }
       }
       await document.fonts.ready;
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -925,6 +1072,16 @@ impl BrowserPreview {
                             bridge.ready = Some(ready);
                         }
                         ipc_repaint_ctx.request_repaint();
+                    } else if let Some((anchor, user_initiated)) =
+                        parse_anchor_message(request.body())
+                    {
+                        if let Ok(mut bridge) = scroll_bridge.lock() {
+                            bridge.source_position = Some(anchor.source_position);
+                            if user_initiated {
+                                bridge.user_anchor = Some(anchor);
+                            }
+                        }
+                        ipc_repaint_ctx.request_repaint();
                     } else if let Some((source_position, user_initiated)) =
                         parse_source_message(request.body())
                     {
@@ -996,6 +1153,7 @@ impl BrowserPreview {
                             "insertCount": patch.insert_count,
                             "oldBlockCount": patch.old_block_count,
                             "anchorMap": patch.anchor_map,
+                            "blockIds": patch.block_ids,
                         })
                     })
                     .map(|patch| patch.to_string())
@@ -1038,6 +1196,7 @@ impl BrowserPreview {
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             bridge.source_position = None;
             bridge.user_source_position = None;
+            bridge.user_anchor = None;
             bridge.ready = None;
         }
     }
@@ -1133,6 +1292,13 @@ impl BrowserPreview {
             .and_then(|mut bridge| bridge.user_source_position.take())
     }
 
+    pub fn take_user_scroll_anchor(&mut self) -> Option<ScrollAnchor> {
+        self.scroll_bridge
+            .lock()
+            .ok()
+            .and_then(|mut bridge| bridge.user_anchor.take())
+    }
+
     pub fn take_dropped_paths(&mut self) -> Vec<PathBuf> {
         self.scroll_bridge
             .lock()
@@ -1190,6 +1356,25 @@ impl BrowserPreview {
                 if smooth { "true" } else { "false" }
             ))
             .map_err(|error| format!("无法同步预览滚动位置：{error}"))
+    }
+
+    pub fn scroll_to_block_anchor(
+        &self,
+        anchor: &ScrollAnchor,
+        smooth: bool,
+    ) -> Result<(), String> {
+        let Some(webview) = &self.webview else {
+            return Err("浏览器预览尚未就绪".to_string());
+        };
+        webview
+            .evaluate_script(&format!(
+                "window.__mdEditorSetBlockAnchor?.({}, {:.8}, {:.8}, {});",
+                anchor.block_id,
+                anchor.offset.clamp(0.0, 1.0),
+                anchor.source_position.max(0.0),
+                if smooth { "true" } else { "false" }
+            ))
+            .map_err(|error| format!("无法同步预览块位置：{error}"))
     }
 
     pub fn set_body_font_size(&mut self, size: f32, base_size: f32) -> Result<(), String> {
@@ -1258,6 +1443,28 @@ fn parse_source_message(message: &str) -> Option<(f32, bool)> {
         "program" => Some((source_position, false)),
         _ => None,
     }
+}
+
+fn parse_anchor_message(message: &str) -> Option<(ScrollAnchor, bool)> {
+    let mut parts = message.split(':');
+    if parts.next()? != "md-anchor" {
+        return None;
+    }
+    let source = parts.next()?;
+    if !matches!(source, "user" | "program") {
+        return None;
+    }
+    let block_id = parts.next()?.parse::<u64>().ok()?;
+    let offset = parts.next()?.parse::<f32>().ok()?.clamp(0.0, 1.0);
+    let source_position = parts.next()?.parse::<f32>().ok()?.max(0.0);
+    parts.next().is_none().then_some((
+        ScrollAnchor {
+            block_id,
+            offset,
+            source_position,
+        },
+        source == "user",
+    ))
 }
 
 fn parse_ready_message(message: &str) -> Option<WebViewReady> {
@@ -2554,20 +2761,39 @@ fn preview_document_response(
                     .map(|body| body.as_bytes().to_vec())
             } else if path == "/blocks" {
                 (!payload.blocks.is_empty()).then(|| {
-                    let start = query_value("start")
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap_or(0)
-                        .min(payload.blocks.len());
-                    let count = query_value("count")
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .unwrap_or(payload.blocks.len().saturating_sub(start));
-                    let blocks = payload
-                        .blocks
+                    let requested_ids = query_value("ids").map(|value| {
+                        value
+                            .split(',')
+                            .filter_map(|id| id.parse::<u64>().ok())
+                            .collect::<Vec<_>>()
+                    });
+                    let blocks = if let Some(requested_ids) = requested_ids {
+                        requested_ids
+                            .iter()
+                            .filter_map(|id| {
+                                payload.blocks.iter().find(|block| block.block_id == *id)
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        let start = query_value("start")
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or(0)
+                            .min(payload.blocks.len());
+                        let count = query_value("count")
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .unwrap_or(payload.blocks.len().saturating_sub(start));
+                        payload
+                            .blocks
+                            .iter()
+                            .skip(start)
+                            .take(count)
+                            .collect::<Vec<_>>()
+                    };
+                    let blocks = blocks
                         .iter()
-                        .skip(start)
-                        .take(count)
                         .map(|block| {
                             serde_json::json!({
+                                "id": block.block_id,
                                 "html": block.html.as_ref(),
                                 "sourceStart": block.source_start,
                                 "sourceEnd": block.source_end,
@@ -2976,8 +3202,8 @@ mod tests {
         JB_MONO_BOLD_WOFF, JB_MONO_REGULAR_WOFF, LXGW_WENKAI_MEDIUM_WOFF, LXGW_WENKAI_REGULAR_WOFF,
         MERMAID_BOOTSTRAP, SCROLL_SYNC_SCRIPT, VIRTUAL_PREVIEW_SCRIPT,
         custom_protocol_script_source, custom_protocol_url, document, local_image_response,
-        local_image_url, parse_ready_message, parse_source_message, preview_asset_response,
-        source_line_at_byte, source_line_starts,
+        local_image_url, parse_anchor_message, parse_ready_message, parse_source_message,
+        preview_asset_response, source_line_at_byte, source_line_starts,
     };
     use wry::http::Request;
 
@@ -3022,6 +3248,7 @@ mod tests {
         let bridge = preview.scroll_bridge.lock().expect("scroll bridge");
         assert_eq!(bridge.source_position, None);
         assert_eq!(bridge.user_source_position, None);
+        assert_eq!(bridge.user_anchor, None);
     }
 
     #[test]
@@ -3542,6 +3769,19 @@ mod tests {
             body["sourceAnchors"].as_array().unwrap().len(),
             document.blocks.len() + 1
         );
+
+        let requested_id = parsed.block_index()[2].id;
+        let request = Request::builder()
+            .uri(format!(
+                "https://mdpreview.localhost/blocks?revision={:016x}&ids={requested_id}",
+                document.hash
+            ))
+            .body(Vec::new())
+            .expect("ID blocks request");
+        let response = super::preview_document_response(request, &payload);
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(response.body()).expect("blocks JSON");
+        assert_eq!(body["blocks"][0]["id"].as_u64(), Some(requested_id));
     }
 
     #[test]
@@ -3617,6 +3857,17 @@ mod tests {
             Some((14.25, false))
         );
         assert_eq!(parse_source_message("other:user:0.5"), None);
+        assert_eq!(
+            parse_anchor_message("md-anchor:user:42:0.375:625.5"),
+            Some((
+                super::ScrollAnchor {
+                    block_id: 42,
+                    offset: 0.375,
+                    source_position: 625.5,
+                },
+                true,
+            ))
+        );
         assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorSetSourcePosition"));
         assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorSetFontSize"));
         assert!(SCROLL_SYNC_SCRIPT.contains("--md-body-font-size"));
@@ -3625,6 +3876,8 @@ mod tests {
         assert!(SCROLL_SYNC_SCRIPT.contains("distance * 0.38"));
         assert!(SCROLL_SYNC_SCRIPT.contains("cancelAnimationFrame"));
         assert!(SCROLL_SYNC_SCRIPT.contains("requestAnimationFrame(report)"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorReplaceBlock"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("__mdEditorSetBlockAnchor"));
         let ready = parse_ready_message("md-ready:8400.5:720:1234").unwrap();
         assert_eq!(ready.content_height, 8400.5);
         assert_eq!(ready.viewport_height, 720.0);
