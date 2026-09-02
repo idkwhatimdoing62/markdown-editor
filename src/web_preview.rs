@@ -1265,6 +1265,13 @@ impl BrowserPreview {
         }
         if source_changed {
             if patch_document {
+                let block_ids = body_patch.as_ref().map(|patch| {
+                    patch
+                        .block_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                });
                 let patch_json = body_patch
                     .as_ref()
                     .map(|patch| {
@@ -1274,7 +1281,7 @@ impl BrowserPreview {
                             "insertCount": patch.insert_count,
                             "oldBlockCount": patch.old_block_count,
                             "anchorMap": patch.anchor_map,
-                            "blockIds": patch.block_ids,
+                            "blockIds": block_ids,
                         })
                     })
                     .map(|patch| patch.to_string())
@@ -1487,10 +1494,12 @@ impl BrowserPreview {
         let Some(webview) = &self.webview else {
             return Err("浏览器预览尚未就绪".to_string());
         };
+        let block_id = serde_json::to_string(&anchor.block_id.to_string())
+            .map_err(|error| format!("无法编码预览块 ID：{error}"))?;
         webview
             .evaluate_script(&format!(
                 "window.__mdEditorSetBlockAnchor?.({}, {:.8}, {:.8}, {});",
-                anchor.block_id,
+                block_id,
                 anchor.offset.clamp(0.0, 1.0),
                 anchor.source_position.max(0.0),
                 if smooth { "true" } else { "false" }
