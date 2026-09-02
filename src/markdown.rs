@@ -1,6 +1,5 @@
 //! 把 Markdown 解析为可渲染的块模型。
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -9,156 +8,12 @@ use std::ops::Range;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-const STRONG_BOUNDARY: &str = "<!--md-strong-boundary-->";
 
 pub fn parse_options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
-}
-
-/// Make a frequent authoring typo render as intended without changing the source text.
-///
-/// CommonMark does not treat `**text **` as strong emphasis because whitespace appears
-/// immediately before the closing delimiter. Move that whitespace behind the delimiter,
-/// while leaving fenced and inline code untouched.
-pub fn normalize_compat_markdown(markdown: &str) -> Cow<'_, str> {
-    let mut output: Option<String> = None;
-    let mut source_offset = 0;
-    let mut fence: Option<(u8, usize)> = None;
-
-    for line_with_ending in markdown.split_inclusive('\n') {
-        let (line, ending) = line_with_ending
-            .strip_suffix('\n')
-            .map_or((line_with_ending, ""), |line| (line, "\n"));
-        let marker = fence_marker(line);
-
-        if let Some((fence_char, fence_len)) = fence {
-            if let Some(output) = &mut output {
-                output.push_str(line);
-                output.push_str(ending);
-            }
-            if marker.is_some_and(|(ch, len)| ch == fence_char && len >= fence_len) {
-                fence = None;
-            }
-            source_offset += line_with_ending.len();
-            continue;
-        }
-
-        if let Some(opening) = marker {
-            fence = Some(opening);
-            if let Some(output) = &mut output {
-                output.push_str(line);
-                output.push_str(ending);
-            }
-            source_offset += line_with_ending.len();
-            continue;
-        }
-
-        let normalized = normalize_strong_whitespace_in_line(line);
-        if matches!(normalized, Cow::Owned(_)) && output.is_none() {
-            let mut initialized = String::with_capacity(markdown.len());
-            initialized.push_str(&markdown[..source_offset]);
-            output = Some(initialized);
-        }
-        if let Some(output) = &mut output {
-            output.push_str(&normalized);
-            output.push_str(ending);
-        }
-        source_offset += line_with_ending.len();
-    }
-
-    match output {
-        Some(output) => Cow::Owned(output),
-        None => Cow::Borrowed(markdown),
-    }
-}
-
-fn fence_marker(line: &str) -> Option<(u8, usize)> {
-    let trimmed = line.trim_start();
-    let marker = *trimmed.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
-    }
-    let count = trimmed.bytes().take_while(|byte| *byte == marker).count();
-    (count >= 3).then_some((marker, count))
-}
-
-fn normalize_strong_whitespace_in_line(line: &str) -> Cow<'_, str> {
-    let bytes = line.as_bytes();
-    if !bytes.windows(2).any(|window| window == b"**") {
-        return Cow::Borrowed(line);
-    }
-    let mut output = String::with_capacity(line.len());
-    let mut index = 0;
-    let mut inline_code_ticks: Option<usize> = None;
-    let mut strong_content_start: Option<usize> = None;
-    let mut changed = false;
-
-    while index < bytes.len() {
-        if bytes[index] == b'`' {
-            let count = bytes[index..]
-                .iter()
-                .take_while(|byte| **byte == b'`')
-                .count();
-            match inline_code_ticks {
-                Some(opening) if opening == count => inline_code_ticks = None,
-                None => inline_code_ticks = Some(count),
-                _ => {}
-            }
-            output.push_str(&line[index..index + count]);
-            index += count;
-            continue;
-        }
-
-        if inline_code_ticks.is_none() && bytes[index..].starts_with(b"**") {
-            if let Some(content_start) = strong_content_start.take() {
-                let trailing_bytes = output[content_start..]
-                    .chars()
-                    .rev()
-                    .take_while(|ch| matches!(ch, ' ' | '\t'))
-                    .map(char::len_utf8)
-                    .sum::<usize>();
-                if trailing_bytes > 0 && output.len() > content_start + trailing_bytes {
-                    let whitespace = output.split_off(output.len() - trailing_bytes);
-                    output.push_str("**");
-                    output.push_str(&whitespace);
-                    changed = true;
-                    index += 2;
-                    continue;
-                }
-                output.push_str("**");
-                index += 2;
-                if index < bytes.len()
-                    && !line[index..]
-                        .chars()
-                        .next()
-                        .expect("valid UTF-8 boundary")
-                        .is_whitespace()
-                {
-                    output.push_str(STRONG_BOUNDARY);
-                    changed = true;
-                }
-                continue;
-            } else {
-                strong_content_start = Some(output.len() + 2);
-            }
-            output.push_str("**");
-            index += 2;
-            continue;
-        }
-
-        let ch = line[index..].chars().next().expect("valid UTF-8 boundary");
-        output.push(ch);
-        index += ch.len_utf8();
-    }
-
-    if changed {
-        Cow::Owned(output)
-    } else {
-        Cow::Borrowed(line)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -213,7 +68,6 @@ pub enum Block {
 #[derive(Debug, Clone)]
 pub struct ParsedDocument {
     source: String,
-    normalized: Option<String>,
     blocks: Vec<Block>,
     events: Vec<SpannedEvent>,
     block_index: Vec<BlockIndexEntry>,
@@ -242,10 +96,6 @@ pub struct SpannedEvent {
 impl ParsedDocument {
     pub fn source(&self) -> &str {
         &self.source
-    }
-
-    pub fn normalized_source(&self) -> &str {
-        self.normalized.as_deref().unwrap_or(&self.source)
     }
 
     pub fn blocks(&self) -> &[Block] {
@@ -278,18 +128,10 @@ impl Default for ParsedDocument {
 }
 
 pub fn parse_document(markdown: &str) -> ParsedDocument {
-    let normalized = normalize_compat_markdown(markdown);
-    let normalized_source = normalized.as_ref();
-    let mut document = parse_normalized_document(normalized_source);
-    document.source = markdown.to_string();
-    document.normalized = match normalized {
-        Cow::Borrowed(_) => None,
-        Cow::Owned(value) => Some(value),
-    };
-    document
+    parse_source_document(markdown)
 }
 
-fn parse_normalized_document(markdown: &str) -> ParsedDocument {
+fn parse_source_document(markdown: &str) -> ParsedDocument {
     let events = Parser::new_ext(markdown, parse_options())
         .into_offset_iter()
         .map(|(event, range)| SpannedEvent {
@@ -305,7 +147,6 @@ fn parse_normalized_document(markdown: &str) -> ParsedDocument {
     let block_index = build_block_index(&blocks, &events);
     ParsedDocument {
         source: markdown.to_string(),
-        normalized: None,
         blocks,
         events,
         block_index,
@@ -441,17 +282,11 @@ pub fn parse_document_incremental(
     if previous.source == markdown {
         return Some(previous.clone());
     }
-    let normalized = normalize_compat_markdown(markdown);
-    let next_normalized = match normalized {
-        Cow::Borrowed(_) => None,
-        Cow::Owned(value) => Some(value),
-    };
-    let next_source = next_normalized.as_deref().unwrap_or(markdown);
-    let previous_source = previous.normalized_source();
+    let next_source = markdown;
+    let previous_source = previous.source();
     if previous_source == next_source {
         let mut next = previous.clone();
         next.source = markdown.to_string();
-        next.normalized = next_normalized;
         return Some(next);
     }
     let old = previous_source.as_bytes();
@@ -511,7 +346,6 @@ pub fn parse_document_incremental(
             let blocks = previous.blocks.clone();
             let mut next = ParsedDocument {
                 source: markdown.to_string(),
-                normalized: next_normalized.clone(),
                 block_index: build_block_index(&blocks, &events),
                 blocks,
                 events,
@@ -569,7 +403,7 @@ pub fn parse_document_incremental(
         let reparsed_source = (old_blocks_safe
             && new_window_end >= old_window_start
             && new_window_end <= next_source.len())
-        .then(|| parse_normalized_document(&next_source[old_window_start..new_window_end]));
+        .then(|| parse_source_document(&next_source[old_window_start..new_window_end]));
         let valid = reparsed_source.as_ref().is_some_and(|reparsed| {
             let source = &next_source[old_window_start..new_window_end];
             (source.is_empty() || !reparsed.blocks.is_empty())
@@ -629,7 +463,6 @@ pub fn parse_document_incremental(
     let block_index = build_block_index(&blocks, &events);
     let mut next = ParsedDocument {
         source: markdown.to_string(),
-        normalized: next_normalized,
         blocks,
         events,
         block_index,
@@ -715,7 +548,7 @@ fn local_window_boundary_is_safe(
 
     // An unterminated fence can only be closed by text outside the local
     // window. Treat that as ambiguous and let the adaptive loop expand.
-    if has_unclosed_fence(reparsed.normalized_source()) {
+    if has_unclosed_fence(reparsed.source()) {
         return false;
     }
     let Some(last_block) = reparsed.blocks.last() else {
@@ -933,7 +766,6 @@ impl Builder {
             Event::TaskListMarker(checked) => {
                 self.text(if checked { "[x] " } else { "[ ] " }.to_string())
             }
-            Event::Html(h) if h.as_ref() == STRONG_BOUNDARY => {}
             Event::Html(h) => match self.stack.last_mut() {
                 Some(Frame::Raw { text }) | Some(Frame::Code { text, .. }) => text.push_str(&h),
                 _ => self.text(h.to_string()),
@@ -1459,17 +1291,17 @@ mod tests {
     }
 
     #[test]
-    fn incremental_parse_reuses_normalized_document_context() {
+    fn incremental_parse_uses_source_without_compat_normalization() {
         let previous = parse_document("- **识别与生成：**区分植物\n\n后文\n");
-        assert!(previous.normalized.is_some());
+        assert_eq!(previous.source(), "- **识别与生成：**区分植物\n\n后文\n");
         let next_source = "- **识别与生成：**区分植物和动物\n\n后文\n";
         let next = parse_document_incremental(&previous, next_source)
-            .expect("normalized Markdown edits should stay incremental");
+            .expect("ordinary Markdown edits should stay incremental");
         let full = parse_document(next_source);
 
         assert_eq!(next.blocks(), full.blocks());
         assert_eq!(next.events(), full.events());
-        assert_eq!(next.normalized_source(), full.normalized_source());
+        assert_eq!(next.source(), full.source());
     }
 
     #[test]
@@ -1628,35 +1460,6 @@ mod tests {
         let mut counts = StructureCounts::default();
         visit_blocks(blocks, &mut counts);
         counts
-    }
-
-    #[test]
-    fn moves_whitespace_behind_strong_closing_delimiter() {
-        let source = "1. **结构层： **训练一个统一的纹样 LoRA。";
-        assert_eq!(
-            normalize_compat_markdown(source),
-            "1. **结构层：** 训练一个统一的纹样 LoRA。"
-        );
-    }
-
-    #[test]
-    fn leaves_strong_markers_inside_code_unchanged() {
-        let source = "`**inline **`\n\n```text\n**fenced **\n```\n";
-        assert!(matches!(
-            normalize_compat_markdown(source),
-            Cow::Borrowed(_)
-        ));
-    }
-
-    #[test]
-    fn inserts_an_invisible_boundary_for_adjacent_chinese_text() {
-        let source = "- **识别与生成：**区分植物";
-        assert_eq!(
-            normalize_compat_markdown(source),
-            "- **识别与生成：**<!--md-strong-boundary-->区分植物"
-        );
-        let blocks = parse(source);
-        assert_eq!(plain_text(&blocks), "识别与生成：区分植物");
     }
 
     #[test]

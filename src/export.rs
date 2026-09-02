@@ -125,8 +125,8 @@ fn compact_html_between_tags(html: &str) -> String {
 
 /// Prepare browser HTML for printpdf's smaller HTML/CSS parser.
 ///
-/// The browser preview can safely use `<strong>`/`<b>` and the parser marker
-/// emitted by `markdown.rs`. printpdf 0.12.x mishandles those inline elements:
+/// The browser preview can safely use `<strong>`/`<b>`. printpdf 0.12.x
+/// mishandles those inline elements:
 /// it keeps the emphasized word but drops the rest of the paragraph (and can
 /// stop laying out following blocks). A class-based span has the same visual
 /// intent and is handled correctly by printpdf, so this conversion is kept
@@ -134,7 +134,6 @@ fn compact_html_between_tags(html: &str) -> String {
 /// unchanged.
 fn pdf_safe_html(html: &str) -> String {
     compact_html_between_tags(html)
-        .replace("<!--md-strong-boundary-->", "")
         .replace("<strong>", "<span class=\"md-pdf-strong\">")
         .replace("</strong>", "</span>")
         .replace("<b>", "<span class=\"md-pdf-strong\">")
@@ -533,11 +532,10 @@ mod tests {
     }
 
     #[test]
-    fn compatible_strong_markup_is_exported_as_strong_html() {
+    fn strong_markup_with_trailing_space_remains_literal() {
         let document = parsed("1. **结构层： **训练一个统一的纹样 LoRA。");
         let html = render_html(&document);
-        assert!(html.contains("<strong>结构层：</strong> 训练一个统一的纹样 LoRA。"));
-        assert!(!html.contains("**结构层"));
+        assert!(html.contains("**结构层： **训练一个统一的纹样 LoRA。"));
     }
 
     #[test]
@@ -595,23 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn pdf输入移除浏览器专用边界注释() {
-        let html = "<p><strong>说明</strong><!--md-strong-boundary-->：正文</p>";
-        assert_eq!(
-            compact_html_between_tags(html).replace("<!--md-strong-boundary-->", ""),
-            "<p><strong>说明</strong>：正文</p>"
-        );
-    }
-
-    #[test]
     fn pdf输入将强调转换为兼容的span且保留后续正文() {
-        let safe = pdf_safe_html(
-            "<p><strong>说明</strong><!--md-strong-boundary-->：正文。</p><p>后文。</p>",
-        );
+        let safe = pdf_safe_html("<p><strong>说明</strong>：正文。</p><p>后文。</p>");
         assert!(safe.contains("<span class=\"md-pdf-strong\">说明</span>：正文。</p>"));
         assert!(safe.contains("<p>后文。</p>"));
         assert!(!safe.contains("<strong>"));
-        assert!(!safe.contains("md-strong-boundary"));
     }
 
     #[test]

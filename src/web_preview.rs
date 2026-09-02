@@ -1772,7 +1772,7 @@ fn document_with_block_ids(
     dark_mode_css: Option<&str>,
     block_ids: &[u64],
 ) -> String {
-    let markdown = document.normalized_source();
+    let markdown = document.source();
     let line_starts = source_line_starts(markdown);
     let has_mermaid = document.has_mermaid();
     let mut heading_index = 0usize;
@@ -2372,9 +2372,7 @@ fn render_incremental_block_content(
     if matches!(document.blocks()[index], crate::markdown::Block::Raw(_)) {
         return None;
     }
-    if slice.source_start > slice.source_end
-        || slice.source_end > document.normalized_source().len()
-    {
+    if slice.source_start > slice.source_end || slice.source_end > document.source().len() {
         return None;
     }
     let mut events = Vec::new();
@@ -2836,7 +2834,7 @@ fn source_markers(html: &str) -> Vec<f32> {
 }
 
 fn document_source_anchors(document: &crate::markdown::ParsedDocument) -> Vec<f32> {
-    let markdown = document.normalized_source();
+    let markdown = document.source();
     let line_starts = source_line_starts(markdown);
     let mut anchors = vec![0.0];
     let mut block_depth = 0usize;
@@ -4591,16 +4589,15 @@ mod tests {
     }
 
     #[test]
-    fn compatible_strong_markup_uses_the_bold_font_face() {
+    fn strong_markup_with_trailing_space_remains_literal() {
         let html = render_document("1. **结构层： **训练一个统一的纹样 LoRA。", "", None, None);
-        assert!(html.contains("<strong>结构层：</strong> 训练一个统一的纹样 LoRA。"));
+        assert!(html.contains("**结构层： **训练一个统一的纹样 LoRA。"));
         assert!(html.contains("font-weight:500;font-display:block"));
         assert!(html.contains("strong,b{font-weight:800!important;}"));
-        assert!(!html.contains("**结构层"));
     }
 
     #[test]
-    fn standard_strong_markup_next_to_chinese_text_is_rendered() {
+    fn strong_markup_adjacent_to_chinese_text_remains_literal() {
         let html = render_document(
             "- **识别与生成：**区分植物、动物、几何和复合纹样；",
             "",
@@ -4608,10 +4605,9 @@ mod tests {
             None,
         );
         assert!(
-            html.contains("<strong>识别与生成：</strong><!--md-strong-boundary-->区分植物"),
+            html.contains("**识别与生成：**区分植物"),
             "generated HTML: {html}"
         );
-        assert!(!html.contains("**识别与生成"));
     }
 
     #[test]
