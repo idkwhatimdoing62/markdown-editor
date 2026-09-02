@@ -1911,6 +1911,100 @@ pub fn preview_document_with_previous(
 /// and browser state stable; callers must provide the parsed document that
 /// produced `previous` so block identity can be compared without rendering
 /// every block again.
+fn preview_document_incremental_variable(
+    previous_preview: &PreviewDocument,
+    previous_document: &crate::markdown::ParsedDocument,
+    document: &crate::markdown::ParsedDocument,
+    base_directory: Option<&Path>,
+) -> Option<PreviewDocument> {
+    let body_range = previous_preview.body_range?;
+    if previous_preview.virtual_manifest.is_some()
+        || previous_preview.has_mermaid != document.has_mermaid()
+        || heading_count(previous_document.blocks()) != heading_count(document.blocks())
+        || previous_preview.blocks.len() != previous_document.blocks().len() + 1
+    {
+        return None;
+    }
+
+    let old_blocks = previous_document.blocks();
+    let new_blocks = document.blocks();
+    let common = old_blocks.len().min(new_blocks.len());
+    let prefix = old_blocks
+        .iter()
+        .zip(new_blocks)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let mut suffix = 0usize;
+    while suffix < old_blocks.len().saturating_sub(prefix)
+        && suffix < new_blocks.len().saturating_sub(prefix)
+        && old_blocks[old_blocks.len() - 1 - suffix] == new_blocks[new_blocks.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    if prefix == common && old_blocks.len() == new_blocks.len() {
+        return preview_document_with_previous(Some(previous_preview), document);
+    }
+
+    let old_changed_end = old_blocks.len().saturating_sub(suffix);
+    let new_changed_end = new_blocks.len().saturating_sub(suffix);
+    let old_window_start = prefix.saturating_sub(1);
+    let old_window_end = (old_changed_end + 1).min(old_blocks.len());
+    let new_window_start = prefix.saturating_sub(1).min(new_blocks.len());
+    let new_window_end = (new_changed_end + 1).min(new_blocks.len());
+    if old_blocks[old_window_start..old_window_end]
+        .iter()
+        .any(|block| !simple_block_pair(block, block))
+        || new_blocks[new_window_start..new_window_end]
+            .iter()
+            .any(|block| !simple_block_pair(block, block))
+    {
+        return None;
+    }
+
+    let slices = top_level_event_slices(document)?;
+    if slices.len() != new_blocks.len() {
+        return None;
+    }
+    let anchors = document_source_anchors(document);
+    if anchors.len() != new_blocks.len() + 2 {
+        return None;
+    }
+    let block_ids = stable_top_level_block_ids(document);
+    let mut body = String::new();
+    body.push_str(&previous_preview.blocks.first()?.html);
+    for index in 0..old_window_start {
+        body.push_str(&previous_preview.blocks.get(index + 1)?.html);
+    }
+    for index in new_window_start..new_window_end {
+        body.push_str(&render_incremental_block(
+            document,
+            index,
+            &slices[index],
+            anchors[index + 1],
+            block_ids[index],
+            base_directory,
+        )?);
+    }
+    for index in old_window_end..old_blocks.len() {
+        body.push_str(&previous_preview.blocks.get(index + 1)?.html);
+    }
+    body.push_str(&source_anchor(*anchors.last()?));
+
+    let mut html = String::with_capacity(previous_preview.shell.len() + body.len());
+    html.push_str(&previous_preview.shell[..body_range.0]);
+    html.push_str(&body);
+    html.push_str(&previous_preview.shell[body_range.1..]);
+    let html = replace_source_markers(&html, &anchors);
+    if requires_virtualization(&html) {
+        return None;
+    }
+    let mut preview = virtualize_document(html);
+    preview.block_fingerprint = block_fingerprint(document);
+    preview.block_ids = block_ids.into();
+    preview.block_index = enriched_block_index(document, &preview);
+    Some(preview)
+}
+
 pub fn preview_document_incremental(
     previous_preview: Option<&PreviewDocument>,
     previous_document: Option<&crate::markdown::ParsedDocument>,
@@ -1919,6 +2013,14 @@ pub fn preview_document_incremental(
 ) -> Option<PreviewDocument> {
     let previous_preview = previous_preview?;
     let previous_document = previous_document?;
+    if previous_document.blocks().len() != document.blocks().len() {
+        return preview_document_incremental_variable(
+            previous_preview,
+            previous_document,
+            document,
+            base_directory,
+        );
+    }
     let body_range = previous_preview.body_range?;
     if previous_preview.virtual_manifest.is_some()
         || previous_preview.has_mermaid != document.has_mermaid()
@@ -3665,6 +3767,44 @@ mod tests {
             None,
         )
         .expect("simple block edit should reuse the preview shell");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_supports_inserting_a_top_level_block() {
+        let first_document = crate::markdown::parse_document("# 一\n\n甲\n\n乙\n");
+        let next_document = crate::markdown::parse_document("# 一\n\n甲\n\n新增\n\n乙\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("inserting a paragraph should patch the preview locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_supports_deleting_a_top_level_block() {
+        let first_document = crate::markdown::parse_document("# 一\n\n甲\n\n删除\n\n乙\n");
+        let next_document = crate::markdown::parse_document("# 一\n\n甲\n\n乙\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("deleting a paragraph should patch the preview locally");
         let full = super::preview_document(&next_document, "", None, None, None);
 
         assert_eq!(incremental.shell, full.shell);
