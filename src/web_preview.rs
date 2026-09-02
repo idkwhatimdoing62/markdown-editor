@@ -51,6 +51,9 @@ pub struct PreviewDocument {
     /// position in the document. These IDs are embedded in the preview DOM so
     /// navigation and incremental updates can target a block after edits.
     block_ids: Arc<[u64]>,
+    /// The same shared index carried by `ParsedDocument`, enriched with the
+    /// latest direct-preview height estimates when available.
+    block_index: Arc<[crate::markdown::BlockIndexEntry]>,
 }
 
 const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
@@ -103,6 +106,11 @@ impl PreviewDocument {
     #[allow(dead_code)]
     pub fn top_level_block_ids(&self) -> &[u64] {
         &self.block_ids
+    }
+
+    #[allow(dead_code)]
+    pub fn block_index(&self) -> &[crate::markdown::BlockIndexEntry] {
+        &self.block_index
     }
 
     /// Counts virtual chunks whose identity or rendered content changed.
@@ -1723,6 +1731,7 @@ pub fn preview_document(
     let mut preview = virtualize_document(html);
     preview.block_fingerprint = block_fingerprint(document);
     preview.block_ids = block_ids.into();
+    preview.block_index = enriched_block_index(document, &preview);
     preview
 }
 
@@ -1757,6 +1766,7 @@ pub fn preview_document_placeholder(
         total_bytes: 0,
         block_fingerprint: 0,
         block_ids: Arc::from([]),
+        block_index: Arc::from([]),
     }
 }
 
@@ -1778,6 +1788,7 @@ pub fn preview_document_with_previous(
     let mut preview = virtualize_document(html);
     preview.block_fingerprint = block_fingerprint(document);
     preview.block_ids = reconcile_top_level_block_ids(previous, document).into();
+    preview.block_index = enriched_block_index(document, &preview);
     Some(preview)
 }
 
@@ -1998,7 +2009,7 @@ pub fn preview_document_virtual_incremental(
         .total_bytes
         .saturating_sub(previous_body_bytes)
         .saturating_add(next_body_bytes);
-    Some(PreviewDocument {
+    let mut preview = PreviewDocument {
         shell: shell.into(),
         body_range: None,
         virtual_manifest: Some(manifest.into()),
@@ -2010,7 +2021,10 @@ pub fn preview_document_virtual_incremental(
         total_bytes,
         block_fingerprint: block_fingerprint(document),
         block_ids: block_ids.into(),
-    })
+        block_index: Arc::from([]),
+    };
+    preview.block_index = enriched_block_index(document, &preview);
+    Some(preview)
 }
 
 fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block) -> bool {
@@ -2022,6 +2036,19 @@ fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block)
         (old, new),
         (crate::markdown::Block::Raw(_), _) | (_, crate::markdown::Block::Raw(_))
     ) && std::mem::discriminant(old) == std::mem::discriminant(new)
+}
+
+fn enriched_block_index(
+    document: &crate::markdown::ParsedDocument,
+    preview: &PreviewDocument,
+) -> Arc<[crate::markdown::BlockIndexEntry]> {
+    let mut entries = document.block_index().to_vec();
+    if preview.virtual_manifest.is_none() {
+        for (entry, chunk) in entries.iter_mut().zip(preview.blocks.iter().skip(1)) {
+            entry.rendered_height = chunk.estimated_height;
+        }
+    }
+    entries.into()
 }
 
 fn heading_count(blocks: &[crate::markdown::Block]) -> usize {
@@ -2269,6 +2296,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             total_bytes,
             block_fingerprint: 0,
             block_ids: Arc::from([]),
+            block_index: Arc::from([]),
         };
     };
     let body_start = body_start_tag + "<body>".len();
@@ -2285,6 +2313,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             total_bytes,
             block_fingerprint: 0,
             block_ids: Arc::from([]),
+            block_index: Arc::from([]),
         };
     };
     let body = &html[body_start..body_end];
@@ -2305,6 +2334,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             total_bytes,
             block_fingerprint: 0,
             block_ids: Arc::from([]),
+            block_index: Arc::from([]),
         };
     }
     let mut boundaries = vec![0usize];
@@ -2379,6 +2409,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         total_bytes,
         block_fingerprint: 0,
         block_ids: Arc::from([]),
+        block_index: Arc::from([]),
     }
 }
 
@@ -2418,9 +2449,13 @@ fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
                 source_start: source_marker_at(body, start).unwrap_or(0.0),
                 source_end: source_marker_at(body, end).unwrap_or(0.0),
                 source_anchors: source_markers(&body[start..end]).into(),
-                estimated_height: 0.0,
-                heading_start: None,
-                heading_end: None,
+                estimated_height: ((source_marker_at(body, end).unwrap_or(0.0)
+                    - source_marker_at(body, start).unwrap_or(0.0))
+                .max(1.0)
+                    * 34.0)
+                    .max(96.0),
+                heading_start: heading_bounds(&body[start..end]).map(|bounds| bounds.0),
+                heading_end: heading_bounds(&body[start..end]).map(|bounds| bounds.1),
             })
         })
         .collect()
