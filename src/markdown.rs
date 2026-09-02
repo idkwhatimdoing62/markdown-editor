@@ -355,12 +355,7 @@ pub fn parse_document_incremental(
     }
 
     let ranges = top_level_block_ranges(previous)?;
-    if ranges.len() != previous.blocks.len()
-        || previous
-            .blocks
-            .iter()
-            .any(|block| !is_incremental_block_safe(block))
-    {
+    if ranges.len() != previous.blocks.len() {
         return None;
     }
     let block_index = ranges
@@ -373,42 +368,59 @@ pub fn parse_document_incremental(
     {
         return None;
     }
-    let old_range = &ranges[block_index];
-    let new_block_end = old_range.end.checked_add_signed(delta)?;
-    if new_block_end < old_range.start || new_block_end > markdown.len() {
+    // Reparse the edited block together with its immediate neighbors. This
+    // gives block-level syntax a small amount of context while still keeping
+    // the common edit path local. If either neighbor is a structural block,
+    // the conservative full-parse path below remains the fallback.
+    let window_start = block_index.saturating_sub(1);
+    let window_end = (block_index + 2).min(ranges.len());
+    if ranges[window_start..window_end]
+        .iter()
+        .enumerate()
+        .any(|(offset, _)| !is_incremental_block_safe(&previous.blocks[window_start + offset]))
+    {
         return None;
     }
-    let reparsed = parse_document(&markdown[old_range.start..new_block_end]);
+    let old_window_start = ranges[window_start].start;
+    let old_window_end = ranges[window_end - 1].end;
+    let new_window_end = old_window_end.checked_add_signed(delta)?;
+    if new_window_end < old_window_start || new_window_end > markdown.len() {
+        return None;
+    }
+    let reparsed = parse_document(&markdown[old_window_start..new_window_end]);
     if reparsed.normalized.is_some()
-        || reparsed.blocks.len() != 1
-        || !is_incremental_block_safe(&reparsed.blocks[0])
+        || reparsed.blocks.len() != window_end - window_start
+        || reparsed
+            .blocks
+            .iter()
+            .any(|block| !is_incremental_block_safe(block))
         || reparsed
             .events
             .iter()
-            .any(|item| item.range.end > new_block_end - old_range.start)
+            .any(|item| item.range.end > new_window_end - old_window_start)
     {
         return None;
     }
 
     let mut blocks = previous.blocks.clone();
-    blocks[block_index] = reparsed.blocks[0].clone();
+    blocks.splice(window_start..window_end, reparsed.blocks);
     let mut events = Vec::with_capacity(previous.events.len() + reparsed.events.len());
     events.extend(
         previous
             .events
             .iter()
-            .filter(|item| item.range.end <= old_range.start)
+            .filter(|item| item.range.end <= old_window_start)
             .cloned(),
     );
     events.extend(reparsed.events.into_iter().map(|item| SpannedEvent {
         event: item.event,
-        range: (old_range.start + item.range.start)..(old_range.start + item.range.end),
+        range: (old_window_start + item.range.start)..(old_window_start + item.range.end),
     }));
     events.extend(
         previous
             .events
             .iter()
-            .filter(|item| item.range.start >= old_range.end)
+            .filter(|item| item.range.start >= old_window_end)
             .map(|item| SpannedEvent {
                 event: item.event.clone(),
                 range: item.range.start.saturating_add_signed(delta)
@@ -1035,6 +1047,16 @@ mod tests {
             .expect("single paragraph edit should be incremental");
         let full = parse_document("# 一\n\n修改后的甲\n\n# 二\n\n乙\n");
 
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
+    fn incremental_parse忽略不相邻的结构性块() {
+        let previous = parse_document("# 一\n\n甲\n\n- 列表项\n\n乙\n");
+        let next = parse_document_incremental(&previous, "# 新标题\n\n甲\n\n- 列表项\n\n乙\n")
+            .expect("不相邻的列表不应阻止安全标题块的局部解析");
+        let full = parse_document("# 新标题\n\n甲\n\n- 列表项\n\n乙\n");
         assert_eq!(next.blocks(), full.blocks());
         assert_eq!(next.events(), full.events());
     }
