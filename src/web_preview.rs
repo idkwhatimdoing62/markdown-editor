@@ -293,16 +293,29 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     return sibling;
   };
 
+  const isBoundaryComment = (node) => node?.nodeType === Node.COMMENT_NODE
+    && /^(md-source|md-block):/.test(node.nodeValue || '');
+
   const replaceBlock = (id, html, sourceStart, sourceEnd) => {
     const marker = blockMarkers().get(String(id));
-    const element = elementAfter(marker);
-    if (!marker || !element) return false;
+    if (!marker) return false;
+    const boundary = (() => {
+      let node = marker.nextSibling;
+      while (node && !isBoundaryComment(node)) node = node.nextSibling;
+      return node;
+    })();
     const template = document.createElement('template');
     template.innerHTML = String(html || '');
+    const fragment = template.content.cloneNode(true);
+    [...fragment.childNodes].forEach((node) => {
+      if (isBoundaryComment(node)) node.remove();
+    });
     const range = document.createRange();
-    range.selectNode(element);
+    range.setStartAfter(marker);
+    if (boundary) range.setEndBefore(boundary);
+    else range.setEndAfter(marker.parentNode.lastChild || marker);
     range.deleteContents();
-    range.insertNode(template.content.cloneNode(true));
+    range.insertNode(fragment);
     let source = marker.previousSibling;
     while (source && source.nodeType !== Node.COMMENT) source = source.previousSibling;
     if (source && /^md-source:[0-9.]+$/.test(source.nodeValue || '') && Number.isFinite(Number(sourceStart))) {
@@ -1920,7 +1933,6 @@ fn preview_document_incremental_variable(
     let body_range = previous_preview.body_range?;
     if previous_preview.virtual_manifest.is_some()
         || previous_preview.has_mermaid != document.has_mermaid()
-        || heading_count(previous_document.blocks()) != heading_count(document.blocks())
         || previous_preview.blocks.len() != previous_document.blocks().len() + 1
     {
         return None;
@@ -1948,9 +1960,19 @@ fn preview_document_incremental_variable(
     let old_changed_end = old_blocks.len().saturating_sub(suffix);
     let new_changed_end = new_blocks.len().saturating_sub(suffix);
     let old_window_start = prefix.saturating_sub(1);
-    let old_window_end = (old_changed_end + 1).min(old_blocks.len());
+    let heading_count_changed =
+        heading_count(previous_document.blocks()) != heading_count(document.blocks());
+    let old_window_end = if heading_count_changed {
+        old_blocks.len()
+    } else {
+        (old_changed_end + 1).min(old_blocks.len())
+    };
     let new_window_start = prefix.saturating_sub(1).min(new_blocks.len());
-    let new_window_end = (new_changed_end + 1).min(new_blocks.len());
+    let new_window_end = if heading_count_changed {
+        new_blocks.len()
+    } else {
+        (new_changed_end + 1).min(new_blocks.len())
+    };
     if old_blocks[old_window_start..old_window_end]
         .iter()
         .any(|block| !simple_block_pair(block, block))
@@ -2055,18 +2077,6 @@ pub fn preview_document_incremental(
     // non-heading blocks can still reuse their existing HTML.
     let heading_count_changed =
         heading_count(previous_document.blocks()) != heading_count(document.blocks());
-    if heading_count_changed
-        && changed.iter().any(|index| {
-            contains_nested_heading(&previous_document.blocks()[*index])
-                || contains_nested_heading(&document.blocks()[*index])
-        })
-    {
-        // Nested headings can change the numbering of descendants in a list
-        // or quote in ways that are not represented by one top-level HTML
-        // block. Keep the conservative full-render fallback for that case.
-        return None;
-    }
-
     let mut render_indices = changed.clone();
     if heading_count_changed {
         let first_changed = *changed.first()?;
@@ -2135,7 +2145,6 @@ pub fn preview_document_virtual_incremental(
     let previous_document = previous_document?;
     if previous_preview.virtual_manifest.is_none()
         || previous_preview.has_mermaid != document.has_mermaid()
-        || heading_count(previous_document.blocks()) != heading_count(document.blocks())
         || previous_document.blocks().len() != document.blocks().len()
     {
         return None;
@@ -2157,6 +2166,20 @@ pub fn preview_document_virtual_incremental(
     {
         return None;
     }
+    let heading_count_changed =
+        heading_count(previous_document.blocks()) != heading_count(document.blocks());
+    let mut render_indices = changed.clone();
+    if heading_count_changed {
+        let first_changed = *changed.first()?;
+        render_indices.extend(
+            (first_changed + 1..document.blocks().len()).filter(|index| {
+                block_heading_count(&previous_document.blocks()[*index]) > 0
+                    || block_heading_count(&document.blocks()[*index]) > 0
+            }),
+        );
+        render_indices.sort_unstable();
+        render_indices.dedup();
+    }
     let slices = top_level_event_slices(document)?;
     if slices.len() != document.blocks().len() {
         return None;
@@ -2173,7 +2196,7 @@ pub fn preview_document_virtual_incremental(
             return None;
         }
         let chunk_end = marker_cursor + marker_count;
-        let mut replacements = changed
+        let mut replacements = render_indices
             .iter()
             .filter_map(|index| {
                 let marker_index = index + 1;
@@ -2277,16 +2300,13 @@ pub fn preview_document_virtual_incremental(
     Some(preview)
 }
 
-fn simple_block_pair(old: &crate::markdown::Block, new: &crate::markdown::Block) -> bool {
+fn simple_block_pair(_old: &crate::markdown::Block, _new: &crate::markdown::Block) -> bool {
     // Re-rendering one complete top-level block is still local when its
     // parsed kind changes: the event slice and source anchor for that block
     // are replaced together, while the surrounding blocks remain intact.
-    // Raw HTML remains on the conservative full-render path because it may
-    // contain arbitrary sibling nodes that do not map one-to-one to anchors.
-    !matches!(
-        (old, new),
-        (crate::markdown::Block::Raw(_), _) | (_, crate::markdown::Block::Raw(_))
-    )
+    // The bridge replaces every sibling between this block marker and the
+    // next source marker, so raw HTML is covered by the same boundary.
+    true
 }
 
 fn enriched_block_index(
@@ -2318,20 +2338,6 @@ fn heading_count(blocks: &[crate::markdown::Block]) -> usize {
 
 fn block_heading_count(block: &crate::markdown::Block) -> usize {
     heading_count(std::slice::from_ref(block))
-}
-
-fn contains_nested_heading(block: &crate::markdown::Block) -> bool {
-    match block {
-        crate::markdown::Block::List { items, .. } => items.iter().flatten().any(|child| {
-            matches!(child, crate::markdown::Block::Heading { .. })
-                || contains_nested_heading(child)
-        }),
-        crate::markdown::Block::Quote(children) => children.iter().any(|child| {
-            matches!(child, crate::markdown::Block::Heading { .. })
-                || contains_nested_heading(child)
-        }),
-        _ => false,
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2431,7 +2437,7 @@ fn render_incremental_block_content(
     // full render.
     let separator = if matches!(
         document.blocks()[index],
-        crate::markdown::Block::Table { .. }
+        crate::markdown::Block::Table { .. } | crate::markdown::Block::Raw(_)
     ) {
         ""
     } else {
@@ -3780,6 +3786,8 @@ mod tests {
         assert!(SCROLL_SYNC_SCRIPT.contains("restoreViewportAnchor"));
         assert!(SCROLL_SYNC_SCRIPT.contains("blockPatched && restoreViewportAnchor"));
         assert!(SCROLL_SYNC_SCRIPT.contains("patch.anchorMap"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("const isBoundaryComment"));
+        assert!(SCROLL_SYNC_SCRIPT.contains("range.setStartAfter(marker)"));
     }
 
     #[test]
@@ -3865,6 +3873,25 @@ mod tests {
             None,
         )
         .expect("deleting a paragraph should patch the preview locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_supports_deleting_the_last_block() {
+        let first_document = crate::markdown::parse_document("最后一段\n");
+        let next_document = crate::markdown::parse_document("");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("deleting the last block should patch the preview body locally");
         let full = super::preview_document(&next_document, "", None, None, None);
 
         assert_eq!(incremental.shell, full.shell);
@@ -3972,6 +3999,26 @@ mod tests {
     }
 
     #[test]
+    fn incremental_preview_supports_raw_html_block_conversion() {
+        let first_document = crate::markdown::parse_document("<div>旧内容</div>\n\n后文\n");
+        let next_document =
+            crate::markdown::parse_document("<div><span>新内容</span></div>\n\n后文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("raw HTML block edits should patch the changed block locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
     fn incremental_preview_supports_paragraph_to_heading_conversion_and_updates_following_ids() {
         let first_document =
             crate::markdown::parse_document("前文\n\n原始段落\n\n## 后续章节\n\n后文\n");
@@ -3993,20 +4040,62 @@ mod tests {
     }
 
     #[test]
-    fn nested_heading_count_change_still_forces_full_preview_rendering() {
+    fn incremental_preview_supports_inserting_a_heading_block() {
+        let first_document = crate::markdown::parse_document("前文\n\n## 后续章节\n\n后文\n");
+        let next_document =
+            crate::markdown::parse_document("前文\n\n# 新章节\n\n## 后续章节\n\n后文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("heading insertion should render the affected suffix locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn incremental_preview_supports_deleting_a_heading_block() {
+        let first_document =
+            crate::markdown::parse_document("前文\n\n# 已删除章节\n\n## 后续章节\n\n后文\n");
+        let next_document = crate::markdown::parse_document("前文\n\n## 后续章节\n\n后文\n");
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("heading deletion should render the affected suffix locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
+    }
+
+    #[test]
+    fn nested_heading_count_change_updates_the_parent_block_incrementally() {
         let first_document = crate::markdown::parse_document("> # 嵌套标题\n");
         let next_document = crate::markdown::parse_document("> 正文\n");
         let first_preview = super::preview_document(&first_document, "", None, None, None);
 
-        assert!(
-            super::preview_document_incremental(
-                Some(&first_preview),
-                Some(&first_document),
-                &next_document,
-                None,
-            )
-            .is_none()
-        );
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("nested heading changes should patch the complete parent block");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
     }
 
     #[test]
@@ -4050,6 +4139,31 @@ mod tests {
     }
 
     #[test]
+    fn virtual_incremental_preview_updates_following_heading_ids() {
+        let first_source = "## 章节\n\n正文段落。\n\n".repeat(15_000);
+        let next_source = first_source.replacen("正文段落。", "# 新标题", 1);
+        let first_document = crate::markdown::parse_document(&first_source);
+        let next_document = crate::markdown::parse_document(&next_source);
+        let first_preview = super::preview_document(&first_document, "", None, None, None);
+        assert!(first_preview.virtual_manifest.is_some());
+
+        let incremental = super::preview_document_virtual_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("heading count changes should patch affected virtual chunks locally");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.virtual_manifest, full.virtual_manifest);
+        assert_eq!(incremental.chunks.len(), full.chunks.len());
+        for (incremental_chunk, full_chunk) in incremental.chunks.iter().zip(full.chunks.iter()) {
+            assert_eq!(incremental_chunk.html, full_chunk.html);
+        }
+    }
+
+    #[test]
     fn virtual_chunk_boundary_drift_forces_full_rebuild() {
         let old = format!(
             "<!--md-source:0-->{}<!--md-source:1-->tail",
@@ -4061,23 +4175,6 @@ mod tests {
         );
 
         assert!(!super::virtual_chunk_boundary_stable(&old, &new, true));
-    }
-
-    #[test]
-    fn incremental_preview_falls_back_when_raw_html_block_changes() {
-        let first_document = crate::markdown::parse_document("<div>旧内容</div>\n");
-        let next_document = crate::markdown::parse_document("<div>新内容</div>\n");
-        let first_preview = super::preview_document(&first_document, "", None, None, None);
-
-        assert!(
-            super::preview_document_incremental(
-                Some(&first_preview),
-                Some(&first_document),
-                &next_document,
-                None,
-            )
-            .is_none()
-        );
     }
 
     #[test]

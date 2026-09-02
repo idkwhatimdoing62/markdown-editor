@@ -279,7 +279,18 @@ impl Default for ParsedDocument {
 
 pub fn parse_document(markdown: &str) -> ParsedDocument {
     let normalized = normalize_compat_markdown(markdown);
-    let events = Parser::new_ext(&normalized, parse_options())
+    let normalized_source = normalized.as_ref();
+    let mut document = parse_normalized_document(normalized_source);
+    document.source = markdown.to_string();
+    document.normalized = match normalized {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(value) => Some(value),
+    };
+    document
+}
+
+fn parse_normalized_document(markdown: &str) -> ParsedDocument {
+    let events = Parser::new_ext(markdown, parse_options())
         .into_offset_iter()
         .map(|(event, range)| SpannedEvent {
             event: event.into_static(),
@@ -290,15 +301,11 @@ pub fn parse_document(markdown: &str) -> ParsedDocument {
     for item in &events {
         builder.push(item.event.clone());
     }
-    let normalized = match normalized {
-        Cow::Borrowed(_) => None,
-        Cow::Owned(value) => Some(value),
-    };
     let blocks = builder.finish();
     let block_index = build_block_index(&blocks, &events);
     ParsedDocument {
         source: markdown.to_string(),
-        normalized,
+        normalized: None,
         blocks,
         events,
         block_index,
@@ -431,11 +438,24 @@ pub fn parse_document_incremental(
     previous: &ParsedDocument,
     markdown: &str,
 ) -> Option<ParsedDocument> {
-    if previous.source == markdown || previous.normalized.is_some() {
-        return None;
+    if previous.source == markdown {
+        return Some(previous.clone());
     }
-    let old = previous.source.as_bytes();
-    let new = markdown.as_bytes();
+    let normalized = normalize_compat_markdown(markdown);
+    let next_normalized = match normalized {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(value) => Some(value),
+    };
+    let next_source = next_normalized.as_deref().unwrap_or(markdown);
+    let previous_source = previous.normalized_source();
+    if previous_source == next_source {
+        let mut next = previous.clone();
+        next.source = markdown.to_string();
+        next.normalized = next_normalized;
+        return Some(next);
+    }
+    let old = previous_source.as_bytes();
+    let new = next_source.as_bytes();
     let prefix = old
         .iter()
         .zip(new.iter())
@@ -451,10 +471,6 @@ pub fn parse_document_incremental(
     let new_mid = &new[prefix..new_end];
     let line_only =
         |slice: &[u8]| !slice.is_empty() && slice.iter().all(|byte| matches!(byte, b'\r' | b'\n'));
-    if !matches!(normalize_compat_markdown(markdown), Cow::Borrowed(_)) {
-        return None;
-    }
-
     let old_mid_len = old_end - prefix;
     let new_mid_len = new_end - prefix;
     let delta = new_mid_len as isize - old_mid_len as isize;
@@ -496,7 +512,7 @@ pub fn parse_document_incremental(
             let blocks = previous.blocks.clone();
             let mut next = ParsedDocument {
                 source: markdown.to_string(),
-                normalized: None,
+                normalized: next_normalized.clone(),
                 block_index: build_block_index(&blocks, &events),
                 blocks,
                 events,
@@ -539,12 +555,12 @@ pub fn parse_document_incremental(
     let old_window_start = ranges[window_start].start;
     let old_window_end = ranges[window_end - 1].end;
     let new_window_end = old_window_end.checked_add_signed(delta)?;
-    if new_window_end < old_window_start || new_window_end > markdown.len() {
+    if new_window_end < old_window_start || new_window_end > next_source.len() {
         return None;
     }
-    let reparsed = parse_document(&markdown[old_window_start..new_window_end]);
-    if reparsed.normalized.is_some()
-        || reparsed.blocks.is_empty()
+    let reparsed_source = &next_source[old_window_start..new_window_end];
+    let reparsed = parse_normalized_document(reparsed_source);
+    if (reparsed.blocks.is_empty() && !reparsed_source.is_empty())
         || reparsed
             .blocks
             .iter()
@@ -585,7 +601,7 @@ pub fn parse_document_incremental(
     let block_index = build_block_index(&blocks, &events);
     let mut next = ParsedDocument {
         source: markdown.to_string(),
-        normalized: None,
+        normalized: next_normalized,
         blocks,
         events,
         block_index,
@@ -608,6 +624,7 @@ fn is_incremental_block_safe(block: &Block) -> bool {
             | Block::Quote(_)
             | Block::Table { .. }
             | Block::Rule
+            | Block::Raw(_)
     )
 }
 
@@ -1292,6 +1309,44 @@ mod tests {
             assert_eq!(next.blocks(), full.blocks());
             assert_eq!(next.events(), full.events());
         }
+    }
+
+    #[test]
+    fn incremental_parse_reparses_raw_html_block() {
+        let previous = parse_document("<div>旧内容</div>\n\n后文\n");
+        let next_source = "<div><span>新内容</span></div>\n\n后文\n";
+        let next = parse_document_incremental(&previous, next_source)
+            .expect("raw HTML edits should stay within their top-level block");
+        let full = parse_document(next_source);
+
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
+    fn incremental_parse_reuses_normalized_document_context() {
+        let previous = parse_document("- **识别与生成：**区分植物\n\n后文\n");
+        assert!(previous.normalized.is_some());
+        let next_source = "- **识别与生成：**区分植物和动物\n\n后文\n";
+        let next = parse_document_incremental(&previous, next_source)
+            .expect("normalized Markdown edits should stay incremental");
+        let full = parse_document(next_source);
+
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+        assert_eq!(next.normalized_source(), full.normalized_source());
+    }
+
+    #[test]
+    fn incremental_parse_supports_deleting_the_last_block() {
+        let previous = parse_document("最后一段\n");
+        let next = parse_document_incremental(&previous, "")
+            .expect("deleting the last block should remain incremental");
+        let full = parse_document("");
+
+        assert!(next.blocks().is_empty());
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
     }
 
     #[test]
