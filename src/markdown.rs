@@ -481,10 +481,9 @@ pub fn parse_document_incremental(
         }
         let ranges = top_level_block_ranges(previous)?;
         let structural_line_edit = ranges.len() != previous.blocks.len()
-            || ranges.iter().zip(&previous.blocks).any(|(range, block)| {
-                let edit_inside_block = (range.start < prefix && prefix < range.end)
-                    || (range.start < old_end && old_end < range.end);
-                edit_inside_block && !is_line_edit_block_safe(block)
+            || ranges.iter().any(|range| {
+                (range.start < prefix && prefix < range.end)
+                    || (range.start < old_end && old_end < range.end)
             });
         if structural_line_edit {
             // A newline inside a list, quote, table, or fenced code block can
@@ -579,6 +578,12 @@ pub fn parse_document_incremental(
                     .events
                     .iter()
                     .all(|item| item.range.end <= new_window_end - old_window_start)
+                && local_window_boundary_is_safe(
+                    next_source,
+                    new_window_end,
+                    reparsed,
+                    window_end < ranges.len(),
+                )
         });
         if valid {
             break (
@@ -651,13 +656,6 @@ fn is_incremental_block_safe(block: &Block) -> bool {
     )
 }
 
-fn is_line_edit_block_safe(block: &Block) -> bool {
-    matches!(
-        block,
-        Block::Heading { .. } | Block::Paragraph(_) | Block::Rule
-    )
-}
-
 pub(crate) fn is_block_tag(tag: &Tag<'_>) -> bool {
     matches!(
         tag,
@@ -695,6 +693,115 @@ fn safe_line_edit(source: &[u8], start: usize, end: usize) -> bool {
         || start == 0
         || end == source.len()
         || (start > 0 && source[start - 1] == b'\n' && end < source.len() && source[end] == b'\n')
+}
+
+fn local_window_boundary_is_safe(
+    source: &str,
+    window_end: usize,
+    reparsed: &ParsedDocument,
+    has_suffix: bool,
+) -> bool {
+    let Some(ranges) = top_level_block_ranges(reparsed) else {
+        return false;
+    };
+    if ranges.len() != reparsed.blocks.len() {
+        return false;
+    }
+    if ranges.first().is_some_and(|range| range.start != 0) {
+        return false;
+    }
+    if !has_suffix {
+        return true;
+    }
+
+    // An unterminated fence can only be closed by text outside the local
+    // window. Treat that as ambiguous and let the adaptive loop expand.
+    if has_unclosed_fence(reparsed.normalized_source()) {
+        return false;
+    }
+    let Some(last_block) = reparsed.blocks.last() else {
+        return false;
+    };
+    let suffix = source.get(window_end..).unwrap_or_default();
+    let has_blank_separator = leading_newline_count(suffix) >= 2;
+    if matches!(
+        last_block,
+        Block::List { .. } | Block::Quote(_) | Block::Code { .. } | Block::Raw(_)
+    ) {
+        return has_blank_separator;
+    }
+    has_blank_separator || suffix_line_starts_new_block(suffix)
+}
+
+fn leading_newline_count(source: &str) -> usize {
+    let mut count = 0;
+    let mut bytes = source.as_bytes();
+    while let Some(first) = bytes.first().copied() {
+        match first {
+            b'\n' => {
+                count += 1;
+                bytes = &bytes[1..];
+            }
+            b'\r' if bytes.get(1) == Some(&b'\n') => {
+                count += 1;
+                bytes = &bytes[2..];
+            }
+            _ => break,
+        }
+    }
+    count
+}
+
+fn suffix_line_starts_new_block(source: &str) -> bool {
+    let line = source
+        .trim_start_matches(['\r', '\n'])
+        .lines()
+        .next()
+        .unwrap_or_default();
+    let trimmed = line.trim_start();
+    trimmed.starts_with('#')
+        || trimmed.starts_with('>')
+        || trimmed.starts_with("```")
+        || trimmed.starts_with("~~~")
+        || trimmed == "---"
+        || trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("+ ")
+        || trimmed.split_once('.').is_some_and(|(prefix, rest)| {
+            !prefix.is_empty()
+                && prefix.chars().all(|ch| ch.is_ascii_digit())
+                && rest.starts_with(' ')
+        })
+}
+
+fn has_unclosed_fence(source: &str) -> bool {
+    let mut open: Option<(u8, usize)> = None;
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let Some((character, length)) = fence_prefix(trimmed) else {
+            continue;
+        };
+        match open {
+            Some((open_character, open_length))
+                if open_character == character && length >= open_length =>
+            {
+                open = None
+            }
+            Some(_) => {}
+            None => open = Some((character, length)),
+        }
+    }
+    open.is_some()
+}
+
+fn fence_prefix(line: &str) -> Option<(u8, usize)> {
+    let bytes = line.as_bytes();
+    let character = *bytes.first()?;
+    if !matches!(character, b'`' | b'~') {
+        return None;
+    }
+    let length = bytes.iter().take_while(|byte| **byte == character).count();
+    (length >= 3).then_some((character, length))
 }
 
 #[cfg(test)]
@@ -1232,6 +1339,17 @@ mod tests {
             .expect("single paragraph edit should be incremental");
         let full = parse_document("# 一\n\n修改后的甲\n\n# 二\n\n乙\n");
 
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
+    }
+
+    #[test]
+    fn incremental_parse_reparses_when_a_newline_splits_a_paragraph() {
+        let previous = parse_document("甲\n乙\n\n后文\n");
+        let next_source = "甲\n\n乙\n\n后文\n";
+        let next = parse_document_incremental(&previous, next_source)
+            .expect("paragraph split should remain locally reparsable");
+        let full = parse_document(next_source);
         assert_eq!(next.blocks(), full.blocks());
         assert_eq!(next.events(), full.events());
     }

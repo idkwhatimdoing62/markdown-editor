@@ -1,6 +1,7 @@
 //! 使用系统浏览器引擎执行主题 CSS 的 Markdown 预览。
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -10,6 +11,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::markdown::{is_block_tag, is_block_tag_end};
 use pulldown_cmark::{CowStr, Event, Tag, html};
+
+// DOM bridge markers are intentionally namespaced away from the IPC
+// `md-source:` messages and from arbitrary comments in user-authored HTML.
+const DOM_SOURCE_MARKER_PREFIX: &str = "<!--md-editor-source:";
+const DOM_BLOCK_MARKER_PREFIX: &str = "<!--md-editor-block:";
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use wry::dpi::{PhysicalPosition, PhysicalSize};
@@ -271,7 +277,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     anchorCache = [];
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
     while (walker.nextNode()) {
-      const match = /^md-source:([0-9.]+)$/.exec(walker.currentNode.nodeValue || '');
+      const match = /^md-editor-source:([0-9.]+)$/.exec(walker.currentNode.nodeValue || '');
       if (match) anchorCache.push({ source: Number(match[1]), node: walker.currentNode });
     }
     return anchorCache;
@@ -281,7 +287,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     const result = new Map();
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
     while (walker.nextNode()) {
-      const match = /^md-block:(\d+)$/.exec(walker.currentNode.nodeValue || '');
+      const match = /^md-editor-block:(\d+)$/.exec(walker.currentNode.nodeValue || '');
       if (match) result.set(match[1], walker.currentNode);
     }
     return result;
@@ -294,7 +300,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   };
 
   const isBoundaryComment = (node) => node?.nodeType === Node.COMMENT_NODE
-    && /^(md-source|md-block):/.test(node.nodeValue || '');
+    && /^(md-editor-source|md-editor-block):/.test(node.nodeValue || '');
 
   const replaceBlock = (id, html, sourceStart, sourceEnd) => {
     const marker = blockMarkers().get(String(id));
@@ -318,8 +324,8 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     range.insertNode(fragment);
     let source = marker.previousSibling;
     while (source && source.nodeType !== Node.COMMENT) source = source.previousSibling;
-    if (source && /^md-source:[0-9.]+$/.test(source.nodeValue || '') && Number.isFinite(Number(sourceStart))) {
-      source.nodeValue = `md-source:${sourceStart}`;
+    if (source && /^md-editor-source:[0-9.]+$/.test(source.nodeValue || '') && Number.isFinite(Number(sourceStart))) {
+      source.nodeValue = `md-editor-source:${sourceStart}`;
     }
     // Keep the full source range in the public contract even though the end
     // marker is refreshed from the complete anchor list below.
@@ -435,7 +441,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_COMMENT);
     let candidate = null;
     while (walker.nextNode()) {
-      const match = /^md-source:([0-9.]+)$/.exec(walker.currentNode.nodeValue || '');
+      const match = /^md-editor-source:([0-9.]+)$/.exec(walker.currentNode.nodeValue || '');
       if (!match || Number(match[1]) > sourcePosition) break;
       candidate = walker.currentNode;
     }
@@ -626,7 +632,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
               if (sourceAnchors) {
                 const refreshed = anchors();
                 for (let index = 0; index < Math.min(refreshed.length, sourceAnchors.length); index += 1) {
-                  refreshed[index].node.nodeValue = `md-source:${sourceAnchors[index]}`;
+                  refreshed[index].node.nodeValue = `md-editor-source:${sourceAnchors[index]}`;
                 }
               }
               blockPatched = true;
@@ -664,7 +670,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
             if (sourceAnchors) {
               const refreshed = anchors();
               for (let index = 0; index < Math.min(refreshed.length, sourceAnchors.length); index += 1) {
-                refreshed[index].node.nodeValue = `md-source:${sourceAnchors[index]}`;
+                refreshed[index].node.nodeValue = `md-editor-source:${sourceAnchors[index]}`;
               }
             }
             anchorCache = null;
@@ -885,9 +891,9 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     let sourceIndex = 0;
     let node = chunk.start;
     while (node) {
-      if (node.nodeType === Node.COMMENT && /^md-source:[0-9.]+$/.test(node.nodeValue || '')) {
+      if (node.nodeType === Node.COMMENT && /^md-editor-source:[0-9.]+$/.test(node.nodeValue || '')) {
         if (sourceIndex < chunk.sourceAnchors.length) {
-          node.nodeValue = `md-source:${chunk.sourceAnchors[sourceIndex]}`;
+          node.nodeValue = `md-editor-source:${chunk.sourceAnchors[sourceIndex]}`;
         }
         sourceIndex += 1;
       }
@@ -898,7 +904,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
 
   const blockIdFromComment = (node) => {
     if (!node || node.nodeType !== Node.COMMENT_NODE) return null;
-    const match = /^md-block:(\d+)$/.exec(node.nodeValue || '');
+    const match = /^md-editor-block:(\d+)$/.exec(node.nodeValue || '');
     return match ? match[1] : null;
   };
 
@@ -1940,47 +1946,8 @@ fn preview_document_incremental_variable(
 
     let old_blocks = previous_document.blocks();
     let new_blocks = document.blocks();
-    let common = old_blocks.len().min(new_blocks.len());
-    let prefix = old_blocks
-        .iter()
-        .zip(new_blocks)
-        .take_while(|(old, new)| old == new)
-        .count();
-    let mut suffix = 0usize;
-    while suffix < old_blocks.len().saturating_sub(prefix)
-        && suffix < new_blocks.len().saturating_sub(prefix)
-        && old_blocks[old_blocks.len() - 1 - suffix] == new_blocks[new_blocks.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-    if prefix == common && old_blocks.len() == new_blocks.len() {
+    if old_blocks == new_blocks {
         return preview_document_with_previous(Some(previous_preview), document);
-    }
-
-    let old_changed_end = old_blocks.len().saturating_sub(suffix);
-    let new_changed_end = new_blocks.len().saturating_sub(suffix);
-    let old_window_start = prefix.saturating_sub(1);
-    let heading_count_changed =
-        heading_count(previous_document.blocks()) != heading_count(document.blocks());
-    let old_window_end = if heading_count_changed {
-        old_blocks.len()
-    } else {
-        (old_changed_end + 1).min(old_blocks.len())
-    };
-    let new_window_start = prefix.saturating_sub(1).min(new_blocks.len());
-    let new_window_end = if heading_count_changed {
-        new_blocks.len()
-    } else {
-        (new_changed_end + 1).min(new_blocks.len())
-    };
-    if old_blocks[old_window_start..old_window_end]
-        .iter()
-        .any(|block| !simple_block_pair(block, block))
-        || new_blocks[new_window_start..new_window_end]
-            .iter()
-            .any(|block| !simple_block_pair(block, block))
-    {
-        return None;
     }
 
     let slices = top_level_event_slices(document)?;
@@ -1994,21 +1961,35 @@ fn preview_document_incremental_variable(
     let block_ids = stable_top_level_block_ids(document);
     let mut body = String::new();
     body.push_str(&previous_preview.blocks.first()?.html);
-    for index in 0..old_window_start {
-        body.push_str(&previous_preview.blocks.get(index + 1)?.html);
-    }
-    for index in new_window_start..new_window_end {
-        body.push_str(&render_incremental_block(
-            document,
-            index,
-            &slices[index],
-            anchors[index + 1],
-            block_ids[index],
-            base_directory,
-        )?);
-    }
-    for index in old_window_end..old_blocks.len() {
-        body.push_str(&previous_preview.blocks.get(index + 1)?.html);
+    let old_by_id = previous_document
+        .block_index()
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            previous_preview
+                .blocks
+                .get(index + 1)
+                .map(|chunk| (entry.id, (index, &old_blocks[index], chunk.html.as_ref())))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut heading_index = 0usize;
+    for index in 0..new_blocks.len() {
+        let id = block_ids[index];
+        if let Some((_, old_block, old_html)) = old_by_id.get(&id)
+            && *old_block == &new_blocks[index]
+        {
+            body.push_str(&rewrite_heading_ids(old_html, heading_index));
+        } else {
+            body.push_str(&render_incremental_block(
+                document,
+                index,
+                &slices[index],
+                anchors[index + 1],
+                id,
+                base_directory,
+            )?);
+        }
+        heading_index += block_heading_count(&new_blocks[index]);
     }
     body.push_str(&source_anchor(*anchors.last()?));
 
@@ -2062,34 +2043,6 @@ pub fn preview_document_incremental(
     if changed.is_empty() {
         return preview_document_with_previous(Some(previous_preview), document);
     }
-    if changed.iter().any(|index| {
-        !simple_block_pair(
-            &previous_document.blocks()[*index],
-            &document.blocks()[*index],
-        )
-    }) {
-        return None;
-    }
-
-    // Heading IDs are assigned in document order. A block that becomes (or
-    // stops being) a heading shifts IDs for later heading-containing blocks,
-    // so include only those later blocks in the local render set. Unchanged
-    // non-heading blocks can still reuse their existing HTML.
-    let heading_count_changed =
-        heading_count(previous_document.blocks()) != heading_count(document.blocks());
-    let mut render_indices = changed.clone();
-    if heading_count_changed {
-        let first_changed = *changed.first()?;
-        render_indices.extend(
-            (first_changed + 1..document.blocks().len()).filter(|index| {
-                block_heading_count(&previous_document.blocks()[*index]) > 0
-                    || block_heading_count(&document.blocks()[*index]) > 0
-            }),
-        );
-        render_indices.sort_unstable();
-        render_indices.dedup();
-    }
-
     let slices = top_level_event_slices(document)?;
     if slices.len() != document.blocks().len() {
         return None;
@@ -2099,12 +2052,13 @@ pub fn preview_document_incremental(
         return None;
     }
 
-    let mut body = String::with_capacity(previous_preview.shell.len());
     let block_ids = stable_top_level_block_ids(document);
-    for (chunk_index, old_chunk) in previous_preview.blocks.iter().enumerate() {
-        let block_index = chunk_index.checked_sub(1);
-        if let Some(index) = block_index.filter(|index| render_indices.binary_search(index).is_ok())
-        {
+    let mut body = String::with_capacity(previous_preview.shell.len());
+    body.push_str(&previous_preview.blocks.first()?.html);
+    let mut heading_index = 0usize;
+    for index in 0..document.blocks().len() {
+        let old_chunk = previous_preview.blocks.get(index + 1)?;
+        if changed.binary_search(&index).is_ok() {
             body.push_str(&render_incremental_block(
                 document,
                 index,
@@ -2114,8 +2068,9 @@ pub fn preview_document_incremental(
                 base_directory,
             )?);
         } else {
-            body.push_str(&old_chunk.html);
+            body.push_str(&rewrite_heading_ids(&old_chunk.html, heading_index));
         }
+        heading_index += block_heading_count(&document.blocks()[index]);
     }
     body.push_str(&source_anchor(*anchors.last()?));
     let mut html = String::with_capacity(previous_preview.shell.len() + body.len());
@@ -2156,30 +2111,11 @@ pub fn preview_document_virtual_incremental(
         .enumerate()
         .filter_map(|(index, (old, new))| (old != new).then_some(index))
         .collect::<Vec<_>>();
-    if changed.is_empty()
-        || changed.iter().any(|index| {
-            !simple_block_pair(
-                &previous_document.blocks()[*index],
-                &document.blocks()[*index],
-            )
-        })
-    {
+    if changed.is_empty() {
         return None;
     }
-    let heading_count_changed =
-        heading_count(previous_document.blocks()) != heading_count(document.blocks());
-    let mut render_indices = changed.clone();
-    if heading_count_changed {
-        let first_changed = *changed.first()?;
-        render_indices.extend(
-            (first_changed + 1..document.blocks().len()).filter(|index| {
-                block_heading_count(&previous_document.blocks()[*index]) > 0
-                    || block_heading_count(&document.blocks()[*index]) > 0
-            }),
-        );
-        render_indices.sort_unstable();
-        render_indices.dedup();
-    }
+    let render_indices =
+        heading_affected_indices(&changed, previous_document.blocks(), document.blocks());
     let slices = top_level_event_slices(document)?;
     if slices.len() != document.blocks().len() {
         return None;
@@ -2300,15 +2236,6 @@ pub fn preview_document_virtual_incremental(
     Some(preview)
 }
 
-fn simple_block_pair(_old: &crate::markdown::Block, _new: &crate::markdown::Block) -> bool {
-    // Re-rendering one complete top-level block is still local when its
-    // parsed kind changes: the event slice and source anchor for that block
-    // are replaced together, while the surrounding blocks remain intact.
-    // The bridge replaces every sibling between this block marker and the
-    // next source marker, so raw HTML is covered by the same boundary.
-    true
-}
-
 fn enriched_block_index(
     document: &crate::markdown::ParsedDocument,
     preview: &PreviewDocument,
@@ -2338,6 +2265,32 @@ fn heading_count(blocks: &[crate::markdown::Block]) -> usize {
 
 fn block_heading_count(block: &crate::markdown::Block) -> usize {
     heading_count(std::slice::from_ref(block))
+}
+
+fn heading_affected_indices(
+    changed: &[usize],
+    old_blocks: &[crate::markdown::Block],
+    new_blocks: &[crate::markdown::Block],
+) -> Vec<usize> {
+    let heading_count_changed = heading_count(old_blocks) != heading_count(new_blocks);
+    if !heading_count_changed {
+        return changed.to_vec();
+    }
+    let Some(first_changed) = changed.first().copied() else {
+        return Vec::new();
+    };
+    let mut indices = changed.to_vec();
+    indices.extend((first_changed + 1..new_blocks.len()).filter(|index| {
+        old_blocks
+            .get(*index)
+            .is_some_and(|block| block_heading_count(block) > 0)
+            || new_blocks
+                .get(*index)
+                .is_some_and(|block| block_heading_count(block) > 0)
+    }));
+    indices.sort_unstable();
+    indices.dedup();
+    indices
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2451,7 +2404,7 @@ fn render_incremental_block_content(
 fn source_marker_ranges(html: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
-    while let Some(relative_start) = html[cursor..].find("<!--md-source:") {
+    while let Some(relative_start) = html[cursor..].find(DOM_SOURCE_MARKER_PREFIX) {
         let start = cursor + relative_start;
         let Some(relative_end) = html[start..].find("-->") else {
             break;
@@ -2535,9 +2488,9 @@ fn virtual_manifest(chunks: &[PreviewChunk]) -> String {
 fn virtual_chunk_block_metadata(html: &str) -> (Vec<u64>, Vec<u64>) {
     let mut markers = Vec::new();
     let mut cursor = 0usize;
-    while let Some(relative) = html[cursor..].find("<!--md-block:") {
+    while let Some(relative) = html[cursor..].find(DOM_BLOCK_MARKER_PREFIX) {
         let start = cursor + relative;
-        let id_start = start + "<!--md-block:".len();
+        let id_start = start + DOM_BLOCK_MARKER_PREFIX.len();
         let Some(relative_end) = html[id_start..].find("-->") else {
             break;
         };
@@ -2585,9 +2538,9 @@ fn replace_block_markers_with_ids(
 fn virtual_block_marker_ranges(html: &str) -> Vec<(std::ops::Range<usize>, u64)> {
     let mut markers = Vec::new();
     let mut cursor = 0usize;
-    while let Some(relative) = html[cursor..].find("<!--md-block:") {
+    while let Some(relative) = html[cursor..].find(DOM_BLOCK_MARKER_PREFIX) {
         let start = cursor + relative;
-        let id_start = start + "<!--md-block:".len();
+        let id_start = start + DOM_BLOCK_MARKER_PREFIX.len();
         let Some(relative_end) = html[id_start..].find("-->") else {
             break;
         };
@@ -2709,7 +2662,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
     let mut chunk_start = 0usize;
     let mut image_cursor = 0usize;
     let mut chunk_image_start = 0usize;
-    while let Some(relative) = body[search_from..].find("<!--md-source:") {
+    while let Some(relative) = body[search_from..].find(DOM_SOURCE_MARKER_PREFIX) {
         let position = search_from + relative;
         while image_positions
             .get(image_cursor)
@@ -2724,12 +2677,12 @@ fn virtualize_document(html: String) -> PreviewDocument {
             chunk_start = position;
             chunk_image_start = image_cursor;
         }
-        search_from = position + "<!--md-source:".len();
+        search_from = position + DOM_SOURCE_MARKER_PREFIX.len();
     }
     boundaries.push(body.len());
 
     let source_end =
-        source_marker_at(body, body.rfind("<!--md-source:").unwrap_or(0)).unwrap_or(1.0);
+        source_marker_at(body, body.rfind(DOM_SOURCE_MARKER_PREFIX).unwrap_or(0)).unwrap_or(1.0);
     let mut chunks = Vec::with_capacity(boundaries.len().saturating_sub(1));
     for (index, pair) in boundaries.windows(2).enumerate() {
         let start = pair[0];
@@ -2797,10 +2750,10 @@ fn requires_virtualization(html: &str) -> bool {
 fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
     let mut markers = Vec::new();
     let mut search_from = 0usize;
-    while let Some(relative) = body[search_from..].find("<!--md-source:") {
+    while let Some(relative) = body[search_from..].find(DOM_SOURCE_MARKER_PREFIX) {
         let position = search_from + relative;
         markers.push(position);
-        search_from = position + "<!--md-source:".len();
+        search_from = position + DOM_SOURCE_MARKER_PREFIX.len();
     }
     markers
         .windows(2)
@@ -2829,13 +2782,13 @@ fn split_preview_blocks(body: &str) -> Vec<PreviewChunk> {
 }
 
 fn preview_block_content(html: &str) -> &str {
-    html.strip_prefix("<!--md-source:")
+    html.strip_prefix(DOM_SOURCE_MARKER_PREFIX)
         .and_then(|rest| rest.split_once("-->").map(|(_, content)| content))
         .unwrap_or(html)
 }
 
 fn block_id_in_html(html: &str) -> Option<u64> {
-    let start = html.find("<!--md-block:")? + "<!--md-block:".len();
+    let start = html.find(DOM_BLOCK_MARKER_PREFIX)? + DOM_BLOCK_MARKER_PREFIX.len();
     let end = html[start..].find("-->")? + start;
     html[start..end].parse().ok()
 }
@@ -2857,19 +2810,21 @@ fn image_tag_positions(html: &str) -> Vec<usize> {
 }
 
 fn source_marker_at(body: &str, position: usize) -> Option<f32> {
-    let marker = body.get(position..)?.strip_prefix("<!--md-source:")?;
+    let marker = body
+        .get(position..)?
+        .strip_prefix(DOM_SOURCE_MARKER_PREFIX)?;
     marker.split("-->").next()?.parse().ok()
 }
 
 fn source_markers(html: &str) -> Vec<f32> {
     let mut markers = Vec::new();
     let mut search_from = 0;
-    while let Some(relative) = html[search_from..].find("<!--md-source:") {
+    while let Some(relative) = html[search_from..].find(DOM_SOURCE_MARKER_PREFIX) {
         let position = search_from + relative;
         if let Some(value) = source_marker_at(html, position) {
             markers.push(value);
         }
-        search_from = position + "<!--md-source:".len();
+        search_from = position + DOM_SOURCE_MARKER_PREFIX.len();
     }
     markers
 }
@@ -2927,7 +2882,7 @@ fn replace_source_markers(html: &str, values: &[f32]) -> String {
     let mut output = String::with_capacity(html.len());
     let mut cursor = 0;
     let mut index = 0;
-    while let Some(relative) = html[cursor..].find("<!--md-source:") {
+    while let Some(relative) = html[cursor..].find(DOM_SOURCE_MARKER_PREFIX) {
         let start = cursor + relative;
         let Some(end_relative) = html[start..].find("-->") else {
             break;
@@ -2946,23 +2901,23 @@ fn replace_source_markers(html: &str, values: &[f32]) -> String {
 fn hash_source_markerless(html: &str) -> u64 {
     let mut normalized = String::with_capacity(html.len());
     let mut cursor = 0;
-    while let Some(relative) = html[cursor..].find("<!--md-source:") {
+    while let Some(relative) = html[cursor..].find(DOM_SOURCE_MARKER_PREFIX) {
         let start = cursor + relative;
         let Some(end_relative) = html[start..].find("-->") else {
             break;
         };
         let end = start + end_relative + "-->".len();
         normalized.push_str(&html[cursor..start]);
-        normalized.push_str("<!--md-source-->");
+        normalized.push_str("<!--md-editor-source-->");
         cursor = end;
     }
     normalized.push_str(&html[cursor..]);
     let mut markerless = String::with_capacity(normalized.len());
     let mut cursor = 0;
-    while let Some(relative) = normalized[cursor..].find("<!--md-block:") {
+    while let Some(relative) = normalized[cursor..].find(DOM_BLOCK_MARKER_PREFIX) {
         let start = cursor + relative;
         markerless.push_str(&normalized[cursor..start]);
-        markerless.push_str("<!--md-block-->");
+        markerless.push_str("<!--md-editor-block-->");
         let Some(end_relative) = normalized[start..].find("-->") else {
             cursor = start;
             break;
@@ -2993,7 +2948,7 @@ fn stable_chunk_id(index: usize) -> u64 {
 }
 
 fn block_anchor(id: u64) -> String {
-    format!("<!--md-block:{id}-->")
+    format!("{DOM_BLOCK_MARKER_PREFIX}{id}-->")
 }
 
 fn heading_bounds(html: &str) -> Option<(usize, usize)> {
@@ -3011,8 +2966,39 @@ fn heading_bounds(html: &str) -> Option<(usize, usize)> {
     first.zip(last)
 }
 
+fn rewrite_heading_ids(html: &str, mut heading_index: usize) -> String {
+    let marker = "id=\"md-heading-";
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = html[cursor..].find(marker) {
+        let start = cursor + relative;
+        let digits_start = start + marker.len();
+        let Some(digits_end) = html[digits_start..]
+            .find('"')
+            .map(|offset| digits_start + offset)
+        else {
+            break;
+        };
+        if html[digits_start..digits_end]
+            .chars()
+            .any(|character| !character.is_ascii_digit())
+        {
+            cursor = digits_end + 1;
+            continue;
+        }
+        output.push_str(&html[cursor..start]);
+        output.push_str(marker);
+        output.push_str(&heading_index.to_string());
+        output.push('"');
+        heading_index += 1;
+        cursor = digits_end + 1;
+    }
+    output.push_str(&html[cursor..]);
+    output
+}
+
 fn source_anchor(source_line: f32) -> String {
-    format!("<!--md-source:{source_line}-->")
+    format!("{DOM_SOURCE_MARKER_PREFIX}{source_line}-->")
 }
 
 fn source_line_starts(markdown: &str) -> Vec<usize> {
@@ -4166,11 +4152,11 @@ mod tests {
     #[test]
     fn virtual_chunk_boundary_drift_forces_full_rebuild() {
         let old = format!(
-            "<!--md-source:0-->{}<!--md-source:1-->tail",
+            "<!--md-editor-source:0-->{}<!--md-editor-source:1-->tail",
             "a".repeat(95 * 1024)
         );
         let new = format!(
-            "<!--md-source:0-->{}<!--md-source:1-->tail",
+            "<!--md-editor-source:0-->{}<!--md-editor-source:1-->tail",
             "a".repeat(100 * 1024)
         );
 
@@ -4245,15 +4231,32 @@ mod tests {
             ids
         );
         for id in ids {
-            assert!(html.contains(&format!("<!--md-block:{id}-->")));
+            assert!(html.contains(&format!("<!--md-editor-block:{id}-->")));
         }
+    }
+
+    #[test]
+    fn raw_html_comments_cannot_be_confused_with_dom_bridge_markers() {
+        let document = crate::markdown::parse_document("<!--md-source:42-->\n\n正文\n");
+        let html = super::document(&document, "", None, None, None);
+
+        assert!(html.contains("<!--md-source:42-->"));
+        assert_eq!(
+            super::source_marker_ranges(&html).len(),
+            super::document_source_anchors(&document).len()
+        );
+        assert!(!html.contains("<!--md-editor-block:42-->"));
     }
 
     #[test]
     fn block_identity_markers_do_not_change_content_hash() {
         assert_eq!(
-            super::hash_source_markerless("<!--md-source:1--><!--md-block:1--><p>x</p>"),
-            super::hash_source_markerless("<!--md-source:1--><!--md-block:2--><p>x</p>"),
+            super::hash_source_markerless(
+                "<!--md-editor-source:1--><!--md-editor-block:1--><p>x</p>"
+            ),
+            super::hash_source_markerless(
+                "<!--md-editor-source:1--><!--md-editor-block:2--><p>x</p>"
+            ),
         );
     }
 
@@ -4325,7 +4328,7 @@ mod tests {
 
     #[test]
     fn virtual_chunk_manifest_exposes_stable_block_metadata() {
-        let html = "<!--md-source:0--><!--md-block:11--><p>A</p><!--md-source:1--><!--md-block:22--><p>B</p>";
+        let html = "<!--md-editor-source:0--><!--md-editor-block:11--><p>A</p><!--md-editor-source:1--><!--md-editor-block:22--><p>B</p>";
         let (ids, hashes) = super::virtual_chunk_block_metadata(html);
 
         assert_eq!(ids, vec![11, 22]);
@@ -4333,7 +4336,7 @@ mod tests {
         assert_ne!(hashes[0], hashes[1]);
         assert_eq!(
             hashes[0],
-            super::hash_source_markerless("<p>A</p><!--md-source:1-->")
+            super::hash_source_markerless("<p>A</p><!--md-editor-source:1-->")
         );
     }
 
@@ -4842,7 +4845,7 @@ mod tests {
         );
         for source_line in [0, 2, 4, 7] {
             assert!(
-                html.contains(&format!("<!--md-source:{source_line}-->")),
+                html.contains(&format!("<!--md-editor-source:{source_line}-->")),
                 "missing source line {source_line}: {html}"
             );
         }
