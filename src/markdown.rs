@@ -510,6 +510,9 @@ pub fn parse_document_incremental(
     if ranges.len() != previous.blocks.len() {
         return None;
     }
+    if ranges.is_empty() {
+        return None;
+    }
     // Reparse the blocks touched by the edit together with their immediate
     // neighbors.  The reparsed window may contain a different number of
     // blocks, which covers inserting or deleting a paragraph without forcing
