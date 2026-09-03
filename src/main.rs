@@ -17,7 +17,7 @@ mod window_close;
 mod window_session;
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -329,6 +329,51 @@ struct RenderResult {
     key: BrowserDocumentKey,
     document: Arc<web_preview::PreviewDocument>,
     parsed_document: Arc<ParsedDocument>,
+    metrics: RenderTelemetry,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, Default)]
+struct RenderTelemetry {
+    elapsed_ms: f64,
+    replaced_blocks: usize,
+    replaced_virtual_chunks: usize,
+    full_navigation: bool,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+#[derive(Default)]
+struct RenderMetrics {
+    last: RenderTelemetry,
+    samples_ms: VecDeque<f64>,
+    full_navigation_count: usize,
+    replaced_blocks: usize,
+    replaced_virtual_chunks: usize,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl RenderMetrics {
+    fn record(&mut self, telemetry: RenderTelemetry) {
+        self.last = telemetry;
+        self.full_navigation_count += usize::from(telemetry.full_navigation);
+        self.replaced_blocks += telemetry.replaced_blocks;
+        self.replaced_virtual_chunks += telemetry.replaced_virtual_chunks;
+        self.samples_ms.push_back(telemetry.elapsed_ms);
+        if self.samples_ms.len() > 128 {
+            self.samples_ms.pop_front();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn edit_p95_ms(&self) -> f64 {
+        if self.samples_ms.is_empty() {
+            return 0.0;
+        }
+        let mut samples = self.samples_ms.iter().copied().collect::<Vec<_>>();
+        samples.sort_by(f64::total_cmp);
+        let index = ((samples.len() - 1) * 95).div_ceil(100);
+        samples[index]
+    }
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -348,42 +393,60 @@ impl RenderWorker {
                     request = newer;
                 }
                 let parsed_document = Arc::new(request.document.clone());
-                let document = Arc::new(
+                let started = Instant::now();
+                let mut full_navigation = false;
+                let document = if let Some(document) =
                     web_preview::preview_document_virtual_incremental(
                         request.previous.as_deref(),
                         request.previous_parsed.as_deref(),
                         &request.document,
                         request.base_directory.as_deref(),
+                    ) {
+                    document
+                } else if let Some(document) = web_preview::preview_document_incremental(
+                    request.previous.as_deref(),
+                    request.previous_parsed.as_deref(),
+                    &request.document,
+                    request.base_directory.as_deref(),
+                ) {
+                    document
+                } else if let Some(document) = web_preview::preview_document_with_previous(
+                    request.previous.as_deref(),
+                    &request.document,
+                ) {
+                    document
+                } else {
+                    full_navigation = true;
+                    web_preview::preview_document(
+                        &request.document,
+                        &request.css,
+                        request.base_directory.as_deref(),
+                        request.font_size_override,
+                        request.dark_mode_css.as_deref(),
                     )
-                    .or_else(|| {
-                        web_preview::preview_document_incremental(
-                            request.previous.as_deref(),
-                            request.previous_parsed.as_deref(),
-                            &request.document,
-                            request.base_directory.as_deref(),
-                        )
-                    })
-                    .or_else(|| {
-                        web_preview::preview_document_with_previous(
-                            request.previous.as_deref(),
-                            &request.document,
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        web_preview::preview_document(
-                            &request.document,
-                            &request.css,
-                            request.base_directory.as_deref(),
-                            request.font_size_override,
-                            request.dark_mode_css.as_deref(),
-                        )
-                    }),
-                );
+                };
+                let replaced_virtual_chunks = request
+                    .previous
+                    .as_ref()
+                    .map_or(document.virtual_chunk_count(), |previous| {
+                        previous.changed_virtual_chunk_count(&document)
+                    });
+                let metrics = RenderTelemetry {
+                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    replaced_blocks: changed_block_count(
+                        request.previous_parsed.as_deref(),
+                        &request.document,
+                    ),
+                    replaced_virtual_chunks,
+                    full_navigation,
+                };
+                let document = Arc::new(document);
                 if result_sender
                     .send(RenderResult {
                         key: request.key,
                         document,
                         parsed_document,
+                        metrics,
                     })
                     .is_err()
                 {
@@ -404,6 +467,28 @@ impl RenderWorker {
     fn try_recv(&self) -> Result<RenderResult, mpsc::TryRecvError> {
         self.results.try_recv()
     }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn changed_block_count(previous: Option<&ParsedDocument>, next: &ParsedDocument) -> usize {
+    let Some(previous) = previous else {
+        return next.blocks().len();
+    };
+    let old_by_id = previous
+        .block_index()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.id, index))
+        .collect::<HashMap<_, _>>();
+    next.block_index()
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
+            old_by_id
+                .get(&entry.id)
+                .is_none_or(|old_index| previous.blocks()[*old_index] != next.blocks()[*index])
+        })
+        .count()
 }
 
 struct ParseRequest {
@@ -988,6 +1073,8 @@ struct MdEditorApp {
     render_worker: RenderWorker,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     render_pending: Option<BrowserDocumentKey>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    render_metrics: RenderMetrics,
 }
 
 impl std::ops::Deref for MdEditorApp {
@@ -1071,6 +1158,8 @@ impl MdEditorApp {
             render_worker: RenderWorker::new(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             render_pending: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            render_metrics: RenderMetrics::default(),
         }
     }
 
@@ -1496,6 +1585,14 @@ impl MdEditorApp {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     fn queue_browser_render(&mut self, key: BrowserDocumentKey) {
+        // Parsing runs on a background worker.  While it is pending `self.text`
+        // already belongs to the new revision, but `self.document` is still the
+        // previous parsed tree.  Never submit that tree under the new key: the
+        // worker result would otherwise look current to the UI and briefly
+        // replace the preview with stale content.
+        if key != self.current_browser_document_key() || self.document.source() != self.text {
+            return;
+        }
         if self.render_pending.as_ref() == Some(&key) {
             return;
         }
@@ -1510,7 +1607,11 @@ impl MdEditorApp {
         let current_key = self.current_browser_document_key();
         let mut changed = false;
         while let Ok(result) = self.render_worker.try_recv() {
-            if result.key == current_key {
+            // The key protects the tab/revision, while this source check also
+            // protects against a request that captured an older ParsedDocument
+            // before parsing caught up with the current text.
+            if result.key == current_key && result.parsed_document.source() == self.text {
+                self.render_metrics.record(result.metrics);
                 self.browser_document_cache = Some(BrowserDocumentCache {
                     key: result.key.clone(),
                     document: result.document,
@@ -4145,6 +4246,42 @@ mod app_tests {
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
+    fn render_is_not_queued_until_parsed_document_matches_current_text() {
+        let mut app = app_with_two_tabs();
+        app.text.push_str("\n尚未完成解析");
+        app.document_revision = app.document_revision.wrapping_add(1);
+        let key = app.current_browser_document_key();
+
+        app.queue_browser_render(key);
+
+        assert!(app.render_pending.is_none());
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn render_metrics_record_incremental_cost_and_navigation_fallbacks() {
+        let mut metrics = RenderMetrics::default();
+        metrics.record(RenderTelemetry {
+            elapsed_ms: 4.0,
+            replaced_blocks: 2,
+            replaced_virtual_chunks: 1,
+            full_navigation: false,
+        });
+        metrics.record(RenderTelemetry {
+            elapsed_ms: 9.0,
+            replaced_blocks: 5,
+            replaced_virtual_chunks: 3,
+            full_navigation: true,
+        });
+
+        assert_eq!(metrics.full_navigation_count, 1);
+        assert_eq!(metrics.replaced_blocks, 7);
+        assert_eq!(metrics.replaced_virtual_chunks, 4);
+        assert_eq!(metrics.edit_p95_ms(), 9.0);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
     fn browser_font_size_change_keeps_render_context() {
         let mut app = app_with_two_tabs();
         let initial = app.current_browser_document_key();
@@ -4239,6 +4376,8 @@ mod app_tests {
             render_worker: RenderWorker::new(),
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             render_pending: None,
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            render_metrics: RenderMetrics::default(),
         }
     }
 

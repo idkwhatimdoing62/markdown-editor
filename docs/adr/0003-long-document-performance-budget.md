@@ -18,7 +18,7 @@
 5. 主进程及全部后代进程的峰值工作集、私有内存和 WebView 进程数。
 6. 单次可重复编辑的增量路径：端到端耗时 P95、受影响块数、受影响虚拟分片数，以及是否退回整页导航。
 
-核心基准 JSON 的 `incremental_edit` 字段对应第 6 项。`full_navigation_count` 是该档位代表性编辑的回退次数；值为 0 表示编辑可以在现有预览上下文内完成局部更新。
+核心基准 JSON 的 `incremental_edit` 字段对应第 6 项。运行时 `RenderWorker` 也会为每次接受的预览结果记录耗时、替换块数、替换虚拟分片数和整页导航标记，并保留最近 128 次样本计算编辑 P95。`full_navigation_count` 是该档位代表性编辑的回退次数；值为 0 表示编辑可以在现有预览上下文内完成局部更新。
 
 脚本位于 `scripts/benchmark-long-docs.ps1`，原始 JSON 写入被 Git 忽略的 `artifacts/performance/`。默认命令用于采样：
 

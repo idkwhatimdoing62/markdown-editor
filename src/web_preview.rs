@@ -2184,8 +2184,9 @@ pub fn preview_document_virtual_incremental(
         let heading_bounds = heading_bounds(&html);
         let source_anchors = source_markers(&html);
         let block_count = virtual_block_marker_ranges(&html).len();
+        let block_id = block_id_in_html(&html).unwrap_or(old_chunk.block_id);
         chunks.push(PreviewChunk {
-            block_id: old_chunk.block_id,
+            block_id,
             content_hash: hash_source_markerless(&html),
             html: html.into(),
             source_start,
@@ -2699,13 +2700,19 @@ fn virtualize_document(html: String) -> PreviewDocument {
             .max(image_count as f32 * ESTIMATED_IMAGE_HEIGHT)
             .max(96.0);
         let heading_bounds = heading_bounds(&body[start..end]);
+        let chunk_html = &body[start..end];
         chunks.push(PreviewChunk {
-            html: Arc::from(&body[start..end]),
-            block_id: stable_chunk_id(index),
-            content_hash: hash_source_markerless(&body[start..end]),
+            html: Arc::from(chunk_html),
+            // A virtual chunk is a transport boundary, not a document block.
+            // Reuse the first stable top-level block marker it contains so
+            // inserting/removing earlier content does not make every later
+            // chunk appear to be a different block.  Marker-less chunks keep
+            // the deterministic index fallback for compatibility.
+            block_id: block_id_in_html(chunk_html).unwrap_or_else(|| stable_chunk_id(index)),
+            content_hash: hash_source_markerless(chunk_html),
             source_start,
             source_end: source_end_for_chunk,
-            source_anchors: source_markers(&body[start..end]).into(),
+            source_anchors: source_markers(chunk_html).into(),
             estimated_height,
             heading_start: heading_bounds.map(|bounds| bounds.0),
             heading_end: heading_bounds.map(|bounds| bounds.1),
@@ -4177,6 +4184,13 @@ mod tests {
             incremental_ids, full_ids,
             "first differing chunk: {first_difference:?}"
         );
+        for chunk in full.chunks.iter() {
+            assert_eq!(
+                Some(chunk.block_id),
+                super::block_id_in_html(&chunk.html),
+                "virtual chunk IDs must inherit a stable document block marker"
+            );
+        }
         assert_eq!(incremental.virtual_manifest, full.virtual_manifest);
     }
 
