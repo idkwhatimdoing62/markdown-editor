@@ -1809,9 +1809,11 @@ impl BrowserPreview {
             }
             repaint.request_repaint();
         });
-        let configuration = WKPDFConfiguration::new(
-            MainThreadMarker::new().ok_or_else(|| "PDF 导出必须在主线程执行".to_string())?,
-        );
+        let configuration = unsafe {
+            WKPDFConfiguration::new(
+                MainThreadMarker::new().ok_or_else(|| "PDF 导出必须在主线程执行".to_string())?,
+            )
+        };
         unsafe {
             webview
                 .webview()
