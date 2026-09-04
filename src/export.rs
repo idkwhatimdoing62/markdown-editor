@@ -44,7 +44,7 @@ pub fn export_html(
     options: ExportOptions<'_>,
 ) -> Result<(), String> {
     let doc = render_styled_html(document, options);
-    std::fs::write(path, doc).map_err(|e| e.to_string())
+    crate::storage::write_atomic(path, doc.as_bytes()).map_err(|e| e.to_string())
 }
 
 pub fn render_styled_html(document: &ParsedDocument, options: ExportOptions<'_>) -> String {
@@ -96,7 +96,7 @@ pub fn export_pdf(
     let doc =
         printpdf::PdfDocument::from_html(&html_doc, &images, &fonts, &options, &mut warnings)?;
     let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    crate::storage::write_atomic(path, &bytes).map_err(|e| e.to_string())
 }
 
 fn compact_html_between_tags(html: &str) -> String {
@@ -251,6 +251,10 @@ fn export_image_destination(
 ) -> Option<String> {
     let path = local_image_path(destination, base_directory)?;
     let content_type = image_content_type(&path)?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    if metadata.len() > crate::io::MAX_IMAGE_FILE_SIZE {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     Some(match mode {
         ImageMode::StandaloneHtml => {

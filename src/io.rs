@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::storage;
 
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
+pub const MAX_IMAGE_FILE_SIZE: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReadError {
@@ -75,13 +76,13 @@ pub fn save_with_conflict_check(
         return Err(SaveError::ExternalModified);
     }
     let bytes = text.as_bytes();
-    fs::write(path, bytes).map_err(|e| SaveError::Io(e.to_string()))?;
+    storage::write_atomic(path, bytes).map_err(|e| SaveError::Io(e.to_string()))?;
     Ok(bytes.to_vec())
 }
 
 pub fn save_overwrite(path: &Path, text: &str) -> Result<Vec<u8>, String> {
     let bytes = text.as_bytes();
-    fs::write(path, bytes).map_err(|e| e.to_string())?;
+    storage::write_atomic(path, bytes).map_err(|e| e.to_string())?;
     Ok(bytes.to_vec())
 }
 

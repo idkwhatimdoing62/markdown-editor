@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage;
 
+const MAX_THEME_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_THEME_ARCHIVE_ENTRIES: usize = 128;
+const MAX_THEME_ARCHIVE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub const BUILT_IN_SSPAI_CSS: &str = include_str!("../assets/sspai.css");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -173,11 +177,20 @@ impl ThemePackage {
             .to_ascii_lowercase();
         match ext.as_str() {
             "json" => {
+                let metadata =
+                    std::fs::metadata(path).map_err(|e| format!("无法读取主题包：{e}"))?;
+                if metadata.len() > MAX_THEME_FILE_BYTES {
+                    return Err("主题 JSON 超过 2 MiB 限制".to_string());
+                }
                 let text =
                     std::fs::read_to_string(path).map_err(|e| format!("无法读取主题包：{e}"))?;
                 Self::from_json(&text)
             }
             "css" => {
+                let metadata = std::fs::metadata(path).map_err(|e| format!("无法读取 CSS：{e}"))?;
+                if metadata.len() > MAX_THEME_FILE_BYTES {
+                    return Err("CSS 主题超过 2 MiB 限制".to_string());
+                }
                 let css =
                     std::fs::read_to_string(path).map_err(|e| format!("无法读取 CSS：{e}"))?;
                 let name = path
@@ -194,16 +207,29 @@ impl ThemePackage {
     fn from_zip(path: &Path) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| format!("无法打开 ZIP：{e}"))?;
         let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP 格式无效：{e}"))?;
+        if archive.len() > MAX_THEME_ARCHIVE_ENTRIES {
+            return Err("主题 ZIP 条目数超过 128 个限制".to_string());
+        }
         let mut css_candidate: Option<(String, String)> = None;
+        let mut candidate_bytes = 0u64;
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
-            if entry.is_dir() || entry.size() > 2 * 1024 * 1024 {
+            if entry.is_dir() {
                 continue;
             }
             let name = entry.name().to_string();
             let lower = name.to_ascii_lowercase();
             if !lower.ends_with(".json") && !lower.ends_with(".css") {
                 continue;
+            }
+            if entry.size() > MAX_THEME_FILE_BYTES {
+                continue;
+            }
+            candidate_bytes = candidate_bytes
+                .checked_add(entry.size())
+                .ok_or_else(|| "主题 ZIP 解压总大小溢出".to_string())?;
+            if candidate_bytes > MAX_THEME_ARCHIVE_BYTES {
+                return Err("主题 ZIP 中 CSS/JSON 解压总大小超过 16 MiB 限制".to_string());
             }
             let mut text = String::new();
             entry
