@@ -18,7 +18,7 @@ egui = "0.35.0"
 fs2 = "0.4"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 notify = "8.2"
-printpdf = "0.12.5"
+printpdf = "0.12.7"
 pulldown-cmark = "0.13.4"
 rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
