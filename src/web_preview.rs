@@ -40,7 +40,7 @@ pub struct BrowserPreview {
     font_asset_requests: Arc<[AtomicUsize; 4]>,
     applied_font_size: Option<(u32, u32)>,
     pdf_export_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
-    pdf_export_pending: Option<(PathBuf, egui::Context)>,
+    pdf_export_pending: Option<(PathBuf, egui::Context, u64)>,
     pdf_export_in_flight: bool,
 }
 
@@ -1233,10 +1233,15 @@ impl BrowserPreview {
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             bridge.pdf_ready = false;
         }
+        // The preparation hook is installed by the initialization script. If
+        // an older/partially initialized WebView does not have it yet, signal
+        // readiness instead of leaving the export request waiting forever.
         webview
-            .evaluate_script("window.__mdEditorPrepareForPrint?.();")
+            .evaluate_script(
+                "window.__mdEditorPrepareForPrint ? window.__mdEditorPrepareForPrint() : window.ipc.postMessage('md-pdf-ready');",
+            )
             .map_err(|error| format!("无法准备 PDF：{error}"))?;
-        self.pdf_export_pending = Some((path.to_path_buf(), ctx.clone()));
+        self.pdf_export_pending = Some((path.to_path_buf(), ctx.clone(), self.document_hash));
         Ok(true)
     }
 
@@ -1247,13 +1252,21 @@ impl BrowserPreview {
             .unwrap_or(false)
     }
 
-    fn maybe_start_pending_pdf_export(&mut self) -> Result<(), String> {
+    fn maybe_start_pending_pdf_export(&mut self, current_hash: u64) -> Result<(), String> {
         if !self.take_pdf_ready() {
             return Ok(());
         }
-        let Some((path, ctx)) = self.pdf_export_pending.take() else {
+        let Some((path, ctx, pending_hash)) = self.pdf_export_pending.take() else {
             return Ok(());
         };
+        if pending_hash != current_hash {
+            self.pdf_export_in_flight = false;
+            self.finish_virtual_pdf_mode();
+            if let Ok(mut slot) = self.pdf_export_result.lock() {
+                *slot = Some(Err("文档在 PDF 导出准备期间发生变化，已取消本次导出".to_string()));
+            }
+            return Ok(());
+        }
         let result = self.start_pdf_export_now(&path, &ctx);
         if result.is_err() {
             self.pdf_export_in_flight = false;
@@ -1401,7 +1414,7 @@ impl BrowserPreview {
             return Ok(PreviewApplyKind::Created);
         }
 
-        self.maybe_start_pending_pdf_export()?;
+        self.maybe_start_pending_pdf_export(document_hash)?;
 
         let body_patch = self
             .document_source
