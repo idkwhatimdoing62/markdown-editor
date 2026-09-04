@@ -32,6 +32,12 @@ winresource = "0.1.30"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 wry = { version = "0.55.1", default-features = false, features = ["protocol"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSError"] }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKPDFConfiguration", "WKWebView"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6.2"
 webview2-com = "0.38.2"

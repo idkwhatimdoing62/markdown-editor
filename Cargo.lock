@@ -2437,11 +2437,15 @@ name = "markdown-editor"
 version = "0.1.26"
 dependencies = [
  "base64",
+ "block2 0.6.2",
  "eframe",
  "egui",
  "fs2",
  "image",
  "notify",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "objc2-web-kit",
  "printpdf",
  "pulldown-cmark",
  "raw-window-handle",

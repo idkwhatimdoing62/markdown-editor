@@ -40,6 +40,8 @@ pub struct BrowserPreview {
     font_asset_requests: Arc<[AtomicUsize; 4]>,
     applied_font_size: Option<(u32, u32)>,
     pdf_export_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+    pdf_export_pending: Option<(PathBuf, egui::Context)>,
+    pdf_export_in_flight: bool,
 }
 
 #[derive(Clone)]
@@ -246,6 +248,7 @@ struct ScrollBridge {
     user_anchor: Option<ScrollAnchor>,
     dropped_paths: Vec<PathBuf>,
     ready: Option<WebViewReady>,
+    pdf_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -583,6 +586,30 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     }
   };
 
+  window.__mdEditorPrepareForPrint = async () => {
+    if (window.__mdVirtualPreview?.prepareForPrint) {
+      await window.__mdVirtualPreview.prepareForPrint();
+    }
+    if (window.__mdRenderMermaid) await window.__mdRenderMermaid(document);
+    await document.fonts.ready;
+    await Promise.all(Array.from(document.images).map(async (image) => {
+      try {
+        if (typeof image.decode === 'function') await image.decode();
+        else if (!image.complete) {
+          await new Promise((resolve) => {
+            image.addEventListener('load', resolve, { once: true });
+            image.addEventListener('error', resolve, { once: true });
+          });
+        }
+      } catch (_) {
+        // Broken images stay visible as browser-native placeholders, matching
+        // the live preview instead of aborting the whole export.
+      }
+    }));
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    window.ipc.postMessage('md-pdf-ready');
+  };
+
   const mapPatchedAnchorIndex = (index, patch, newBlockCount) => {
     if (!patch) return Math.min(index, newBlockCount);
     if (Array.isArray(patch.anchorMap) && Number.isInteger(patch.anchorMap[index])) {
@@ -757,6 +784,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
   let revision = new URL(location.href).searchParams.get('revision') || '';
   let updateRevision = 0;
   let scheduled = false;
+  let printing = false;
 
   const placeholderFor = (chunk) => {
     const node = document.createElement('div');
@@ -865,6 +893,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
   };
 
   const unload = (chunk) => {
+    if (printing) return;
     if (!chunk.start || !chunk.end) return;
     const placeholder = placeholderFor(chunk);
     chunk.start.before(placeholder);
@@ -1048,6 +1077,21 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     }
   };
 
+  // PDF export must include every virtual chunk, not only the chunks near the
+  // current viewport. Keep all chunks mounted while the native browser print
+  // API snapshots the document, then let normal virtualization resume.
+  const prepareForPrint = async () => {
+    printing = true;
+    for (const chunk of chunks) await load(chunk);
+    await document.fonts.ready;
+    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  };
+
+  const finishPrint = () => {
+    printing = false;
+    schedule();
+  };
+
   const scriptNode = document.currentScript;
   const anchor = document.createElement('span');
   anchor.id = 'md-virtual-anchor';
@@ -1117,6 +1161,8 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     loadSource: (source) => load(findBySource(source)),
     captureViewportAnchor: captureVirtualViewportAnchor,
     restoreViewportAnchor: restoreVirtualViewportAnchor,
+    prepareForPrint,
+    finishPrint,
     patch,
   };
   window.addEventListener('scroll', schedule, { passive: true });
@@ -1158,6 +1204,8 @@ impl Default for BrowserPreview {
             font_asset_requests: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
             applied_font_size: None,
             pdf_export_result: Arc::new(Mutex::new(None)),
+            pdf_export_pending: None,
+            pdf_export_in_flight: false,
         }
     }
 }
@@ -1171,6 +1219,55 @@ pub enum PreviewApplyKind {
 }
 
 impl BrowserPreview {
+    fn queue_pdf_export(
+        &mut self,
+        path: &Path,
+        ctx: &egui::Context,
+    ) -> Result<bool, String> {
+        if self.pdf_export_pending.is_some() {
+            return Err("已有一个 PDF 导出正在进行".to_string());
+        }
+        let Some(webview) = &self.webview else {
+            return Err("浏览器预览尚未就绪".to_string());
+        };
+        if let Ok(mut bridge) = self.scroll_bridge.lock() {
+            bridge.pdf_ready = false;
+        }
+        webview
+            .evaluate_script("window.__mdEditorPrepareForPrint?.();")
+            .map_err(|error| format!("无法准备 PDF：{error}"))?;
+        self.pdf_export_pending = Some((path.to_path_buf(), ctx.clone()));
+        Ok(true)
+    }
+
+    fn take_pdf_ready(&self) -> bool {
+        self.scroll_bridge
+            .lock()
+            .map(|mut bridge| std::mem::take(&mut bridge.pdf_ready))
+            .unwrap_or(false)
+    }
+
+    fn maybe_start_pending_pdf_export(&mut self) -> Result<(), String> {
+        if !self.take_pdf_ready() {
+            return Ok(());
+        }
+        let Some((path, ctx)) = self.pdf_export_pending.take() else {
+            return Ok(());
+        };
+        let result = self.start_pdf_export_now(&path, &ctx);
+        if result.is_err() {
+            self.pdf_export_in_flight = false;
+            self.finish_virtual_pdf_mode();
+        }
+        result
+    }
+
+    fn finish_virtual_pdf_mode(&self) {
+        if let Some(webview) = &self.webview {
+            let _ = webview.evaluate_script("window.__mdVirtualPreview?.finishPrint?.();");
+        }
+    }
+
     pub fn show(
         &mut self,
         frame: &eframe::Frame,
@@ -1227,7 +1324,12 @@ impl BrowserPreview {
                 })
                 .with_initialization_script(SCROLL_SYNC_SCRIPT)
                 .with_ipc_handler(move |request| {
-                    if let Some(ready) = parse_ready_message(request.body())
+                    if request.body() == "md-pdf-ready" {
+                        if let Ok(mut bridge) = scroll_bridge.lock() {
+                            bridge.pdf_ready = true;
+                        }
+                        ipc_repaint_ctx.request_repaint();
+                    } else if let Some(ready) = parse_ready_message(request.body())
                         .or_else(|| parse_ready_error(request.body()))
                     {
                         if let Ok(mut bridge) = scroll_bridge.lock() {
@@ -1298,6 +1400,8 @@ impl BrowserPreview {
             self.visible = true;
             return Ok(PreviewApplyKind::Created);
         }
+
+        self.maybe_start_pending_pdf_export()?;
 
         let body_patch = self
             .document_source
@@ -1389,6 +1493,7 @@ impl BrowserPreview {
             bridge.user_source_position = None;
             bridge.user_anchor = None;
             bridge.ready = None;
+            bridge.pdf_ready = false;
         }
     }
 
@@ -1413,6 +1518,8 @@ impl BrowserPreview {
         self.bounds = None;
         self.frozen_frame = None;
         self.applied_font_size = None;
+        self.pdf_export_pending = None;
+        self.pdf_export_in_flight = false;
         if let Ok(mut result) = self.pdf_export_result.lock() {
             *result = None;
         }
@@ -1533,7 +1640,7 @@ impl BrowserPreview {
     /// The callback completes asynchronously on the WebView UI thread. The
     /// caller should poll [`take_pdf_export_result`] on subsequent frames.
     #[cfg(target_os = "windows")]
-    pub fn export_pdf(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
+    fn start_pdf_export_now(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
         use std::fs;
         use webview2_com::Microsoft::Web::WebView2::Win32::{
             ICoreWebView2_7, ICoreWebView2Environment6,
@@ -1625,16 +1732,101 @@ impl BrowserPreview {
         Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "windows")]
+    pub fn export_pdf(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
+        if self.pdf_export_in_flight {
+            return Err("已有一个 PDF 导出正在进行".to_string());
+        }
+        self.queue_pdf_export(path, ctx)?;
+        self.pdf_export_in_flight = true;
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_pdf_export_now(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
+        use block2::RcBlock;
+        use objc2::MainThreadMarker;
+        use objc2_foundation::{NSData, NSError};
+        use objc2_web_kit::WKPDFConfiguration;
+        use std::fs;
+        use wry::WebViewExtMacOS;
+
+        let Some(webview) = &self.webview else {
+            return Err("浏览器预览尚未就绪".to_string());
+        };
+        let target = path.to_path_buf();
+        let temporary = target.with_file_name(format!(
+            ".{}.markdown-editor.pdf.tmp",
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("export")
+        ));
+        let _ = fs::remove_file(&temporary);
+        let result_slot = Arc::clone(&self.pdf_export_result);
+        let repaint = ctx.clone();
+        let callback_temporary = temporary.clone();
+        let callback_target = target.clone();
+        let callback = RcBlock::new(move |data: *mut NSData, error: *mut NSError| {
+            let result = if !error.is_null() {
+                Err("WKWebView PDF 导出失败".to_string())
+            } else if data.is_null() {
+                Err("WKWebView 未返回 PDF 数据".to_string())
+            } else {
+                // The callback owns a valid NSData for the duration of the
+                // call. Copy it before writing so no Objective-C object crosses
+                // the Rust application boundary.
+                let bytes = unsafe { (&*data).to_vec() };
+                fs::write(&callback_temporary, bytes)
+                    .and_then(|_| fs::rename(&callback_temporary, &callback_target))
+                    .map(|_| callback_target.clone())
+                    .map_err(|error| format!("无法写入 PDF：{error}"))
+            };
+            if result.is_err() {
+                let _ = fs::remove_file(&callback_temporary);
+            }
+            if let Ok(mut slot) = result_slot.lock() {
+                *slot = Some(result);
+            }
+            repaint.request_repaint();
+        });
+        let configuration = WKPDFConfiguration::new(
+            MainThreadMarker::new().ok_or_else(|| "PDF 导出必须在主线程执行".to_string())?,
+        );
+        unsafe {
+            webview
+                .webview()
+                .createPDFWithConfiguration_completionHandler(Some(&configuration), &callback);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn export_pdf(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
+        if self.pdf_export_in_flight {
+            return Err("已有一个 PDF 导出正在进行".to_string());
+        }
+        self.queue_pdf_export(path, ctx)?;
+        self.pdf_export_in_flight = true;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     pub fn export_pdf(&mut self, _path: &Path, _ctx: &egui::Context) -> Result<(), String> {
         Err("当前平台暂未接入浏览器原生 PDF 导出".to_string())
     }
 
     pub fn take_pdf_export_result(&mut self) -> Option<Result<PathBuf, String>> {
-        self.pdf_export_result
+        let result = self
+            .pdf_export_result
             .lock()
             .ok()
-            .and_then(|mut result| result.take())
+            .and_then(|mut result| result.take());
+        if result.is_some() {
+            self.pdf_export_in_flight = false;
+            self.finish_virtual_pdf_mode();
+        }
+        result
     }
 
     pub fn has_webview(&self) -> bool {
