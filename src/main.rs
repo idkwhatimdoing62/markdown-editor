@@ -399,24 +399,20 @@ impl RenderMetrics {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct LatestRequestState<T> {
     pending: Mutex<Option<T>>,
     wake: Condvar,
     closed: AtomicBool,
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct LatestRequestSender<T> {
     state: Arc<LatestRequestState<T>>,
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct LatestRequestReceiver<T> {
     state: Arc<LatestRequestState<T>>,
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl<T> LatestRequestState<T> {
     fn channel() -> (LatestRequestSender<T>, LatestRequestReceiver<T>) {
         let state = Arc::new(Self {
@@ -433,7 +429,6 @@ impl<T> LatestRequestState<T> {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl<T> LatestRequestSender<T> {
     fn submit(&self, request: T) {
         if let Ok(mut pending) = self.state.pending.lock() {
@@ -449,7 +444,6 @@ impl<T> LatestRequestSender<T> {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl<T> Drop for LatestRequestSender<T> {
     fn drop(&mut self) {
         self.state.closed.store(true, Ordering::Release);
@@ -457,7 +451,6 @@ impl<T> Drop for LatestRequestSender<T> {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 impl<T> LatestRequestReceiver<T> {
     fn recv(&self) -> Option<T> {
         let mut pending = self.state.pending.lock().ok()?;
@@ -4215,7 +4208,6 @@ fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
 mod app_tests {
     use super::*;
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
     #[test]
     fn latest_request_queue_keeps_only_newest_and_closes_cleanly() {
         let (sender, receiver) = LatestRequestState::<u32>::channel();
