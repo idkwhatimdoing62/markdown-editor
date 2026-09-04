@@ -554,6 +554,7 @@ fn is_incremental_block_safe(block: &Block) -> bool {
             | Block::Quote(_)
             | Block::Table { .. }
             | Block::Rule
+            | Block::Raw(_)
     )
 }
 
@@ -1356,7 +1357,11 @@ mod tests {
     fn incremental_parse_reparses_raw_html_block() {
         let previous = parse_document("<div>旧内容</div>\n\n后文\n");
         let next_source = "<div><span>新内容</span></div>\n\n后文\n";
-        assert!(parse_document_incremental(&previous, next_source).is_none());
+        let next = parse_document_incremental(&previous, next_source)
+            .expect("原始 HTML 块内部的修改应保持在父块范围内");
+        let full = parse_document(next_source);
+        assert_eq!(next.blocks(), full.blocks());
+        assert_eq!(next.events(), full.events());
     }
 
     #[test]
