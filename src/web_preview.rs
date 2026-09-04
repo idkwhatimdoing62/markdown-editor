@@ -60,6 +60,13 @@ pub struct PreviewDocument {
     /// The same shared index carried by `ParsedDocument`, enriched with the
     /// latest direct-preview height estimates when available.
     block_index: Arc<[crate::markdown::BlockIndexEntry]>,
+    update_stats: PreviewUpdateStats,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreviewUpdateStats {
+    pub replaced_blocks: usize,
+    pub replaced_virtual_chunks: usize,
 }
 
 const VIRTUALIZE_AT_BYTES: usize = 512 * 1024;
@@ -117,6 +124,10 @@ impl PreviewDocument {
     #[allow(dead_code)]
     pub fn block_index(&self) -> &[crate::markdown::BlockIndexEntry] {
         &self.block_index
+    }
+
+    pub fn update_stats(&self) -> PreviewUpdateStats {
+        self.update_stats
     }
 
     /// Counts virtual chunks whose identity or rendered content changed.
@@ -1149,6 +1160,14 @@ impl Default for BrowserPreview {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewApplyKind {
+    Created,
+    Patched,
+    Navigated,
+    Unchanged,
+}
+
 impl BrowserPreview {
     pub fn show(
         &mut self,
@@ -1157,7 +1176,7 @@ impl BrowserPreview {
         rect: egui::Rect,
         pixels_per_point: f32,
         document: &Arc<PreviewDocument>,
-    ) -> Result<(), String> {
+    ) -> Result<PreviewApplyKind, String> {
         let bounds = physical_bounds(rect, pixels_per_point);
         let source_changed = self
             .document_source
@@ -1257,7 +1276,7 @@ impl BrowserPreview {
             self.document_changed = true;
             self.bounds = Some(bounds);
             self.visible = true;
-            return Ok(());
+            return Ok(PreviewApplyKind::Created);
         }
 
         let body_patch = self
@@ -1282,8 +1301,8 @@ impl BrowserPreview {
                 .map_err(|error| format!("无法调整预览区域：{error}"))?;
             self.bounds = Some(bounds);
         }
-        if source_changed {
-            if patch_document {
+        let apply_kind = if source_changed {
+            let apply_kind = if patch_document {
                 let block_ids = body_patch.as_ref().map(|patch| {
                     patch
                         .block_ids
@@ -1310,22 +1329,27 @@ impl BrowserPreview {
                         "window.__mdEditorPatchBody?.('{document_hash:016x}', {patch_json});"
                     ))
                     .map_err(|error| format!("无法更新浏览器预览内容：{error}"))?;
+                PreviewApplyKind::Patched
             } else {
                 webview
                     .load_url(&preview_document_url(document_hash))
                     .map_err(|error| format!("无法刷新浏览器预览：{error}"))?;
-            }
+                PreviewApplyKind::Navigated
+            };
             self.document_hash = document_hash;
             self.document_source = Some(Arc::clone(document));
             self.document_changed = true;
-        }
+            apply_kind
+        } else {
+            PreviewApplyKind::Unchanged
+        };
         if !self.visible {
             webview
                 .set_visible(true)
                 .map_err(|error| format!("无法显示浏览器预览：{error}"))?;
             self.visible = true;
         }
-        Ok(())
+        Ok(apply_kind)
     }
 
     fn store_document(&self, document: &Arc<PreviewDocument>) {
@@ -1865,6 +1889,10 @@ pub fn preview_document(
     preview.block_fingerprint = block_fingerprint(document);
     preview.block_ids = block_ids.into();
     preview.block_index = enriched_block_index(document, &preview);
+    preview.update_stats = PreviewUpdateStats {
+        replaced_blocks: document.blocks().len(),
+        replaced_virtual_chunks: preview.virtual_chunk_count(),
+    };
     preview
 }
 
@@ -1900,6 +1928,7 @@ pub fn preview_document_placeholder(
         block_fingerprint: 0,
         block_ids: Arc::from([]),
         block_index: Arc::from([]),
+        update_stats: PreviewUpdateStats::default(),
     }
 }
 
@@ -1922,6 +1951,7 @@ pub fn preview_document_with_previous(
     preview.block_fingerprint = block_fingerprint(document);
     preview.block_ids = reconcile_top_level_block_ids(previous, document).into();
     preview.block_index = enriched_block_index(document, &preview);
+    preview.update_stats = PreviewUpdateStats::default();
     Some(preview)
 }
 
@@ -1960,6 +1990,7 @@ fn preview_document_incremental_variable(
     }
     let block_ids = stable_top_level_block_ids(document);
     let mut body = String::new();
+    let mut replaced_blocks = 0usize;
     body.push_str(&previous_preview.blocks.first()?.html);
     let old_by_id = previous_document
         .block_index()
@@ -1980,6 +2011,7 @@ fn preview_document_incremental_variable(
         {
             body.push_str(&rewrite_heading_ids(old_html, heading_index));
         } else {
+            replaced_blocks += 1;
             body.push_str(&render_incremental_block(
                 document,
                 index,
@@ -2005,6 +2037,10 @@ fn preview_document_incremental_variable(
     preview.block_fingerprint = block_fingerprint(document);
     preview.block_ids = block_ids.into();
     preview.block_index = enriched_block_index(document, &preview);
+    preview.update_stats = PreviewUpdateStats {
+        replaced_blocks,
+        replaced_virtual_chunks: 0,
+    };
     Some(preview)
 }
 
@@ -2084,6 +2120,11 @@ pub fn preview_document_incremental(
     let mut preview = virtualize_document(html);
     preview.block_fingerprint = block_fingerprint(document);
     preview.block_ids = block_ids.into();
+    preview.block_index = enriched_block_index(document, &preview);
+    preview.update_stats = PreviewUpdateStats {
+        replaced_blocks: changed.len(),
+        replaced_virtual_chunks: 0,
+    };
     Some(preview)
 }
 
@@ -2124,6 +2165,7 @@ pub fn preview_document_virtual_incremental(
     let block_ids = stable_top_level_block_ids(document);
     let mut marker_cursor = 0usize;
     let mut block_cursor = 0usize;
+    let mut replaced_virtual_chunks = 0usize;
     let mut chunks = Vec::with_capacity(previous_preview.chunks.len());
     for (chunk_index, old_chunk) in previous_preview.chunks.iter().enumerate() {
         let marker_count = old_chunk.source_anchors.len();
@@ -2143,6 +2185,9 @@ pub fn preview_document_virtual_incremental(
                 }
             })
             .collect::<Vec<_>>();
+        if !replacements.is_empty() {
+            replaced_virtual_chunks += 1;
+        }
         replacements.sort_unstable_by_key(|replacement| std::cmp::Reverse(replacement.0));
         let mut html = old_chunk.html.to_string();
         for (local_marker, block_index) in replacements {
@@ -2232,6 +2277,10 @@ pub fn preview_document_virtual_incremental(
         block_fingerprint: block_fingerprint(document),
         block_ids: block_ids.into(),
         block_index: Arc::from([]),
+        update_stats: PreviewUpdateStats {
+            replaced_blocks: 0,
+            replaced_virtual_chunks,
+        },
     };
     preview.block_index = enriched_block_index(document, &preview);
     Some(preview)
@@ -2622,6 +2671,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             block_fingerprint: 0,
             block_ids: Arc::from([]),
             block_index: Arc::from([]),
+            update_stats: PreviewUpdateStats::default(),
         };
     };
     let body_start = body_start_tag + "<body>".len();
@@ -2639,6 +2689,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             block_fingerprint: 0,
             block_ids: Arc::from([]),
             block_index: Arc::from([]),
+            update_stats: PreviewUpdateStats::default(),
         };
     };
     let body = &html[body_start..body_end];
@@ -2660,6 +2711,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
             block_fingerprint: 0,
             block_ids: Arc::from([]),
             block_index: Arc::from([]),
+            update_stats: PreviewUpdateStats::default(),
         };
     }
     let mut boundaries = vec![0usize];
@@ -2741,6 +2793,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
         block_fingerprint: 0,
         block_ids: Arc::from([]),
         block_index: Arc::from([]),
+        update_stats: PreviewUpdateStats::default(),
     }
 }
 

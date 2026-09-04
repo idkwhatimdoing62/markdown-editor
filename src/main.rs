@@ -333,12 +333,21 @@ struct RenderResult {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+fn render_result_matches_current(
+    result: &RenderResult,
+    current_key: &BrowserDocumentKey,
+    current_text: &str,
+) -> bool {
+    result.key == *current_key && result.parsed_document.source() == current_text
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, Default)]
 struct RenderTelemetry {
     elapsed_ms: f64,
     replaced_blocks: usize,
     replaced_virtual_chunks: usize,
-    full_navigation: bool,
+    full_render: bool,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -346,7 +355,8 @@ struct RenderTelemetry {
 struct RenderMetrics {
     last: RenderTelemetry,
     samples_ms: VecDeque<f64>,
-    full_navigation_count: usize,
+    full_render_count: usize,
+    webview_navigation_count: usize,
     replaced_blocks: usize,
     replaced_virtual_chunks: usize,
 }
@@ -355,7 +365,7 @@ struct RenderMetrics {
 impl RenderMetrics {
     fn record(&mut self, telemetry: RenderTelemetry) {
         self.last = telemetry;
-        self.full_navigation_count += usize::from(telemetry.full_navigation);
+        self.full_render_count += usize::from(telemetry.full_render);
         self.replaced_blocks += telemetry.replaced_blocks;
         self.replaced_virtual_chunks += telemetry.replaced_virtual_chunks;
         self.samples_ms.push_back(telemetry.elapsed_ms);
@@ -364,7 +374,6 @@ impl RenderMetrics {
         }
     }
 
-    #[allow(dead_code)]
     fn edit_p95_ms(&self) -> f64 {
         if self.samples_ms.is_empty() {
             return 0.0;
@@ -373,6 +382,22 @@ impl RenderMetrics {
         samples.sort_by(f64::total_cmp);
         let index = ((samples.len() - 1) * 95).div_ceil(100);
         samples[index]
+    }
+
+    fn record_webview_navigation(&mut self) {
+        self.webview_navigation_count += 1;
+    }
+
+    fn snapshot_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "last_render_ms": self.last.elapsed_ms,
+            "edit_p95_ms": self.edit_p95_ms(),
+            "render_fallback_count": self.full_render_count,
+            "webview_navigation_count": self.webview_navigation_count,
+            "replaced_blocks": self.replaced_blocks,
+            "replaced_virtual_chunks": self.replaced_virtual_chunks,
+            "sample_count": self.samples_ms.len(),
+        })
     }
 }
 
@@ -392,9 +417,9 @@ impl RenderWorker {
                 while let Ok(newer) = request_receiver.try_recv() {
                     request = newer;
                 }
-                let parsed_document = Arc::new(request.document.clone());
                 let started = Instant::now();
-                let mut full_navigation = false;
+                let parsed_document = Arc::new(request.document.clone());
+                let mut full_render = false;
                 let document = if let Some(document) =
                     web_preview::preview_document_virtual_incremental(
                         request.previous.as_deref(),
@@ -416,7 +441,7 @@ impl RenderWorker {
                 ) {
                     document
                 } else {
-                    full_navigation = true;
+                    full_render = true;
                     web_preview::preview_document(
                         &request.document,
                         &request.css,
@@ -425,20 +450,12 @@ impl RenderWorker {
                         request.dark_mode_css.as_deref(),
                     )
                 };
-                let replaced_virtual_chunks = request
-                    .previous
-                    .as_ref()
-                    .map_or(document.virtual_chunk_count(), |previous| {
-                        previous.changed_virtual_chunk_count(&document)
-                    });
+                let update_stats = document.update_stats();
                 let metrics = RenderTelemetry {
                     elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-                    replaced_blocks: changed_block_count(
-                        request.previous_parsed.as_deref(),
-                        &request.document,
-                    ),
-                    replaced_virtual_chunks,
-                    full_navigation,
+                    replaced_blocks: update_stats.replaced_blocks,
+                    replaced_virtual_chunks: update_stats.replaced_virtual_chunks,
+                    full_render,
                 };
                 let document = Arc::new(document);
                 if result_sender
@@ -470,27 +487,6 @@ impl RenderWorker {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn changed_block_count(previous: Option<&ParsedDocument>, next: &ParsedDocument) -> usize {
-    let Some(previous) = previous else {
-        return next.blocks().len();
-    };
-    let old_by_id = previous
-        .block_index()
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| (entry.id, index))
-        .collect::<HashMap<_, _>>();
-    next.block_index()
-        .iter()
-        .enumerate()
-        .filter(|(index, entry)| {
-            old_by_id
-                .get(&entry.id)
-                .is_none_or(|old_index| previous.blocks()[*old_index] != next.blocks()[*index])
-        })
-        .count()
-}
-
 struct ParseRequest {
     tab_id: u64,
     revision: u64,
@@ -1610,7 +1606,7 @@ impl MdEditorApp {
             // The key protects the tab/revision, while this source check also
             // protects against a request that captured an older ParsedDocument
             // before parsing caught up with the current text.
-            if result.key == current_key && result.parsed_document.source() == self.text {
+            if render_result_matches_current(&result, &current_key, &self.text) {
                 self.render_metrics.record(result.metrics);
                 self.browser_document_cache = Some(BrowserDocumentCache {
                     key: result.key.clone(),
@@ -1717,6 +1713,7 @@ impl MdEditorApp {
                 "lxgw_medium": font_requests[3],
             },
             "font_asset_bytes_before_ready": self.browser_preview.font_asset_requested_bytes(),
+            "render_metrics": self.render_metrics.snapshot_json(),
             "error": ready.error,
         });
         let result = (|| -> Result<(), String> {
@@ -3708,76 +3705,83 @@ impl eframe::App for MdEditorApp {
                     ctx.request_repaint_after(Duration::from_secs_f64(remaining));
                 }
                 let document = self.browser_document(preview_refresh_remaining.is_some());
-                if let Err(error) =
-                    self.browser_preview
-                        .show(frame, &ctx, rect, ctx.pixels_per_point(), &document)
-                {
-                    self.status_note = error;
-                } else {
-                    if let Err(error) = self
-                        .browser_preview
-                        .set_body_font_size(self.body_font_size, self.browser_base_font_size())
-                    {
-                        self.status_note = error;
-                    }
-                    let document_changed = self.browser_preview.take_document_changed();
-                    if let Some(editor) = split_editor_scroll.as_ref()
-                        && let Err(error) =
-                            self.sync_browser_scrolls(&ctx, editor, document_changed)
-                    {
-                        self.status_note = error;
-                    }
-                    if document_changed {
-                        self.pending_preview_restore =
-                            Some((self.id, self.preview_source_position));
-                    }
-                    if self.view_mode == ViewMode::Preview {
-                        if let Some(anchor) = self.browser_preview.take_user_scroll_anchor() {
-                            self.preview_source_position = anchor.source_position;
-                            self.pending_preview_restore = None;
-                        } else if let Some(source_position) =
-                            self.browser_preview.take_user_source_position()
+                match self.browser_preview.show(
+                    frame,
+                    &ctx,
+                    rect,
+                    ctx.pixels_per_point(),
+                    &document,
+                ) {
+                    Err(error) => self.status_note = error,
+                    Ok(apply_kind) => {
+                        if matches!(apply_kind, web_preview::PreviewApplyKind::Navigated) {
+                            self.render_metrics.record_webview_navigation();
+                        }
+                        if let Err(error) = self
+                            .browser_preview
+                            .set_body_font_size(self.body_font_size, self.browser_base_font_size())
                         {
-                            self.preview_source_position = source_position;
-                            self.pending_preview_restore = None;
+                            self.status_note = error;
                         }
-                    }
-                    if let Some(index) = preview_heading_target.take() {
-                        match self.browser_preview.scroll_to_heading(index) {
-                            Ok(()) => self.pending_preview_restore = None,
-                            Err(error) => self.status_note = error,
+                        let document_changed = self.browser_preview.take_document_changed();
+                        if let Some(editor) = split_editor_scroll.as_ref()
+                            && let Err(error) =
+                                self.sync_browser_scrolls(&ctx, editor, document_changed)
+                        {
+                            self.status_note = error;
                         }
-                    }
-                    if let Some(source_position) = search_preview_target.take() {
-                        match self.browser_preview.find_text(
-                            &self.search_query,
-                            source_position,
-                            self.search_backwards,
-                        ) {
-                            Ok(()) => {
+                        if document_changed {
+                            self.pending_preview_restore =
+                                Some((self.id, self.preview_source_position));
+                        }
+                        if self.view_mode == ViewMode::Preview {
+                            if let Some(anchor) = self.browser_preview.take_user_scroll_anchor() {
+                                self.preview_source_position = anchor.source_position;
+                                self.pending_preview_restore = None;
+                            } else if let Some(source_position) =
+                                self.browser_preview.take_user_source_position()
+                            {
                                 self.preview_source_position = source_position;
                                 self.pending_preview_restore = None;
                             }
-                            Err(error) => self.status_note = error,
                         }
-                    } else if search_preview_clear
-                        && let Err(error) = self.browser_preview.find_text("", 0.0, false)
-                    {
-                        self.status_note = error;
-                    }
-                    if let Some(ready) = self.browser_preview.take_ready() {
-                        if let Some((tab_id, source_position)) = self.pending_preview_restore
-                            && tab_id == self.id
-                        {
-                            match self
-                                .browser_preview
-                                .scroll_to_source_position(source_position, false)
-                            {
+                        if let Some(index) = preview_heading_target.take() {
+                            match self.browser_preview.scroll_to_heading(index) {
                                 Ok(()) => self.pending_preview_restore = None,
                                 Err(error) => self.status_note = error,
                             }
                         }
-                        self.finish_benchmark_probe(ready);
+                        if let Some(source_position) = search_preview_target.take() {
+                            match self.browser_preview.find_text(
+                                &self.search_query,
+                                source_position,
+                                self.search_backwards,
+                            ) {
+                                Ok(()) => {
+                                    self.preview_source_position = source_position;
+                                    self.pending_preview_restore = None;
+                                }
+                                Err(error) => self.status_note = error,
+                            }
+                        } else if search_preview_clear
+                            && let Err(error) = self.browser_preview.find_text("", 0.0, false)
+                        {
+                            self.status_note = error;
+                        }
+                        if let Some(ready) = self.browser_preview.take_ready() {
+                            if let Some((tab_id, source_position)) = self.pending_preview_restore
+                                && tab_id == self.id
+                            {
+                                match self
+                                    .browser_preview
+                                    .scroll_to_source_position(source_position, false)
+                                {
+                                    Ok(()) => self.pending_preview_restore = None,
+                                    Err(error) => self.status_note = error,
+                                }
+                            }
+                            self.finish_benchmark_probe(ready);
+                        }
                     }
                 }
                 if self.editor_focused {
@@ -4265,19 +4269,40 @@ mod app_tests {
             elapsed_ms: 4.0,
             replaced_blocks: 2,
             replaced_virtual_chunks: 1,
-            full_navigation: false,
+            full_render: false,
         });
         metrics.record(RenderTelemetry {
             elapsed_ms: 9.0,
             replaced_blocks: 5,
             replaced_virtual_chunks: 3,
-            full_navigation: true,
+            full_render: true,
         });
 
-        assert_eq!(metrics.full_navigation_count, 1);
+        assert_eq!(metrics.full_render_count, 1);
         assert_eq!(metrics.replaced_blocks, 7);
         assert_eq!(metrics.replaced_virtual_chunks, 4);
         assert_eq!(metrics.edit_p95_ms(), 9.0);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn stale_render_result_is_rejected_when_source_changed() {
+        let app = app_with_two_tabs();
+        let current_key = app.current_browser_document_key();
+        let stale_source = format!("{}\n过期内容", app.text);
+        let stale_document = Arc::new(markdown::parse_document(&stale_source));
+        let result = RenderResult {
+            key: current_key.clone(),
+            document: Arc::new(web_preview::preview_document_placeholder("", None, None)),
+            parsed_document: stale_document,
+            metrics: RenderTelemetry::default(),
+        };
+
+        assert!(!render_result_matches_current(
+            &result,
+            &current_key,
+            &app.text
+        ));
     }
 
     #[cfg(any(target_os = "windows", target_os = "macos"))]
