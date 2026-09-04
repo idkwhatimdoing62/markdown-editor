@@ -2437,6 +2437,25 @@ fn render_incremental_block_content(
     if slice.source_start > slice.source_end || slice.source_end > document.source().len() {
         return None;
     }
+    // These raw blocks are document-scoped rather than ordinary HTML. Their
+    // output depends on references or metadata outside the local block, so
+    // keep the safe parent boundary without pretending an isolated render is
+    // equivalent to the full document.
+    if matches!(document.blocks()[index], crate::markdown::Block::Raw(_))
+        && document.events()[slice.event_start..slice.event_end]
+            .iter()
+            .any(|item| {
+                matches!(
+                    item.event,
+                    Event::FootnoteReference(_)
+                        | Event::Start(Tag::FootnoteDefinition(_))
+                        | Event::Start(Tag::DefinitionList)
+                        | Event::Start(Tag::MetadataBlock(_))
+                )
+            })
+    {
+        return None;
+    }
     let mut events = Vec::new();
     let mut heading_index = heading_count(&document.blocks()[..index]);
     for item in &document.events()[slice.event_start..slice.event_end] {
