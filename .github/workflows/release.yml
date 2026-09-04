@@ -1,0 +1,120 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (for example v0.1.26)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows packages
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"').Matches[0].Groups[1].Value
+          $stage = Join-Path $env:RUNNER_TEMP "markdown-editor-$version"
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/markdown-editor.exe $stage
+          Copy-Item README.md $stage
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist/markdown-editor-v$version-windows-x86_64.zip" -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path -LiteralPath $iscc)) { throw "ISCC.exe not found" }
+          & $iscc installer/markdown-editor.iss
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: |
+            dist/markdown-editor-v*-windows-x86_64.zip
+            dist/markdown-editor-v*-windows-x86_64-setup.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS universal package
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build universal app ZIP
+        run: bash scripts/build-macos.sh
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-package
+          path: dist/markdown-editor-v*-macos-universal.app.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows packages
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-packages
+          path: dist
+      - name: Download macOS package
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-package
+          path: dist
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then tag="${INPUT_TAG}"; fi
+          [[ "$tag" == v* ]] || { echo "Tag must start with v" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Markdown Editor ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            dist/markdown-editor-v*-windows-x86_64.zip
+            dist/markdown-editor-v*-windows-x86_64-setup.exe
+            dist/markdown-editor-v*-macos-universal.app.zip

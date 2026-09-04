@@ -1,0 +1,31 @@
+name: Long-document performance gate
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "scripts/benchmark-long-docs.ps1"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  long-documents:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Enforce 100 KiB, 1 MiB and 10 MiB budgets
+        shell: pwsh
+        run: .\scripts\benchmark-long-docs.ps1 -EnforceBudgets
+      - name: Upload benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-document-performance
+          path: artifacts/performance
+          if-no-files-found: warn

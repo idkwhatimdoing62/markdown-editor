@@ -1,10 +1,11 @@
 //! 文件读写、冲突检测、草稿恢复。
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::storage;
@@ -96,11 +97,37 @@ pub enum SaveError {
     Io(String),
 }
 
+fn save_lock_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document");
+    path.with_file_name(format!(".{name}.markdown-editor.lock"))
+}
+
+fn acquire_save_lock(path: &Path) -> Result<fs::File, String> {
+    let lock_path = save_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)
+        .map_err(|error| error.to_string())?;
+    lock.try_lock_exclusive()
+        .map_err(|error| format!("document is already being saved: {error}"))?;
+    Ok(lock)
+}
+
 pub fn save_with_conflict_check(
     path: &Path,
     text: &str,
     snapshot: &[u8],
 ) -> Result<Vec<u8>, SaveError> {
+    let _lock = acquire_save_lock(path).map_err(SaveError::Io)?;
     let current = fs::read(path).map_err(|e| SaveError::Io(e.to_string()))?;
     if current.as_slice() != snapshot {
         return Err(SaveError::ExternalModified);
@@ -111,6 +138,7 @@ pub fn save_with_conflict_check(
 }
 
 pub fn save_overwrite(path: &Path, text: &str) -> Result<Vec<u8>, String> {
+    let _lock = acquire_save_lock(path)?;
     let bytes = text.as_bytes();
     storage::write_atomic(path, bytes).map_err(|e| e.to_string())?;
     Ok(bytes.to_vec())
