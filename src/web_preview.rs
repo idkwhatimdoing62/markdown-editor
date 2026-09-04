@@ -39,6 +39,7 @@ pub struct BrowserPreview {
     mermaid_runtime_requests: Arc<AtomicUsize>,
     font_asset_requests: Arc<[AtomicUsize; 4]>,
     applied_font_size: Option<(u32, u32)>,
+    pdf_export_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
 }
 
 #[derive(Clone)]
@@ -1156,6 +1157,7 @@ impl Default for BrowserPreview {
             mermaid_runtime_requests: Arc::new(AtomicUsize::new(0)),
             font_asset_requests: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
             applied_font_size: None,
+            pdf_export_result: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -1411,6 +1413,9 @@ impl BrowserPreview {
         self.bounds = None;
         self.frozen_frame = None;
         self.applied_font_size = None;
+        if let Ok(mut result) = self.pdf_export_result.lock() {
+            *result = None;
+        }
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             *bridge = ScrollBridge::default();
         }
@@ -1521,6 +1526,119 @@ impl BrowserPreview {
             .zip(preview_font_asset_sizes())
             .map(|(count, size)| count.saturating_mul(size))
             .sum()
+    }
+
+    /// Start exporting the currently displayed WebView document as a PDF.
+    ///
+    /// The callback completes asynchronously on the WebView UI thread. The
+    /// caller should poll [`take_pdf_export_result`] on subsequent frames.
+    #[cfg(target_os = "windows")]
+    pub fn export_pdf(&mut self, path: &Path, ctx: &egui::Context) -> Result<(), String> {
+        use std::fs;
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            ICoreWebView2_7, ICoreWebView2Environment6,
+        };
+        use webview2_com::{CoTaskMemPWSTR, PrintToPdfCompletedHandler};
+        use windows_core::Interface;
+        use wry::WebViewExtWindows;
+
+        let Some(webview) = &self.webview else {
+            return Err("浏览器预览尚未就绪".to_string());
+        };
+        let target = path.to_path_buf();
+        let temporary = target.with_file_name(format!(
+            ".{}.markdown-editor.pdf.tmp",
+            target
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("export")
+        ));
+        let _ = fs::remove_file(&temporary);
+
+        let environment = webview.environment();
+        let settings = unsafe {
+            environment
+                .cast::<ICoreWebView2Environment6>()
+                .map_err(|error| format!("当前 WebView2 不支持 PDF 设置：{error}"))?
+                .CreatePrintSettings()
+                .map_err(|error| format!("无法创建 PDF 打印设置：{error}"))?
+        };
+        unsafe {
+            settings
+                .SetShouldPrintBackgrounds(true)
+                .map_err(|error| format!("无法设置 PDF 背景：{error}"))?;
+            settings
+                .SetShouldPrintHeaderAndFooter(false)
+                .map_err(|error| format!("无法关闭 PDF 页眉页脚：{error}"))?;
+            // WebView2 print settings use inches. These values match A4 and
+            // leave the page styling (including @media print) in control of
+            // the document itself.
+            settings
+                .SetPageWidth(8.2677)
+                .map_err(|error| format!("无法设置 PDF 页面宽度：{error}"))?;
+            settings
+                .SetPageHeight(11.6929)
+                .map_err(|error| format!("无法设置 PDF 页面高度：{error}"))?;
+            settings
+                .SetMarginTop(0.3149)
+                .and_then(|_| settings.SetMarginRight(0.3149))
+                .and_then(|_| settings.SetMarginBottom(0.3149))
+                .and_then(|_| settings.SetMarginLeft(0.3149))
+                .map_err(|error| format!("无法设置 PDF 页边距：{error}"))?;
+        }
+
+        let result_slot = Arc::clone(&self.pdf_export_result);
+        let repaint = ctx.clone();
+        let callback_temporary = temporary.clone();
+        let callback_target = target.clone();
+        let callback = PrintToPdfCompletedHandler::create(Box::new(move |status, success| {
+            let result = if let Err(error) = status {
+                Err(format!("WebView2 PDF 导出失败：{error}"))
+            } else if !success {
+                Err("WebView2 未能生成 PDF".to_string())
+            } else {
+                fs::rename(&callback_temporary, &callback_target)
+                    .map(|_| callback_target.clone())
+                    .map_err(|error| format!("无法写入 PDF：{error}"))
+            };
+            if result.is_err() {
+                let _ = fs::remove_file(&callback_temporary);
+            }
+            if let Ok(mut slot) = result_slot.lock() {
+                *slot = Some(result);
+            }
+            repaint.request_repaint();
+            Ok(())
+        }));
+
+        let temporary_path = temporary.to_string_lossy().to_string();
+        let temporary_path = CoTaskMemPWSTR::from(temporary_path.as_str());
+        let webview7 = webview
+            .webview()
+            .cast::<ICoreWebView2_7>()
+            .map_err(|error| format!("当前 WebView2 不支持 PDF 导出：{error}"))?;
+        unsafe {
+            webview7
+                .PrintToPdf(*temporary_path.as_ref().as_pcwstr(), Some(&settings), &callback)
+                .map_err(|error| format!("无法启动 WebView2 PDF 导出：{error}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    pub fn export_pdf(&mut self, _path: &Path, _ctx: &egui::Context) -> Result<(), String> {
+        Err("当前平台暂未接入浏览器原生 PDF 导出".to_string())
+    }
+
+    pub fn take_pdf_export_result(&mut self) -> Option<Result<PathBuf, String>> {
+        self.pdf_export_result
+            .lock()
+            .ok()
+            .and_then(|mut result| result.take())
+    }
+
+    pub fn has_webview(&self) -> bool {
+        self.webview.is_some()
     }
 
     pub fn source_position(&self) -> Option<f32> {

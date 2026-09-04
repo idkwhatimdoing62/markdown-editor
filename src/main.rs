@@ -2398,7 +2398,7 @@ impl MdEditorApp {
         }
     }
 
-    fn export_pdf(&mut self) {
+    fn export_pdf(&mut self, ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
             .set_file_name("导出.pdf")
@@ -2406,6 +2406,19 @@ impl MdEditorApp {
         else {
             return;
         };
+
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if self.browser_preview.has_webview() {
+            match self.browser_preview.export_pdf(&path, ctx) {
+                Ok(()) => {
+                    self.status_note = format!("正在从预览导出 PDF：{}", path.display());
+                    return;
+                }
+                Err(error) => {
+                    self.status_note = format!("浏览器原生导出不可用，将使用兼容导出：{error}");
+                }
+            }
+        }
         let title = self.export_title();
         let options = self.export_options(&title);
         match export::export_pdf(&path, &self.document, options) {
@@ -2472,7 +2485,7 @@ impl MdEditorApp {
                 }
                 if ui.button("导出 PDF…").clicked() {
                     ui.close();
-                    self.export_pdf();
+                    self.export_pdf(ctx);
                 }
                 ui.separator();
                 if ui.button("退出").clicked() {
@@ -2638,7 +2651,7 @@ impl MdEditorApp {
                         .clicked()
                     {
                         ui.close();
-                        self.export_pdf();
+                        self.export_pdf(ui.ctx());
                     }
                     #[cfg(target_os = "windows")]
                     {
@@ -3449,6 +3462,15 @@ impl eframe::App for MdEditorApp {
         let current_theme = self.theme_spec();
         apply_visuals(&ctx, self.dark, &current_theme);
         let now = ctx.input(|i| i.time);
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if let Some(result) = self.browser_preview.take_pdf_export_result() {
+            match result {
+                Ok(path) => self.status_note = format!("已从预览导出 PDF：{}", path.display()),
+                Err(error) => {
+                    self.status = DocStatus::SaveFailed(format!("导出 PDF 失败：{error}"))
+                }
+            }
+        }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut browser_rect = None;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
