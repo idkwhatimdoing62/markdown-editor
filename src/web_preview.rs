@@ -1233,6 +1233,12 @@ impl BrowserPreview {
         if let Ok(mut bridge) = self.scroll_bridge.lock() {
             bridge.pdf_ready = false;
         }
+        if let Ok(mut result) = self.pdf_export_result.lock() {
+            // Do not let a completion from a previous export get consumed as
+            // the result of this request while the new browser print is still
+            // being prepared.
+            *result = None;
+        }
         // The preparation hook is installed by the initialization script. If
         // an older/partially initialized WebView does not have it yet, signal
         // readiness instead of leaving the export request waiting forever.
