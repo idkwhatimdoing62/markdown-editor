@@ -3494,9 +3494,10 @@ fn is_embedded_preview_url(url: &url::Url) -> bool {
     match url.scheme() {
         "mdpreview" | "mdfile" | "mdfont" => url.host_str() == Some("localhost"),
         // `with_https_scheme(true)` maps the custom protocols above to exact
-        // HTTPS localhost origins on Windows. Keep this allow-list strict so
-        // regular external HTTPS links still open in the system browser.
-        "https" => matches!(
+        // HTTPS localhost origins on Windows (older WebView runtimes may
+        // report the same origin as HTTP). Keep this allow-list strict so
+        // regular external links still open in the system browser.
+        "http" | "https" => matches!(
             url.host_str(),
             Some("mdpreview.localhost" | "mdfile.localhost" | "mdfont.localhost")
         ),
@@ -4083,7 +4084,7 @@ mod tests {
         for url in [
             "https://example.com/docs",
             "https://mdpreview.localhost.evil.example/docs",
-            "http://mdfile.localhost/image.png",
+            "http://example.com/image.png",
         ] {
             assert!(
                 !is_embedded_preview_url(&url::Url::parse(url).unwrap()),
