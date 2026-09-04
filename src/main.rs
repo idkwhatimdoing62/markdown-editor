@@ -22,10 +22,8 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{
-    Arc, mpsc,
-    mpsc::{Receiver, Sender},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc, mpsc::Receiver};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -402,21 +400,87 @@ impl RenderMetrics {
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+struct LatestRequestState<T> {
+    pending: Mutex<Option<T>>,
+    wake: Condvar,
+    closed: AtomicBool,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct LatestRequestSender<T> {
+    state: Arc<LatestRequestState<T>>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+struct LatestRequestReceiver<T> {
+    state: Arc<LatestRequestState<T>>,
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl<T> LatestRequestState<T> {
+    fn channel() -> (LatestRequestSender<T>, LatestRequestReceiver<T>) {
+        let state = Arc::new(Self {
+            pending: Mutex::new(None),
+            wake: Condvar::new(),
+            closed: AtomicBool::new(false),
+        });
+        (
+            LatestRequestSender {
+                state: Arc::clone(&state),
+            },
+            LatestRequestReceiver { state },
+        )
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl<T> LatestRequestSender<T> {
+    fn submit(&self, request: T) {
+        if let Ok(mut pending) = self.state.pending.lock() {
+            if self.state.closed.load(Ordering::Acquire) {
+                return;
+            }
+            // Replacing the pending request makes this queue bounded by one
+            // full document snapshot. The worker always observes the latest
+            // revision once it finishes the request currently in progress.
+            *pending = Some(request);
+            self.state.wake.notify_one();
+        }
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl<T> Drop for LatestRequestSender<T> {
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+        self.state.wake.notify_all();
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+impl<T> LatestRequestReceiver<T> {
+    fn recv(&self) -> Option<T> {
+        let mut pending = self.state.pending.lock().ok()?;
+        while pending.is_none() && !self.state.closed.load(Ordering::Acquire) {
+            pending = self.state.wake.wait(pending).ok()?;
+        }
+        pending.take()
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct RenderWorker {
-    requests: Sender<RenderRequest>,
+    requests: LatestRequestSender<RenderRequest>,
     results: Receiver<RenderResult>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 impl RenderWorker {
     fn new() -> Self {
-        let (request_sender, request_receiver) = mpsc::channel::<RenderRequest>();
+        let (request_queue, request_receiver) = LatestRequestState::<RenderRequest>::channel();
         let (result_sender, result_receiver) = mpsc::channel::<RenderResult>();
         std::thread::spawn(move || {
-            while let Ok(mut request) = request_receiver.recv() {
-                while let Ok(newer) = request_receiver.try_recv() {
-                    request = newer;
-                }
+            while let Some(request) = request_receiver.recv() {
                 let started = Instant::now();
                 let parsed_document = Arc::new(request.document.clone());
                 let mut full_render = false;
@@ -472,13 +536,13 @@ impl RenderWorker {
             }
         });
         Self {
-            requests: request_sender,
+            requests: request_queue,
             results: result_receiver,
         }
     }
 
     fn submit(&self, request: RenderRequest) {
-        let _ = self.requests.send(request);
+        self.requests.submit(request);
     }
 
     fn try_recv(&self) -> Result<RenderResult, mpsc::TryRecvError> {
@@ -501,21 +565,16 @@ struct ParseResult {
 }
 
 struct ParseWorker {
-    requests: Sender<ParseRequest>,
+    requests: LatestRequestSender<ParseRequest>,
     results: Receiver<ParseResult>,
 }
 
 impl ParseWorker {
     fn new() -> Self {
-        let (request_sender, request_receiver) = mpsc::channel::<ParseRequest>();
+        let (request_queue, request_receiver) = LatestRequestState::<ParseRequest>::channel();
         let (result_sender, result_receiver) = mpsc::channel::<ParseResult>();
         std::thread::spawn(move || {
-            while let Ok(mut request) = request_receiver.recv() {
-                // If edits arrived while parsing was busy, skip queued intermediate
-                // revisions and parse only the newest snapshot.
-                while let Ok(newer) = request_receiver.try_recv() {
-                    request = newer;
-                }
+            while let Some(request) = request_receiver.recv() {
                 let document = request
                     .previous
                     .as_ref()
@@ -539,13 +598,13 @@ impl ParseWorker {
             }
         });
         Self {
-            requests: request_sender,
+            requests: request_queue,
             results: result_receiver,
         }
     }
 
     fn submit(&self, request: ParseRequest) {
-        let _ = self.requests.send(request);
+        self.requests.submit(request);
     }
 
     fn try_recv(&self) -> Result<ParseResult, mpsc::TryRecvError> {
@@ -4155,6 +4214,17 @@ fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
 #[cfg(test)]
 mod app_tests {
     use super::*;
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn latest_request_queue_keeps_only_newest_and_closes_cleanly() {
+        let (sender, receiver) = LatestRequestState::<u32>::channel();
+        sender.submit(1);
+        sender.submit(2);
+        assert_eq!(receiver.recv(), Some(2));
+        drop(sender);
+        assert_eq!(receiver.recv(), None);
+    }
 
     #[test]
     fn scroll_state_ids_are_isolated_per_document_tab() {

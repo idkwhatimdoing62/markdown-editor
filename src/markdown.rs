@@ -218,12 +218,70 @@ fn reconcile_block_ids(previous: &ParsedDocument, next: &mut ParsedDocument) {
     if previous.block_index.is_empty() || next.block_index.is_empty() {
         return;
     }
-    let mut candidates = Vec::new();
+
+    // Most edits affect a small source window. Indexing exact block content
+    // lets unchanged blocks survive large insertions without scanning every
+    // old block, while the bounded index window keeps changed-block matching
+    // close to the edit. This avoids the previous O(N²) candidate matrix.
+    const MATCH_WINDOW: usize = 32;
+    let mut old_by_key = HashMap::<(u8, u64), Vec<usize>>::new();
+    let mut old_used = std::collections::HashSet::new();
+    let mut new_used = std::collections::HashSet::new();
+    for (old_index, old_block) in previous.blocks.iter().enumerate() {
+        old_by_key
+            .entry(block_match_key(old_block))
+            .or_default()
+            .push(old_index);
+    }
+
+    // Claim exact content matches first.  This prevents a newly inserted
+    // block whose source range overlaps the old first block from stealing the
+    // identity that belongs to an unchanged block later in the document.
     for (new_index, new_block) in next.blocks.iter().enumerate() {
-        for (old_index, old_block) in previous.blocks.iter().enumerate() {
+        let Some(exact_indices) = old_by_key.get(&block_match_key(new_block)) else {
+            continue;
+        };
+        let insertion = exact_indices.partition_point(|index| *index < new_index);
+        let exact_start = insertion.saturating_sub(4);
+        let exact_end = (insertion + 4).min(exact_indices.len());
+        let best = exact_indices[exact_start..exact_end]
+            .iter()
+            .copied()
+            .filter(|old_index| !old_used.contains(old_index))
+            .min_by_key(|old_index| old_index.abs_diff(new_index));
+        if let Some(old_index) = best {
+            next.block_index[new_index].id = previous.block_index[old_index].id;
+            next.block_index[new_index].rendered_height =
+                previous.block_index[old_index].rendered_height;
+            old_used.insert(old_index);
+            new_used.insert(new_index);
+        }
+    }
+
+    // Match changed blocks only within a bounded ordinal window.  Unchanged
+    // blocks that moved farther than the window were already claimed above by
+    // their exact content fingerprints.
+    for (new_index, new_block) in next.blocks.iter().enumerate() {
+        if new_used.contains(&new_index) {
+            continue;
+        }
+        let mut old_indices = Vec::with_capacity(MATCH_WINDOW * 2 + 1);
+        let local_start = new_index.saturating_sub(MATCH_WINDOW);
+        let local_end = (new_index + MATCH_WINDOW + 1).min(previous.blocks.len());
+        old_indices.extend(local_start..local_end);
+        old_indices.sort_unstable();
+        old_indices.dedup();
+        let mut best = None;
+        for old_index in old_indices {
+            if old_used.contains(&old_index) {
+                continue;
+            }
+            let old_block = &previous.blocks[old_index];
             if std::mem::discriminant(old_block) != std::mem::discriminant(new_block) {
                 continue;
             }
+            // Duplicate blocks are ambiguous; inspect only entries near the
+            // current ordinal and let neighbour checks disambiguate them.
             let old_range = &previous.block_index[old_index].source_range;
             let new_range = &next.block_index[new_index].source_range;
             let overlap = old_range.start.max(new_range.start) < old_range.end.min(new_range.end);
@@ -242,22 +300,33 @@ fn reconcile_block_ids(previous: &ParsedDocument, next: &mut ParsedDocument) {
                 + (previous_neighbour as i64) * 2_000
                 + (next_neighbour as i64) * 2_000
                 - (old_index.abs_diff(new_index) as i64);
-            candidates.push((score, old_index, new_index));
+            if best.is_none_or(|(best_score, _)| score > best_score) {
+                best = Some((score, old_index));
+            }
+        }
+        if let Some((_, old_index)) = best {
+            next.block_index[new_index].id = previous.block_index[old_index].id;
+            next.block_index[new_index].rendered_height =
+                previous.block_index[old_index].rendered_height;
+            old_used.insert(old_index);
         }
     }
-    candidates.sort_unstable_by(|left, right| right.cmp(left));
-    let mut old_used = vec![false; previous.blocks.len()];
-    let mut new_used = vec![false; next.blocks.len()];
-    for (_, old_index, new_index) in candidates {
-        if old_used[old_index] || new_used[new_index] {
-            continue;
-        }
-        old_used[old_index] = true;
-        new_used[new_index] = true;
-        next.block_index[new_index].id = previous.block_index[old_index].id;
-        next.block_index[new_index].rendered_height =
-            previous.block_index[old_index].rendered_height;
-    }
+}
+
+fn block_match_key(block: &Block) -> (u8, u64) {
+    let kind = match block {
+        Block::Heading { .. } => 0,
+        Block::Paragraph(_) => 1,
+        Block::List { .. } => 2,
+        Block::Code { .. } => 3,
+        Block::Quote(_) => 4,
+        Block::Table { .. } => 5,
+        Block::Rule => 6,
+        Block::Raw(_) => 7,
+    };
+    let mut hasher = DefaultHasher::new();
+    block.hash(&mut hasher);
+    (kind, hasher.finish())
 }
 
 pub fn parse_document_with_previous(
