@@ -1204,6 +1204,7 @@ impl BrowserPreview {
             let local_image_requests = Arc::clone(&self.local_image_requests);
             let mermaid_runtime_requests = Arc::clone(&self.mermaid_runtime_requests);
             let font_asset_requests = Arc::clone(&self.font_asset_requests);
+            let navigation_ctx = ctx.clone();
             let webview = builder
                 .with_custom_protocol("mdpreview".into(), move |_webview_id, request| {
                     preview_document_response(request, &document_payload)
@@ -1262,6 +1263,23 @@ impl BrowserPreview {
                     }
                     // Prevent the browser engine from navigating to the dropped file.
                     true
+                })
+                .with_navigation_handler(move |url| {
+                    let Ok(parsed) = url::Url::parse(&url) else {
+                        return false;
+                    };
+                    match parsed.scheme() {
+                        // Keep document and local image protocol requests inside
+                        // the embedded preview. External links belong to the
+                        // user's regular browser and must not replace the
+                        // current document WebView.
+                        "mdpreview" | "mdfile" => true,
+                        "http" | "https" => {
+                            navigation_ctx.open_url(egui::OpenUrl { url, new_tab: true });
+                            false
+                        }
+                        _ => false,
+                    }
                 })
                 .with_url(preview_document_url(document_hash))
                 .with_bounds(to_wry_rect(bounds))
