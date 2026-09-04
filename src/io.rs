@@ -1,6 +1,7 @@
 //! 文件读写、冲突检测、草稿恢复。
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -55,9 +56,38 @@ pub fn file_stamp(path: &Path) -> Result<FileStamp, ReadError> {
 }
 
 pub fn read_snapshot_checked(path: &Path) -> Result<Vec<u8>, ReadError> {
-    let metadata = fs::metadata(path).map_err(|error| ReadError::Io(error.to_string()))?;
+    let mut file = fs::File::open(path).map_err(|error| ReadError::Io(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ReadError::Io(error.to_string()))?;
     check_size(metadata.len())?;
-    fs::read(path).map_err(|error| ReadError::Io(error.to_string()))
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| ReadError::Io(error.to_string()))?;
+    Ok(bytes)
+}
+
+/// Read a bounded asset from an already-open file handle. Opening the file
+/// before checking its metadata keeps the size check tied to the same inode,
+/// avoiding a metadata/read race when previewing or exporting local images.
+pub fn read_file_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {limit} byte limit"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {limit} byte limit"),
+        ));
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -388,6 +418,16 @@ mod tests {
         let p = dir.join("big.md");
         fs::write(&p, vec![b'a'; (MAX_FILE_SIZE + 1024) as usize]).unwrap();
         assert!(matches!(read_markdown(&p), Err(ReadError::TooLarge { .. })));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 有界文件读取拒绝超限资源() {
+        let dir = temp_dir();
+        let p = dir.join("asset.bin");
+        fs::write(&p, b"12345").unwrap();
+        assert_eq!(read_file_limited(&p, 5).unwrap(), b"12345");
+        assert!(read_file_limited(&p, 4).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

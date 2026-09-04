@@ -3418,11 +3418,7 @@ fn local_image_response(request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]
         .filter(|path| supported_image_path(path))
         .and_then(|path| {
             let content_type = image_content_type(&path)?;
-            let metadata = std::fs::metadata(&path).ok()?;
-            if metadata.len() > crate::io::MAX_IMAGE_FILE_SIZE {
-                return None;
-            }
-            let bytes = std::fs::read(path).ok()?;
+            let bytes = crate::io::read_file_limited(&path, crate::io::MAX_IMAGE_FILE_SIZE).ok()?;
             Some((bytes, content_type))
         });
 

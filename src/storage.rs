@@ -1,12 +1,15 @@
 //! Application-owned persistent storage and recovery helpers.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const CORRUPT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+static SIDECAR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn config_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -49,12 +52,31 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("state");
-    let operation_id = format!("{}-{}", std::process::id(), unix_timestamp());
+    let operation_id = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        unix_timestamp(),
+        SIDECAR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let temporary = parent.join(format!(".{file_name}.{operation_id}.tmp"));
     let backup = parent.join(format!(".{file_name}.{operation_id}.bak"));
-    fs::write(&temporary, bytes)?;
-    if path.exists() {
-        fs::rename(path, &backup)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file.write_all(bytes) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = file.sync_all() {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if path.exists()
+        && let Err(error) = fs::rename(path, &backup)
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
     }
     if let Err(error) = fs::rename(&temporary, path) {
         let _ = fs::remove_file(&temporary);

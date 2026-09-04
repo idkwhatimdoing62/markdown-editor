@@ -251,11 +251,7 @@ fn export_image_destination(
 ) -> Option<String> {
     let path = local_image_path(destination, base_directory)?;
     let content_type = image_content_type(&path)?;
-    let metadata = std::fs::metadata(&path).ok()?;
-    if metadata.len() > crate::io::MAX_IMAGE_FILE_SIZE {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = crate::io::read_file_limited(&path, crate::io::MAX_IMAGE_FILE_SIZE).ok()?;
     Some(match mode {
         ImageMode::StandaloneHtml => {
             format!("data:{content_type};base64,{}", BASE64.encode(bytes))
