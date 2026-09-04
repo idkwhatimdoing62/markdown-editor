@@ -483,6 +483,20 @@ mod tests {
     }
 
     #[test]
+    fn 并发保存会被文件锁拒绝() {
+        let dir = temp_dir();
+        let p = dir.join("locked.md");
+        let lock = acquire_save_lock(&p).unwrap();
+        assert!(matches!(
+            save_overwrite(&p, "blocked"),
+            Err(error) if error.contains("already being saved")
+        ));
+        drop(lock);
+        assert_eq!(save_overwrite(&p, "ok").unwrap(), b"ok");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 新文档可以直接创建并写入() {
         let dir = temp_dir();
         let p = dir.join("new.md");
