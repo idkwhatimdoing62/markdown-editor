@@ -1219,11 +1219,7 @@ pub enum PreviewApplyKind {
 }
 
 impl BrowserPreview {
-    fn queue_pdf_export(
-        &mut self,
-        path: &Path,
-        ctx: &egui::Context,
-    ) -> Result<bool, String> {
+    fn queue_pdf_export(&mut self, path: &Path, ctx: &egui::Context) -> Result<bool, String> {
         if self.pdf_export_pending.is_some() {
             return Err("已有一个 PDF 导出正在进行".to_string());
         }
@@ -1269,7 +1265,9 @@ impl BrowserPreview {
             self.pdf_export_in_flight = false;
             self.finish_virtual_pdf_mode();
             if let Ok(mut slot) = self.pdf_export_result.lock() {
-                *slot = Some(Err("文档在 PDF 导出准备期间发生变化，已取消本次导出".to_string()));
+                *slot = Some(Err(
+                    "文档在 PDF 导出准备期间发生变化，已取消本次导出".to_string()
+                ));
             }
             return Ok(());
         }
@@ -1391,12 +1389,16 @@ impl BrowserPreview {
                     let Ok(parsed) = url::Url::parse(&url) else {
                         return false;
                     };
+                    // On Windows `with_https_scheme(true)` exposes our custom
+                    // protocols as HTTPS localhost origins. Treat those exact
+                    // origins as embedded resources; otherwise the initial
+                    // preview navigation is mistaken for an external link and
+                    // gets opened in the user's browser when switching to
+                    // 阅读模式.
+                    if is_embedded_preview_url(&parsed) {
+                        return true;
+                    }
                     match parsed.scheme() {
-                        // Keep document and local image protocol requests inside
-                        // the embedded preview. External links belong to the
-                        // user's regular browser and must not replace the
-                        // current document WebView.
-                        "mdpreview" | "mdfile" => true,
                         "http" | "https" => {
                             navigation_ctx.open_url(egui::OpenUrl { url, new_tab: true });
                             false
@@ -1745,7 +1747,11 @@ impl BrowserPreview {
             .map_err(|error| format!("当前 WebView2 不支持 PDF 导出：{error}"))?;
         unsafe {
             webview7
-                .PrintToPdf(*temporary_path.as_ref().as_pcwstr(), Some(&settings), &callback)
+                .PrintToPdf(
+                    *temporary_path.as_ref().as_pcwstr(),
+                    Some(&settings),
+                    &callback,
+                )
                 .map_err(|error| format!("无法启动 WebView2 PDF 导出：{error}"))?;
         }
         Ok(())
@@ -3484,6 +3490,20 @@ fn custom_protocol_script_source(scheme: &str) -> String {
     }
 }
 
+fn is_embedded_preview_url(url: &url::Url) -> bool {
+    match url.scheme() {
+        "mdpreview" | "mdfile" | "mdfont" => url.host_str() == Some("localhost"),
+        // `with_https_scheme(true)` maps the custom protocols above to exact
+        // HTTPS localhost origins on Windows. Keep this allow-list strict so
+        // regular external HTTPS links still open in the system browser.
+        "https" => matches!(
+            url.host_str(),
+            Some("mdpreview.localhost" | "mdfile.localhost" | "mdfont.localhost")
+        ),
+        _ => false,
+    }
+}
+
 fn rewrite_local_image_event<'a>(event: Event<'a>, base_directory: Option<&Path>) -> Event<'a> {
     match event {
         Event::Start(Tag::Image {
@@ -4039,11 +4059,38 @@ mod tests {
     use super::{
         JB_MONO_BOLD_WOFF, JB_MONO_REGULAR_WOFF, LXGW_WENKAI_MEDIUM_WOFF, LXGW_WENKAI_REGULAR_WOFF,
         MERMAID_BOOTSTRAP, SCROLL_SYNC_SCRIPT, VIRTUAL_PREVIEW_SCRIPT,
-        custom_protocol_script_source, custom_protocol_url, document, local_image_response,
-        local_image_url, parse_anchor_message, parse_ready_message, parse_source_message,
-        preview_asset_response, source_line_at_byte, source_line_starts,
+        custom_protocol_script_source, custom_protocol_url, document, is_embedded_preview_url,
+        local_image_response, local_image_url, parse_anchor_message, parse_ready_message,
+        parse_source_message, preview_asset_response, source_line_at_byte, source_line_starts,
     };
     use wry::http::Request;
+
+    #[test]
+    fn embedded_preview_origins_stay_in_the_webview() {
+        for url in [
+            "https://mdpreview.localhost/document?revision=1",
+            "https://mdfile.localhost/C:/notes/image.png",
+            "https://mdfont.localhost/jetbrains-regular.woff",
+            "mdpreview://localhost/document?revision=1",
+            "mdfile://localhost/image.png",
+            "mdfont://localhost/mermaid-init.js",
+        ] {
+            assert!(
+                is_embedded_preview_url(&url::Url::parse(url).unwrap()),
+                "embedded origin should stay in WebView: {url}"
+            );
+        }
+        for url in [
+            "https://example.com/docs",
+            "https://mdpreview.localhost.evil.example/docs",
+            "http://mdfile.localhost/image.png",
+        ] {
+            assert!(
+                !is_embedded_preview_url(&url::Url::parse(url).unwrap()),
+                "external URL must not be treated as embedded: {url}"
+            );
+        }
+    }
 
     #[test]
     fn closing_preview_releases_retained_document_payload() {
