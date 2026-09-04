@@ -2434,12 +2434,6 @@ fn render_incremental_block_content(
     block_id: u64,
     base_directory: Option<&Path>,
 ) -> Option<String> {
-    // Raw HTML also carries footnote definitions and other structures that
-    // require document-level normalization. Rendering them in isolation can
-    // diverge from the full document output, so keep this boundary conservative.
-    if matches!(document.blocks()[index], crate::markdown::Block::Raw(_)) {
-        return None;
-    }
     if slice.source_start > slice.source_end || slice.source_end > document.source().len() {
         return None;
     }
@@ -4083,21 +4077,23 @@ mod tests {
     }
 
     #[test]
-    fn incremental_preview_falls_back_for_raw_html_block_conversion() {
+    fn incremental_preview_rebuilds_raw_html_block_conversion() {
         let first_document = crate::markdown::parse_document("<div>旧内容</div>\n\n后文\n");
         let next_document =
             crate::markdown::parse_document("<div><span>新内容</span></div>\n\n后文\n");
         let first_preview = super::preview_document(&first_document, "", None, None, None);
 
-        assert!(
-            super::preview_document_incremental(
-                Some(&first_preview),
-                Some(&first_document),
-                &next_document,
-                None,
-            )
-            .is_none()
-        );
+        let incremental = super::preview_document_incremental(
+            Some(&first_preview),
+            Some(&first_document),
+            &next_document,
+            None,
+        )
+        .expect("raw HTML block edits should remain local");
+        let full = super::preview_document(&next_document, "", None, None, None);
+
+        assert_eq!(incremental.shell, full.shell);
+        assert_eq!(incremental.source_anchors(), full.source_anchors());
     }
 
     #[test]
