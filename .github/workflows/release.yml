@@ -129,6 +129,10 @@ jobs:
     needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Download Windows packages
         uses: actions/download-artifact@v4
         with:
