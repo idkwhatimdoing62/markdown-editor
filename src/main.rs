@@ -46,6 +46,7 @@ const EXTERNAL_POLL_INTERVAL: f64 = 0.35;
 #[allow(dead_code)]
 const PREVIEW_REFRESH_DEBOUNCE_SECONDS: f64 = 0.2;
 const EXTERNAL_STABLE_DELAY: f64 = 0.45;
+const WORKER_POLL_INTERVAL: f64 = 0.016;
 
 fn main() -> eframe::Result {
     let launch = LaunchOptions::from_env();
@@ -231,7 +232,12 @@ struct PendingExternalChange {
 struct ExternalFileWatcher {
     watcher: notify::RecommendedWatcher,
     receiver: Receiver<notify::Result<notify::Event>>,
+    /// Files currently tracked by the application.  We keep this separate
+    /// from the directories registered with `notify`: editors commonly save
+    /// by writing a temporary file and renaming it over the original, which
+    /// invalidates a watcher registered directly on the file on Windows.
     watched: HashSet<PathBuf>,
+    watched_directories: HashSet<PathBuf>,
 }
 
 impl ExternalFileWatcher {
@@ -245,6 +251,7 @@ impl ExternalFileWatcher {
             watcher,
             receiver,
             watched: HashSet::new(),
+            watched_directories: HashSet::new(),
         })
     }
 
@@ -252,18 +259,44 @@ impl ExternalFileWatcher {
         if self.watched.contains(path) {
             return;
         }
-        if self
-            .watcher
-            .watch(path, notify::RecursiveMode::NonRecursive)
-            .is_ok()
+        // Watch the containing directory instead of the file itself. Atomic
+        // saves (tmp -> rename) replace the directory entry and otherwise
+        // leave a file-level watcher attached to the old inode.
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        if !self.watched_directories.contains(&directory)
+            && self
+                .watcher
+                .watch(&directory, notify::RecursiveMode::NonRecursive)
+                .is_err()
         {
-            self.watched.insert(path.to_path_buf());
+            return;
         }
+        self.watched_directories.insert(directory);
+        self.watched.insert(path.to_path_buf());
     }
 
     fn unwatch(&mut self, path: &Path) {
-        if self.watched.remove(path) {
-            let _ = self.watcher.unwatch(path);
+        if !self.watched.remove(path) {
+            return;
+        }
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let directory_still_needed = self.watched.iter().any(|watched| {
+            watched
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                == directory
+        });
+        if !directory_still_needed && self.watched_directories.remove(&directory) {
+            let _ = self.watcher.unwatch(&directory);
         }
     }
 
@@ -274,6 +307,23 @@ impl ExternalFileWatcher {
             .flat_map(|event| event.paths)
             .collect()
     }
+}
+
+fn external_event_matches_path(changed_paths: &HashSet<PathBuf>, path: &Path) -> bool {
+    changed_paths.iter().any(|event_path| {
+        if event_path == path {
+            return true;
+        }
+        // Windows file dialogs and notify can use different spellings for
+        // the same path (for example `C:\...` vs `\\?\C:\...`). Canonical
+        // comparison keeps an event from being lost due to that formatting
+        // difference. If either path no longer exists, the stamp poll below
+        // remains the source of truth.
+        matches!(
+            (std::fs::canonicalize(event_path), std::fs::canonicalize(path)),
+            (Ok(event_path), Ok(file_path)) if event_path == file_path
+        )
+    })
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -1976,7 +2026,12 @@ impl MdEditorApp {
         let active_path = self.path.clone();
         if let Some(path) = active_path {
             let snapshot = self.disk_snapshot.clone();
-            match self.probe_external_change(&path, &snapshot, now, changed_paths.contains(&path)) {
+            match self.probe_external_change(
+                &path,
+                &snapshot,
+                now,
+                external_event_matches_path(&changed_paths, &path),
+            ) {
                 ExternalProbe::Stable(bytes) => {
                     let active_index = self.active_tab;
                     match apply_external_bytes(&mut self.tabs[active_index], bytes) {
@@ -2008,7 +2063,12 @@ impl MdEditorApp {
                 continue;
             };
             let snapshot = self.tabs[index].disk_snapshot.clone();
-            match self.probe_external_change(&path, &snapshot, now, changed_paths.contains(&path)) {
+            match self.probe_external_change(
+                &path,
+                &snapshot,
+                now,
+                external_event_matches_path(&changed_paths, &path),
+            ) {
                 ExternalProbe::Stable(bytes) => {
                     match apply_external_bytes(&mut self.tabs[index], bytes) {
                         Ok(ExternalChangeResult::Unchanged) => {}
@@ -3567,6 +3627,12 @@ impl eframe::App for MdEditorApp {
         self.poll_external_changes(&ctx, now);
 
         self.poll_document_parse_results(&ctx);
+        // Background parsing does not itself wake egui. Keep polling while a
+        // parse is in flight; otherwise the window can go idle after the
+        // debounce repaint and never consume the completed document.
+        if self.parse_pending {
+            ctx.request_repaint_after(Duration::from_secs_f64(WORKER_POLL_INTERVAL));
+        }
         if !self.parse_pending && self.text != self.document.source() {
             // Catch programmatic changes that do not pass through the editor
             // widget's changed flag.
@@ -3859,6 +3925,12 @@ impl eframe::App for MdEditorApp {
                     ctx.request_repaint_after(Duration::from_secs_f64(remaining));
                 }
                 let document = self.browser_document(preview_refresh_remaining.is_some());
+                // Rendering is performed off the UI thread. Once a request is
+                // queued, continue polling for its result even if no input or
+                // debounce timer is generating repaints.
+                if self.render_pending.is_some() {
+                    ctx.request_repaint_after(Duration::from_secs_f64(WORKER_POLL_INTERVAL));
+                }
                 match self.browser_preview.show(
                     frame,
                     &ctx,
