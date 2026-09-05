@@ -780,6 +780,26 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
 (() => {
   const manifestNode = document.getElementById('md-virtual-manifest');
   if (!manifestNode) return;
+  // Chunks and manifests are served by the `mdpreview` origin. Resolve
+  // transport requests explicitly on both Windows (HTTPS localhost aliases)
+  // and macOS (custom protocols) so a future asset-host change cannot route
+  // them to the wrong origin.
+  const previewOrigin = (() => {
+    try {
+      const url = new URL(location.href);
+      if (url.hostname === 'mdfont.localhost') {
+        url.hostname = 'mdpreview.localhost';
+        return url.origin;
+      }
+      if (url.protocol === 'mdfont:') {
+        url.protocol = 'mdpreview:';
+        return url.origin;
+      }
+    } catch (_) {
+      // Keep the current origin as a safe fallback for embedded test pages.
+    }
+    return location.origin;
+  })();
   let chunks = JSON.parse(manifestNode.textContent || '[]');
   let revision = new URL(location.href).searchParams.get('revision') || '';
   let updateRevision = 0;
@@ -997,7 +1017,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
         || current.blockIds.some((id, index) => String(id) !== String(next.blockIds[index]))) {
       return false;
     }
-    const chunkUrl = new URL(`/chunk/${next.index}?revision=${encodeURIComponent(revision)}`, location.origin);
+    const chunkUrl = new URL(`/chunk/${next.index}?revision=${encodeURIComponent(revision)}`, previewOrigin);
     const response = await fetch(chunkUrl, { cache: 'no-store' });
     if (!response.ok) return false;
     const template = document.createElement('template');
@@ -1028,7 +1048,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     if (chunk.loading) return chunk.loading;
     chunk.loading = (async () => {
       try {
-        const chunkUrl = new URL(`/chunk/${chunk.index}?revision=${encodeURIComponent(revision)}`, location.origin);
+        const chunkUrl = new URL(`/chunk/${chunk.index}?revision=${encodeURIComponent(revision)}`, previewOrigin);
         const response = await fetch(chunkUrl, { cache: 'no-store' });
         if (!response.ok) return;
         const template = document.createElement('template');
@@ -1103,7 +1123,7 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
 
   const patch = async (nextRevision, savedSource, savedAnchor = null) => {
     const requestRevision = ++updateRevision;
-    const manifestUrl = new URL(`/manifest?revision=${encodeURIComponent(nextRevision)}`, location.origin);
+    const manifestUrl = new URL(`/manifest?revision=${encodeURIComponent(nextRevision)}`, previewOrigin);
     const response = await fetch(manifestUrl, { cache: 'no-store' });
     if (!response.ok) throw new Error(`preview manifest request failed: ${response.status}`);
     const nextChunks = await response.json();
@@ -2219,6 +2239,7 @@ fn document_with_block_ids(
     let editor_font = editor_font_css();
     let dark_mode_css = dark_mode_css.unwrap_or_default();
     let asset_origin = custom_protocol_script_source("mdfont");
+    let preview_origin = custom_protocol_script_source("mdpreview");
     let image_origin = custom_protocol_script_source("mdfile");
     let mermaid_scripts = if has_mermaid {
         format!(
@@ -2230,7 +2251,7 @@ fn document_with_block_ids(
     };
 
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src {asset_origin}; style-src 'unsafe-inline'; img-src 'self' data: {image_origin} http: https:; font-src 'self' data: {asset_origin} http: https:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{font_runtime}{dark_mode_css}</style>{mermaid_scripts}</head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src {asset_origin} {preview_origin}; style-src 'unsafe-inline'; img-src 'self' data: {image_origin} http: https:; font-src 'self' data: {asset_origin} http: https:; connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{font_runtime}{dark_mode_css}</style>{mermaid_scripts}</head><body>{body}</body></html>"
     )
 }
 
@@ -3152,7 +3173,7 @@ fn virtualize_document(html: String) -> PreviewDocument {
     let manifest = virtual_manifest(&chunks);
     let virtual_script = format!(
         "<script id=\"md-virtual-manifest\" type=\"application/json\">{manifest}</script><script defer src=\"{}\"></script>",
-        custom_protocol_url("mdfont", "virtual-preview.js")
+        custom_protocol_url("mdpreview", "virtual-preview.js")
     );
     let mut shell = String::with_capacity(html.len() - body.len() + virtual_script.len());
     shell.push_str(&html[..body_start]);
@@ -3593,6 +3614,14 @@ fn preview_document_response(
     request: Request<Vec<u8>>,
     document_payload: &Arc<Mutex<Option<Arc<PreviewDocument>>>>,
 ) -> Response<Cow<'static, [u8]>> {
+    if request.uri().path() == "/virtual-preview.js" {
+        return Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/javascript; charset=utf-8")
+            .header(CACHE_CONTROL, "no-cache")
+            .body(Cow::Borrowed(VIRTUAL_PREVIEW_SCRIPT.as_bytes()))
+            .expect("valid virtual preview script response");
+    }
     let payload = document_payload
         .lock()
         .ok()
@@ -3614,6 +3643,7 @@ fn preview_document_response(
         return Response::builder()
             .status(409)
             .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
             .header(CACHE_CONTROL, "no-store")
             .body(Cow::Borrowed(&b"stale preview revision"[..]))
             .expect("valid stale preview response");
@@ -3699,6 +3729,7 @@ fn preview_document_response(
                 "text/html; charset=utf-8"
             },
         )
+        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .header("X-Content-Type-Options", "nosniff")
         .header(CACHE_CONTROL, "no-store")
         .body(Cow::Owned(bytes))
