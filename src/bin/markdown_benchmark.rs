@@ -8,6 +8,8 @@
 mod export;
 #[path = "../html_image.rs"]
 mod html_image;
+#[path = "../io.rs"]
+mod io;
 #[path = "../markdown.rs"]
 mod markdown;
 #[path = "../storage.rs"]

@@ -16,8 +16,12 @@ mod web_preview;
 mod window_close;
 mod window_session;
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use std::collections::VecDeque;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -609,7 +613,6 @@ impl RenderWorker {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
 struct ParseRequest {
     tab_id: u64,
     revision: u64,
@@ -1321,9 +1324,12 @@ impl MdEditorApp {
             }
             tab.document = result.document;
             tab.parse_pending = false;
-            if index == self.active_tab {
-                self.browser_document_cache = None;
-                self.render_pending = None;
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            {
+                if index == self.active_tab {
+                    self.browser_document_cache = None;
+                    self.render_pending = None;
+                }
             }
             active_document_changed |= index == self.active_tab;
         }
@@ -2429,8 +2435,11 @@ impl MdEditorApp {
                     self.document = markdown::parse_document(&self.text);
                     self.document_revision = self.document_revision.wrapping_add(1);
                     self.parse_pending = false;
-                    self.browser_document_cache = None;
-                    self.render_pending = None;
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    {
+                        self.browser_document_cache = None;
+                        self.render_pending = None;
+                    }
                     self.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
                     if let Err(error) = self.persist_draft_session() {
@@ -2463,20 +2472,30 @@ impl MdEditorApp {
     }
 
     fn export_pdf(&mut self, ctx: &egui::Context) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PDF", &["pdf"])
-            .set_file_name("导出.pdf")
-            .save_file()
-        else {
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            let _ = ctx;
+            self.status_note = "PDF 导出需要 Windows 或 macOS 的内置预览".to_string();
             return;
-        };
+        }
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("PDF", &["pdf"])
+                .set_file_name("导出.pdf")
+                .save_file()
+            else {
+                return;
+            };
 
-        match self.browser_preview.export_pdf(&path, ctx) {
-            Ok(()) => {
-                self.status_note = format!("正在从预览导出 PDF：{}", path.display());
-            }
-            Err(error) => {
-                self.status = DocStatus::SaveFailed(format!("PDF 导出需要可用的内置预览：{error}"));
+            match self.browser_preview.export_pdf(&path, ctx) {
+                Ok(()) => {
+                    self.status_note = format!("正在从预览导出 PDF：{}", path.display());
+                }
+                Err(error) => {
+                    self.status =
+                        DocStatus::SaveFailed(format!("PDF 导出需要可用的内置预览：{error}"));
+                }
             }
         }
     }
