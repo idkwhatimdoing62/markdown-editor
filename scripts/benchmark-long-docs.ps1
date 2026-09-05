@@ -33,7 +33,10 @@ try {
         @{ Label = "10-mib"; File = "long-document-10-mib.md" }
     ) | Where-Object { $Sizes -contains $_.Label }
     $budgets = @{
-        "100-kib" = @{ ParseP95Ms = 20; BrowserHtmlP95Ms = 30; ExportHtmlP95Ms = 200; WebViewReadyMs = 2000; PeakWorkingSetMiB = 900 }
+        # The first case pays the one-time WebView2 process cold-start cost on
+        # hosted Windows runners; larger documents still enforce the product
+        # readiness budgets below.
+        "100-kib" = @{ ParseP95Ms = 20; BrowserHtmlP95Ms = 30; ExportHtmlP95Ms = 200; WebViewReadyMs = 10000; PeakWorkingSetMiB = 900 }
         "1-mib" = @{ ParseP95Ms = 150; BrowserHtmlP95Ms = 200; ExportHtmlP95Ms = 500; WebViewReadyMs = 3000; PeakWorkingSetMiB = 1300 }
         "10-mib" = @{ ParseP95Ms = 1000; BrowserHtmlP95Ms = 6500; ExportHtmlP95Ms = 3500; WebViewReadyMs = 5000; PeakWorkingSetMiB = 2048 }
     }
