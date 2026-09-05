@@ -57,14 +57,24 @@ pub fn file_stamp(path: &Path) -> Result<FileStamp, ReadError> {
 }
 
 pub fn read_snapshot_checked(path: &Path) -> Result<Vec<u8>, ReadError> {
-    let mut file = fs::File::open(path).map_err(|error| ReadError::Io(error.to_string()))?;
+    let file = fs::File::open(path).map_err(|error| ReadError::Io(error.to_string()))?;
     let metadata = file
         .metadata()
         .map_err(|error| ReadError::Io(error.to_string()))?;
     check_size(metadata.len())?;
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
+    // Metadata is only a fast rejection hint: another process can append to
+    // the file after the check. Read one byte beyond the limit so the memory
+    // bound remains valid even while an external writer is active.
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_SIZE.saturating_add(1))
+        .read_to_end(&mut bytes)
         .map_err(|error| ReadError::Io(error.to_string()))?;
+    if bytes.len() as u64 > MAX_FILE_SIZE {
+        return Err(ReadError::TooLarge {
+            size: bytes.len() as u64,
+            limit: MAX_FILE_SIZE,
+        });
+    }
     Ok(bytes)
 }
 
@@ -72,7 +82,7 @@ pub fn read_snapshot_checked(path: &Path) -> Result<Vec<u8>, ReadError> {
 /// before checking its metadata keeps the size check tied to the same inode,
 /// avoiding a metadata/read race when previewing or exporting local images.
 pub fn read_file_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let mut file = fs::File::open(path)?;
+    let file = fs::File::open(path)?;
     let size = file.metadata()?.len();
     if size > limit {
         return Err(std::io::Error::new(
@@ -80,8 +90,8 @@ pub fn read_file_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
             format!("file exceeds {limit} byte limit"),
         ));
     }
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.read_to_end(&mut bytes)?;
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -122,14 +132,50 @@ fn acquire_save_lock(path: &Path) -> Result<fs::File, String> {
     Ok(lock)
 }
 
+fn read_current_for_conflict(path: &Path) -> Result<(Vec<u8>, FileStamp), SaveError> {
+    let before = fs::metadata(path).map_err(|error| SaveError::Io(error.to_string()))?;
+    let bytes = read_file_limited(path, MAX_FILE_SIZE).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            SaveError::ExternalModified
+        } else {
+            SaveError::Io(error.to_string())
+        }
+    })?;
+    let after = fs::metadata(path).map_err(|error| SaveError::Io(error.to_string()))?;
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return Err(SaveError::ExternalModified);
+    }
+    Ok((
+        bytes,
+        FileStamp {
+            modified: after.modified().ok(),
+            len: after.len(),
+        },
+    ))
+}
+
 pub fn save_with_conflict_check(
     path: &Path,
     text: &str,
     snapshot: &[u8],
 ) -> Result<Vec<u8>, SaveError> {
     let _lock = acquire_save_lock(path).map_err(SaveError::Io)?;
-    let current = fs::read(path).map_err(|e| SaveError::Io(e.to_string()))?;
+    // Conflict checks compare raw bytes, so invalid UTF-8 is still a valid
+    // externally modified file. The bounded reader also prevents a replaced
+    // file from forcing an unbounded allocation.
+    let (current, current_stamp) = read_current_for_conflict(path)?;
     if current.as_slice() != snapshot {
+        return Err(SaveError::ExternalModified);
+    }
+    // Re-check immediately before replacing the file. This closes the common
+    // external-editor race window; the application lock still coordinates our
+    // own saves, while this second bounded read detects external replacements
+    // that happened during the first comparison.
+    let (current_again, stamp_again) = read_current_for_conflict(path)?;
+    if stamp_again != current_stamp {
+        return Err(SaveError::ExternalModified);
+    }
+    if current_again.as_slice() != snapshot {
         return Err(SaveError::ExternalModified);
     }
     let bytes = text.as_bytes();
@@ -145,7 +191,7 @@ pub fn save_overwrite(path: &Path, text: &str) -> Result<Vec<u8>, String> {
 }
 
 pub fn read_snapshot(path: &Path) -> Option<Vec<u8>> {
-    fs::read(path).ok()
+    read_file_limited(path, MAX_FILE_SIZE).ok()
 }
 
 const DRAFT_SCHEMA_VERSION: u32 = 2;
@@ -271,7 +317,13 @@ fn load_draft_at(path: &Path, now: u64) -> Option<DraftSession> {
         storage::quarantine_corrupt(path);
         return None;
     }
-    let bytes = fs::read(path).ok()?;
+    let bytes = match read_file_limited(path, DRAFT_SESSION_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            storage::quarantine_corrupt(path);
+            return None;
+        }
+    };
     let mut session: DraftSession = match serde_json::from_slice(&bytes) {
         Ok(session) => session,
         Err(_) => match serde_json::from_slice::<LegacyDraftEnvelope>(&bytes) {
@@ -368,7 +420,7 @@ pub fn load_draft() -> Option<DraftSession> {
 
     // One-time migration from releases that stored the draft in the OS temp directory.
     let legacy = legacy_draft_path();
-    let bytes = fs::read(&legacy).ok()?;
+    let bytes = read_file_limited(&legacy, MAX_FILE_SIZE).ok()?;
     if bytes.is_empty() || bytes.len() as u64 > MAX_FILE_SIZE {
         let _ = fs::remove_file(legacy);
         return None;

@@ -21,6 +21,8 @@ pub fn register_and_open_default_apps() -> Result<(), String> {
     register(&executable)?;
 
     // Inform Explorer before opening Settings so the newly registered app is visible immediately.
+    // SAFETY: the notification API accepts null data pointers for the
+    // SHCNE_ASSOCCHANGED event; no borrowed memory is dereferenced.
     unsafe {
         SHChangeNotify(
             SHCNE_ASSOCCHANGED as i32,
@@ -106,6 +108,8 @@ fn set_registry_string(key_path: &str, value_name: &str, value: &str) -> Result<
     let value_name = wide(value_name);
     let value = wide(value);
     let mut key: HKEY = ptr::null_mut();
+    // SAFETY: all pointers refer to NUL-terminated UTF-16 buffers owned by
+    // this function, and `key` is a valid out-parameter for the registry API.
     let create_result = unsafe {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
@@ -124,6 +128,8 @@ fn set_registry_string(key_path: &str, value_name: &str, value: &str) -> Result<
     }
 
     let bytes = value.len().saturating_mul(size_of::<u16>());
+    // SAFETY: `key` was returned by RegCreateKeyExW, and the value buffers are
+    // NUL-terminated UTF-16 strings whose byte length is explicitly supplied.
     let set_result = unsafe {
         RegSetValueExW(
             key,
@@ -134,6 +140,8 @@ fn set_registry_string(key_path: &str, value_name: &str, value: &str) -> Result<
             bytes as u32,
         )
     };
+    // SAFETY: `key` is either a valid handle returned above or null after a
+    // failed creation; RegCloseKey is only called after the success check.
     unsafe {
         RegCloseKey(key);
     }

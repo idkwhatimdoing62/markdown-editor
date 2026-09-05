@@ -177,22 +177,17 @@ impl ThemePackage {
             .to_ascii_lowercase();
         match ext.as_str() {
             "json" => {
-                let metadata =
-                    std::fs::metadata(path).map_err(|e| format!("无法读取主题包：{e}"))?;
-                if metadata.len() > MAX_THEME_FILE_BYTES {
-                    return Err("主题 JSON 超过 2 MiB 限制".to_string());
-                }
-                let text =
-                    std::fs::read_to_string(path).map_err(|e| format!("无法读取主题包：{e}"))?;
+                let bytes = crate::io::read_file_limited(path, MAX_THEME_FILE_BYTES)
+                    .map_err(|e| format!("无法读取主题包：{e}"))?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| "主题 JSON 不是有效的 UTF-8 文本".to_string())?;
                 Self::from_json(&text)
             }
             "css" => {
-                let metadata = std::fs::metadata(path).map_err(|e| format!("无法读取 CSS：{e}"))?;
-                if metadata.len() > MAX_THEME_FILE_BYTES {
-                    return Err("CSS 主题超过 2 MiB 限制".to_string());
-                }
-                let css =
-                    std::fs::read_to_string(path).map_err(|e| format!("无法读取 CSS：{e}"))?;
+                let bytes = crate::io::read_file_limited(path, MAX_THEME_FILE_BYTES)
+                    .map_err(|e| format!("无法读取 CSS：{e}"))?;
+                let css = String::from_utf8(bytes)
+                    .map_err(|_| "CSS 主题不是有效的 UTF-8 文本".to_string())?;
                 let name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -585,7 +580,13 @@ fn load_saved_at(path: &Path) -> Option<ThemePackage> {
         storage::quarantine_corrupt(path);
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = match crate::io::read_file_limited(path, THEME_STATE_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            storage::quarantine_corrupt(path);
+            return None;
+        }
+    };
     let envelope: SavedThemeEnvelope = match serde_json::from_slice(&bytes) {
         Ok(envelope) => envelope,
         Err(_) => {
@@ -631,7 +632,8 @@ pub fn load_saved() -> Option<ThemePackage> {
 
     // One-time migration from releases that stored the raw package in the temp directory.
     let legacy = legacy_theme_path();
-    let text = std::fs::read_to_string(&legacy).ok()?;
+    let bytes = crate::io::read_file_limited(&legacy, MAX_THEME_FILE_BYTES).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
     let package = match ThemePackage::from_json(&text) {
         Ok(package) => package,
         Err(_) => {
@@ -666,8 +668,12 @@ fn load_dark_at(path: &Path) -> bool {
         storage::quarantine_corrupt(path);
         return false;
     }
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
+    let bytes = match crate::io::read_file_limited(path, APPEARANCE_STATE_LIMIT) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            storage::quarantine_corrupt(path);
+            return false;
+        }
     };
     let Ok(envelope) = serde_json::from_slice::<SavedAppearanceEnvelope>(&bytes) else {
         storage::quarantine_corrupt(path);

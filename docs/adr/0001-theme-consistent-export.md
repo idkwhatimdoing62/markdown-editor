@@ -1,6 +1,6 @@
 # ADR-0001：HTML/PDF 采用主题一致导出
 
-> 状态：已采纳
+> 状态：已废弃（由 ADR-0004 supersede）
 > 日期：2026-08-13
 > 影响版本：下一发布版本起
 
@@ -40,7 +40,7 @@ HTML 和 PDF 都接收当前主题 CSS、当前正文字号、文档目录和标
 
 ## 决策
 
-采用方案 B。
+本 ADR 的方案 B 已由 ADR-0004 取代；HTML 仍沿用主题一致的导出规则，PDF 改为只使用预览 WebView 的原生打印引擎。
 
 `export_html` 和 `export_pdf` 必须接收 `ExportOptions`。调用方负责提供活动标签的以下状态：
 

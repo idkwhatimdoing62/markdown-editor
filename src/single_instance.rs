@@ -1,31 +1,46 @@
 //! Per-user desktop single-instance coordination over loopback TCP.
 
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-const IPC_SCHEMA_VERSION: u32 = 1;
+const IPC_SCHEMA_VERSION: u32 = 2;
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const ACK: u8 = 0x06;
+const IPC_TOKEN_BYTES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRequest {
     pub schema_version: u32,
     pub paths: Vec<PathBuf>,
     pub focus_window: bool,
+    #[serde(default)]
+    pub auth_token: String,
 }
 
 impl OpenRequest {
+    #[cfg(test)]
     pub fn new(paths: Vec<PathBuf>) -> Self {
         Self {
             schema_version: IPC_SCHEMA_VERSION,
             paths,
             focus_window: true,
+            auth_token: String::new(),
+        }
+    }
+
+    fn with_auth_token(paths: Vec<PathBuf>, auth_token: String) -> Self {
+        Self {
+            schema_version: IPC_SCHEMA_VERSION,
+            paths,
+            focus_window: true,
+            auth_token,
         }
     }
 }
@@ -38,15 +53,80 @@ pub enum Acquisition {
 
 pub fn acquire(paths: Vec<PathBuf>) -> Acquisition {
     let address = ipc_address();
+    let token = match load_or_create_ipc_token() {
+        Ok(token) => token,
+        Err(error) => {
+            return Acquisition::Unavailable(format!("无法初始化单实例认证：{error}"));
+        }
+    };
+    let request = OpenRequest::with_auth_token(paths, token.clone());
     match TcpListener::bind(address) {
-        Ok(listener) => Acquisition::Primary(start_listener(listener)),
-        Err(bind_error) => match forward_request(address, &OpenRequest::new(paths)) {
+        Ok(listener) => Acquisition::Primary(start_listener(listener, token)),
+        Err(bind_error) => match forward_request(address, &request) {
             Ok(()) => Acquisition::Forwarded,
             Err(forward_error) => Acquisition::Unavailable(format!(
                 "无法连接现有窗口（端口 {}）：{forward_error}；监听失败：{bind_error}",
                 address.port()
             )),
         },
+    }
+}
+
+fn ipc_token_path() -> PathBuf {
+    crate::storage::config_dir().join("state").join("ipc.token")
+}
+
+fn read_token_file(path: &Path) -> io::Result<String> {
+    let file = fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((IPC_TOKEN_BYTES * 2 + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "IPC token is not UTF-8"))
+}
+
+fn valid_token(token: &str) -> bool {
+    token.len() == IPC_TOKEN_BYTES * 2 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn load_or_create_ipc_token() -> io::Result<String> {
+    let path = ipc_token_path();
+    if path.exists() {
+        match read_token_file(&path) {
+            Ok(token) if valid_token(&token) => return Ok(token),
+            Ok(_) => {
+                crate::storage::quarantine_corrupt(&path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                crate::storage::quarantine_corrupt(&path);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let token = rand::random::<[u8; IPC_TOKEN_BYTES]>()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            file.write_all(token.as_bytes())?;
+            file.sync_all()?;
+            Ok(token)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let token = read_token_file(&path)?;
+            if valid_token(&token) {
+                Ok(token)
+            } else {
+                crate::storage::quarantine_corrupt(&path);
+                load_or_create_ipc_token()
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -62,7 +142,7 @@ fn ipc_address() -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
 }
 
-fn start_listener(listener: TcpListener) -> Receiver<OpenRequest> {
+fn start_listener(listener: TcpListener, expected_token: String) -> Receiver<OpenRequest> {
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
         .name("markdown-editor-single-instance".to_string())
@@ -74,6 +154,7 @@ fn start_listener(listener: TcpListener) -> Receiver<OpenRequest> {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
                 if let Ok(request) = read_request(&mut stream)
+                    && request.auth_token == expected_token
                     && sender.send(request).is_ok()
                 {
                     let _ = stream.write_all(&[ACK]);
@@ -167,6 +248,7 @@ mod tests {
             schema_version: 99,
             paths: Vec::new(),
             focus_window: true,
+            auth_token: String::new(),
         };
         let mut bytes = Vec::new();
         write_request(&mut bytes, &request).unwrap();

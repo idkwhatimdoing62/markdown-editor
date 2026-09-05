@@ -413,6 +413,23 @@ struct LatestRequestReceiver<T> {
     state: Arc<LatestRequestState<T>>,
 }
 
+/// A bounded, latest-only result channel. Worker results contain complete
+/// parsed/rendered documents, so retaining every completed revision can grow
+/// memory without bound while the UI is blocked. Replacing the pending result
+/// keeps at most one large document snapshot alive for each worker.
+struct LatestResultState<T> {
+    pending: Mutex<Option<T>>,
+    closed: AtomicBool,
+}
+
+struct LatestResultSender<T> {
+    state: Arc<LatestResultState<T>>,
+}
+
+struct LatestResultReceiver<T> {
+    state: Arc<LatestResultState<T>>,
+}
+
 impl<T> LatestRequestState<T> {
     fn channel() -> (LatestRequestSender<T>, LatestRequestReceiver<T>) {
         let state = Arc::new(Self {
@@ -461,17 +478,71 @@ impl<T> LatestRequestReceiver<T> {
     }
 }
 
+impl<T> LatestResultState<T> {
+    fn channel() -> (LatestResultSender<T>, LatestResultReceiver<T>) {
+        let state = Arc::new(Self {
+            pending: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        });
+        (
+            LatestResultSender {
+                state: Arc::clone(&state),
+            },
+            LatestResultReceiver { state },
+        )
+    }
+}
+
+impl<T> LatestResultSender<T> {
+    fn submit(&self, result: T) {
+        if let Ok(mut pending) = self.state.pending.lock()
+            && !self.state.closed.load(Ordering::Acquire)
+        {
+            *pending = Some(result);
+        }
+    }
+}
+
+impl<T> Drop for LatestResultSender<T> {
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+    }
+}
+
+impl<T> LatestResultReceiver<T> {
+    fn try_recv(&self) -> Result<T, mpsc::TryRecvError> {
+        let mut pending = self
+            .state
+            .pending
+            .lock()
+            .map_err(|_| mpsc::TryRecvError::Disconnected)?;
+        if let Some(result) = pending.take() {
+            Ok(result)
+        } else if self.state.closed.load(Ordering::Acquire) {
+            Err(mpsc::TryRecvError::Disconnected)
+        } else {
+            Err(mpsc::TryRecvError::Empty)
+        }
+    }
+}
+
+impl<T> Drop for LatestResultReceiver<T> {
+    fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
+    }
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 struct RenderWorker {
     requests: LatestRequestSender<RenderRequest>,
-    results: Receiver<RenderResult>,
+    results: LatestResultReceiver<RenderResult>,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 impl RenderWorker {
     fn new() -> Self {
         let (request_queue, request_receiver) = LatestRequestState::<RenderRequest>::channel();
-        let (result_sender, result_receiver) = mpsc::channel::<RenderResult>();
+        let (result_sender, result_receiver) = LatestResultState::<RenderResult>::channel();
         std::thread::spawn(move || {
             while let Some(request) = request_receiver.recv() {
                 let started = Instant::now();
@@ -515,17 +586,12 @@ impl RenderWorker {
                     full_render,
                 };
                 let document = Arc::new(document);
-                if result_sender
-                    .send(RenderResult {
-                        key: request.key,
-                        document,
-                        parsed_document,
-                        metrics,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                result_sender.submit(RenderResult {
+                    key: request.key,
+                    document,
+                    parsed_document,
+                    metrics,
+                });
             }
         });
         Self {
@@ -559,13 +625,13 @@ struct ParseResult {
 
 struct ParseWorker {
     requests: LatestRequestSender<ParseRequest>,
-    results: Receiver<ParseResult>,
+    results: LatestResultReceiver<ParseResult>,
 }
 
 impl ParseWorker {
     fn new() -> Self {
         let (request_queue, request_receiver) = LatestRequestState::<ParseRequest>::channel();
-        let (result_sender, result_receiver) = mpsc::channel::<ParseResult>();
+        let (result_sender, result_receiver) = LatestResultState::<ParseResult>::channel();
         std::thread::spawn(move || {
             while let Some(request) = request_receiver.recv() {
                 let document = request
@@ -585,9 +651,7 @@ impl ParseWorker {
                     revision: request.revision,
                     document,
                 };
-                if result_sender.send(result).is_err() {
-                    break;
-                }
+                result_sender.submit(result);
             }
         });
         Self {
@@ -2407,23 +2471,13 @@ impl MdEditorApp {
             return;
         };
 
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        if self.browser_preview.has_webview() {
-            match self.browser_preview.export_pdf(&path, ctx) {
-                Ok(()) => {
-                    self.status_note = format!("正在从预览导出 PDF：{}", path.display());
-                    return;
-                }
-                Err(error) => {
-                    self.status_note = format!("浏览器原生导出不可用，将使用兼容导出：{error}");
-                }
+        match self.browser_preview.export_pdf(&path, ctx) {
+            Ok(()) => {
+                self.status_note = format!("正在从预览导出 PDF：{}", path.display());
             }
-        }
-        let title = self.export_title();
-        let options = self.export_options(&title);
-        match export::export_pdf(&path, &self.document, options) {
-            Ok(()) => self.status_note = format!("已导出 PDF：{}", path.display()),
-            Err(e) => self.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
+            Err(error) => {
+                self.status = DocStatus::SaveFailed(format!("PDF 导出需要可用的内置预览：{error}"));
+            }
         }
     }
 
@@ -4238,6 +4292,23 @@ mod app_tests {
         assert_eq!(receiver.recv(), Some(2));
         drop(sender);
         assert_eq!(receiver.recv(), None);
+    }
+
+    #[test]
+    fn latest_result_queue_drops_stale_large_results() {
+        let (sender, receiver) = LatestResultState::<String>::channel();
+        sender.submit("old document".to_string());
+        sender.submit("latest document".to_string());
+        assert_eq!(receiver.try_recv().unwrap(), "latest document");
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        drop(sender);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]

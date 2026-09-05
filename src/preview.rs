@@ -1,7 +1,7 @@
 //! 把块模型渲染到 egui 预览区。
 
 use egui::text::{LayoutJob, TextFormat};
-use egui::{Color32, FontFamily, FontId, Stroke};
+use egui::{Color32, FontFamily, FontId, RichText, Stroke};
 
 use crate::markdown::{Block, Inline};
 use crate::theme::{HeadingStyle, ThemeSpec};
@@ -259,6 +259,10 @@ fn show_inlines_block(
     };
     let mut links = Vec::new();
     let job = inlines_to_job(inlines, &base, ui.visuals().hyperlink_color, &mut links);
+    if clickable && links.len() > 1 {
+        show_inline_runs(ui, inlines, size, strong, line_height);
+        return;
+    }
     let mut label = egui::Label::new(job).wrap();
     if clickable {
         label = label.sense(egui::Sense::click());
@@ -270,6 +274,140 @@ fn show_inlines_block(
         ui.ctx().open_url(egui::OpenUrl {
             url: url.clone(),
             new_tab: true,
+        });
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct InlineRunStyle {
+    strong: bool,
+    italics: bool,
+    code: bool,
+    strikethrough: bool,
+    link: Option<String>,
+}
+
+#[derive(Clone)]
+struct InlineRun {
+    text: String,
+    style: InlineRunStyle,
+}
+
+/// Render multi-link inline content as separate hit-testable labels. A single
+/// LayoutJob only exposes one response rectangle, so opening `links.first()`
+/// would otherwise make every click in a paragraph open the first URL.
+fn show_inline_runs(
+    ui: &mut egui::Ui,
+    inlines: &[Inline],
+    size: f32,
+    strong: bool,
+    line_height: f32,
+) {
+    let mut runs = Vec::new();
+    collect_inline_runs(
+        inlines,
+        &InlineRunStyle {
+            strong,
+            ..Default::default()
+        },
+        &mut runs,
+    );
+    ui.horizontal_wrapped(|ui| {
+        let previous_spacing = ui.spacing().item_spacing.x;
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for run in runs {
+            if run.text.is_empty() {
+                continue;
+            }
+            let family = if run.style.code {
+                FontFamily::Monospace
+            } else if run.style.strong {
+                bold_family()
+            } else {
+                FontFamily::Proportional
+            };
+            let color = run.style.link.as_ref().map_or_else(
+                || ui.visuals().text_color(),
+                |_| ui.visuals().hyperlink_color,
+            );
+            let mut text = RichText::new(run.text)
+                .font(FontId::new(size, family))
+                .color(color)
+                .line_height(Some(size * line_height));
+            if run.style.italics {
+                text = text.italics();
+            }
+            if run.style.strikethrough {
+                text = text.strikethrough();
+            }
+            if run.style.link.is_some() {
+                text = text.underline();
+            }
+            let response = ui.add(egui::Label::new(text).wrap().sense(
+                if run.style.link.is_some() {
+                    egui::Sense::click()
+                } else {
+                    egui::Sense::hover()
+                },
+            ));
+            if response.clicked()
+                && let Some(url) = run.style.link
+            {
+                ui.ctx().open_url(egui::OpenUrl { url, new_tab: true });
+            }
+        }
+        ui.spacing_mut().item_spacing.x = previous_spacing;
+    });
+}
+
+fn collect_inline_runs(inlines: &[Inline], style: &InlineRunStyle, runs: &mut Vec<InlineRun>) {
+    for inline in inlines {
+        match inline {
+            Inline::Text(text) => append_inline_run(runs, text, style),
+            Inline::Emphasis(children) => {
+                let mut nested = style.clone();
+                nested.italics = true;
+                collect_inline_runs(children, &nested, runs);
+            }
+            Inline::Strong(children) => {
+                let mut nested = style.clone();
+                nested.strong = true;
+                collect_inline_runs(children, &nested, runs);
+            }
+            Inline::Strikethrough(children) => {
+                let mut nested = style.clone();
+                nested.strikethrough = true;
+                collect_inline_runs(children, &nested, runs);
+            }
+            Inline::Code(code) => {
+                let mut nested = style.clone();
+                nested.code = true;
+                append_inline_run(runs, code, &nested);
+            }
+            Inline::Link { url, children, .. } => {
+                let mut nested = style.clone();
+                nested.link = Some(url.clone());
+                collect_inline_runs(children, &nested, runs);
+            }
+            Inline::Image { alt, .. } => append_inline_run(runs, &format!("[图片] {alt}"), style),
+            Inline::SoftBreak => append_inline_run(runs, " ", style),
+            Inline::HardBreak => append_inline_run(runs, "\n", style),
+        }
+    }
+}
+
+fn append_inline_run(runs: &mut Vec<InlineRun>, text: &str, style: &InlineRunStyle) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(previous) = runs.last_mut()
+        && previous.style == *style
+    {
+        previous.text.push_str(text);
+    } else {
+        runs.push(InlineRun {
+            text: text.to_string(),
+            style: style.clone(),
         });
     }
 }
@@ -360,7 +498,8 @@ fn strip_task_marker(item: &[Block]) -> (Option<bool>, Vec<Block>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::markdown::parse;
+    use super::{InlineRunStyle, collect_inline_runs};
+    use crate::markdown::{Block, parse};
     use crate::preview::bold_family;
 
     struct TextRun {
@@ -440,6 +579,21 @@ mod tests {
         assert!((h1.y - h2.y).abs() < 2.0, "表头单元格应在同一行");
         let row1 = cell("编辑");
         assert!((row1.y - h1.y).abs() > 10.0, "数据行应在表头下方");
+    }
+
+    #[test]
+    fn 多链接段落为每个链接保留独立点击目标() {
+        let blocks = parse("[甲](https://example.com/a) 与 [乙](https://example.com/b)");
+        let Block::Paragraph(inlines) = &blocks[0] else {
+            panic!("应解析为段落");
+        };
+        let mut runs = Vec::new();
+        collect_inline_runs(inlines, &InlineRunStyle::default(), &mut runs);
+        let urls = runs
+            .iter()
+            .filter_map(|run| run.style.link.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(urls, ["https://example.com/a", "https://example.com/b"]);
     }
 
     #[test]

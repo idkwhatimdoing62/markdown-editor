@@ -310,9 +310,9 @@ stateDiagram-v2
 
 主题写入用户配置目录的 `themes/current.json`，包含格式版本、保存时间和主题包。草稿或主题为空、超限、版本不兼容、时间异常或 JSON 损坏时，文件改名为 `.corrupt-时间戳` 并降级为无草稿或内置主题；隔离文件、临时文件和备份文件保留 7 天后清理。旧版本位于系统临时目录的草稿和主题会在首次读取时迁移，迁移成功后删除旧文件。
 
-HTML 和 PDF 采用主题一致导出，决策见 [ADR-0001](docs/adr/0001-theme-consistent-export.md)。`main.rs` 把活动标签的主题 CSS、亮暗外观、深色色板、正文字号、文档目录和标题传给 `export.rs`。导出模块使用相同的 Markdown 解析选项、DOM 兼容规则和应用字体生成完整文档；深色外观导出追加与预览相同的深色覆盖层。
+HTML 和 PDF 采用主题一致导出，决策见 [ADR-0004](docs/adr/0004-webview-native-pdf-export.md)。`main.rs` 把活动标签的主题 CSS、亮暗外观、深色色板、正文字号、文档目录和标题传给导出链路。HTML 由 `export.rs` 生成自包含文件；PDF 由当前预览 WebView 的原生打印接口生成，深色外观使用与预览相同的深色覆盖层。
 
-HTML 内嵌字体、本地图片和按需 Mermaid 运行库，离开应用后仍可显示。PDF 把同一主题化 DOM、字体和本地图片交给 `printpdf`，并直接写入用户选择的路径。PDF 引擎不执行 JavaScript，因此 Mermaid 在 PDF 中保留为代码块；浏览器专有 CSS 超出 `printpdf` 能力时允许局部退化。
+HTML 内嵌字体、本地图片和按需 Mermaid 运行库，离开应用后仍可显示。PDF 导出前等待当前 WebView 的字体、图片、Mermaid 和长文档分块就绪，再调用 Windows WebView2 `PrintToPdf` 或 macOS WKWebView `createPDF` 写入用户选择的路径。没有可用 WebView 时直接提示错误，不生成第二套布局结果。
 
 Windows 默认应用处理顺序：
 
@@ -336,10 +336,10 @@ Windows 8 及以后由用户完成最终默认选择，应用不修改受保护�
 | `io.rs` | 文件上限、UTF-8、快照、冲突写入、草稿路径 | `read_markdown`、`file_stamp`、`save_with_conflict_check` | 编码、原子写入、冲突和草稿策略 |
 | `storage.rs` | 用户配置目录、版本号、原子替换、损坏隔离和过期清理 | `config_dir`、`write_atomic`、`quarantine_corrupt`、`cleanup_sidecars` | 持久化位置、版本迁移和清理策略 |
 | `markdown.rs` | 唯一 Markdown 解析入口、兼容预处理、内部块/行内模型、带范围事件流和纯文本提取 | `parse_document`、`ParsedDocument`、`plain_text` | 语法和统一解析产物 |
-| `web_preview.rs` | 浏览器 HTML、CSS 层叠、自定义协议、Mermaid、源码锚点、WebView 生命周期 | `document`、`BrowserPreview::show`、滚动与章节接口 | 浏览器 DOM、资源、安全和滚动同步 |
+| `web_preview.rs` | 浏览器 HTML、CSS 层叠、自定义协议、Mermaid、源码锚点、WebView 生命周期和原生 PDF 导出 | `document`、`BrowserPreview::show`、`BrowserPreview::export_pdf`、滚动与章节接口 | 浏览器 DOM、资源、安全、滚动同步和平台打印接口 |
 | `preview.rs` | egui 后备预览 | `show_preview_with_theme` | 无 WebView 或弹层期间的后备显示 |
 | `theme.rs` | 主题格式、ZIP 选择、主题持久化和应用色板 | `ThemePackage::from_file`、`spec`、`browser_css` | 外部主题格式和兼容参数 |
-| `export.rs` | 主题化 HTML/PDF、导出资源和内置字体 | `ExportOptions`、`render_styled_html`、`export_html`、`export_pdf` | 导出格式、资源内嵌和 PDF 兼容 |
+| `export.rs` | 主题化 HTML、导出资源和内置字体 | `ExportOptions`、`render_styled_html`、`export_html` | HTML 格式和资源内嵌 |
 | `file_association.rs` | Windows ProgID、注册表能力和系统设置入口 | `register_and_open_default_apps` | Windows 默认应用协议 |
 | `single_instance.rs` | 每用户回环地址、启动请求协议、监听、转发和确认 | `acquire`、`OpenRequest` | 单实例边界、协议版本、消息上限和进程间交接 |
 | `installer/`、`packaging/macos/` | 安装注册、图标、App Bundle 文档类型 | Inno Setup、`Info.plist` | 发布包与平台集成 |
@@ -355,7 +355,7 @@ Windows 8 及以后由用户完成最终默认选择，应用不修改受保护�
 | `BrowserPreview::show(...)` | 父窗口、区域和 HTML | 可见 WebView | 创建、定位或加载错误 | WebView 原生句柄 |
 | `ThemePackage::from_file(path)` | CSS、JSON 或 ZIP | 统一主题包 | 格式、编码、大小和字段错误 | ZIP 原始目录结构 |
 | `export_html(path,markdown,options)` | 文本、活动主题、字号、目录和标题 | 自包含主题化 HTML | 文件写入错误 | 输出体积和浏览器实现细节 |
-| `export_pdf(path,markdown,options)` | 文本、活动主题、字号、目录和标题 | 使用相同主题输入的 PDF | HTML/CSS 转换或文件写入错误 | JavaScript 执行和浏览器专有 CSS |
+| `BrowserPreview::export_pdf(path,ctx)` | 当前预览 DOM、活动主题、字号、目录和标题 | 由 WebView 原生打印引擎生成 PDF | WebView 不可用、资源未就绪或平台打印错误 | 无第二套 PDF 布局；不提供无 WebView 的 PDF 回退 |
 | `register_and_open_default_apps()` | 当前 exe 路径 | 候选程序注册完成并打开设置 | 注册表或进程启动错误 | Windows 最终用户选择 |
 | `single_instance::acquire(paths)` | 启动参数中的全部文件路径 | 主进程获得接收器；后续进程收到确认并退出 | 端口被无关程序占用或现有进程无响应时显示错误并退出 | 跨设备、跨用户或网络通信 |
 
@@ -442,7 +442,7 @@ Windows 8 及以后由用户完成最终默认选择，应用不修改受保护�
 | 本地持久化 | 用户配置目录、版本化 JSON、原子替换和损坏隔离 | 多标签草稿与主题不会被临时目录清理；支持旧数据迁移和安全降级 | 草稿总量限制 256 MiB；隔离文件最多保留 7 天 | 需要跨设备配置或会话同步时 |
 | 默认应用 | 注册候选能力并打开系统设置 | 遵守 Windows 用户选择规则 | 需要用户确认，无法一键静默完成 | 改用 MSIX 或增加平台专用集成时 |
 | 单实例 | 每用户稳定回环 TCP 端口、版本化 JSON 请求和确认字节 | 文件关联复用现有窗口；无需平台专用进程发现 API | 极小概率端口冲突；主进程界面循环最多约 350 ms 后消费请求 | 需要多窗口、用户可选多实例或沙箱平台限制回环通信时 |
-| HTML/PDF 导出 | 主题一致导出，见 ADR-0001 | 主题、字号、字体和本地图片共享输入；继续直接保存 | PDF 浏览器专有 CSS 可能退化，Mermaid 不执行 | 需要 Mermaid 或浏览器像素级 PDF 时 |
+| HTML/PDF 导出 | HTML 自包含导出；PDF 复用当前 WebView 原生打印，见 ADR-0004 | 预览与 PDF 使用同一 DOM、主题、字号、字体和本地资源 | 依赖系统 WebView；WebView 不可用时不提供 PDF | 需要跨平台统一渲染引擎时 |
 | macOS 分发 | Universal App + ad-hoc 签名 | Intel 和 Apple Silicon 共用下载包 | 未公证，首次启动可能被 Gatekeeper 拦截 | 面向更多用户或进入正式分发渠道 |
 
 ## 7. C4 架构视图

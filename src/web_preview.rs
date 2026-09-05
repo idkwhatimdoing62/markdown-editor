@@ -1684,6 +1684,8 @@ impl BrowserPreview {
         let _ = fs::remove_file(&temporary);
 
         let environment = webview.environment();
+        // SAFETY: WebView2 returns an interface pointer that is valid for the
+        // lifetime of `environment`; the cast only queries a COM interface.
         let settings = unsafe {
             environment
                 .cast::<ICoreWebView2Environment6>()
@@ -1691,6 +1693,8 @@ impl BrowserPreview {
                 .CreatePrintSettings()
                 .map_err(|error| format!("无法创建 PDF 打印设置：{error}"))?
         };
+        // SAFETY: the print settings object is a valid COM interface returned
+        // by WebView2 and all values are finite inches within its API range.
         unsafe {
             settings
                 .SetShouldPrintBackgrounds(true)
@@ -1745,6 +1749,9 @@ impl BrowserPreview {
             .webview()
             .cast::<ICoreWebView2_7>()
             .map_err(|error| format!("当前 WebView2 不支持 PDF 导出：{error}"))?;
+        // SAFETY: `temporary_path` owns a valid NUL-terminated PWSTR for the
+        // duration of the synchronous COM call, while `settings` and `callback`
+        // remain alive until WebView2 accepts the request.
         unsafe {
             webview7
                 .PrintToPdf(
@@ -1801,6 +1808,8 @@ impl BrowserPreview {
                 // The callback owns a valid NSData for the duration of the
                 // call. Copy it before writing so no Objective-C object crosses
                 // the Rust application boundary.
+                // SAFETY: WebKit guarantees a non-null NSData pointer for the duration
+                // of this completion callback; copy its bytes before returning.
                 let bytes = unsafe { (&*data).to_vec() };
                 fs::write(&callback_temporary, bytes)
                     .and_then(|_| fs::rename(&callback_temporary, &callback_target))
@@ -1815,11 +1824,15 @@ impl BrowserPreview {
             }
             repaint.request_repaint();
         });
+        // SAFETY: WKPDFConfiguration must be created on the current main thread;
+        // the marker above proves that requirement before constructing it.
         let configuration = unsafe {
             WKPDFConfiguration::new(
                 MainThreadMarker::new().ok_or_else(|| "PDF 导出必须在主线程执行".to_string())?,
             )
         };
+        // SAFETY: `webview` and `configuration` are valid Objective-C objects
+        // retained for the duration of the synchronous method invocation.
         unsafe {
             webview
                 .webview()
@@ -1854,10 +1867,6 @@ impl BrowserPreview {
             self.finish_virtual_pdf_mode();
         }
         result
-    }
-
-    pub fn has_webview(&self) -> bool {
-        self.webview.is_some()
     }
 
     pub fn source_position(&self) -> Option<f32> {
@@ -2210,6 +2219,7 @@ fn document_with_block_ids(
     let editor_font = editor_font_css();
     let dark_mode_css = dark_mode_css.unwrap_or_default();
     let asset_origin = custom_protocol_script_source("mdfont");
+    let image_origin = custom_protocol_script_source("mdfile");
     let mermaid_scripts = if has_mermaid {
         format!(
             "<script defer src=\"{}\"></script>",
@@ -2220,7 +2230,7 @@ fn document_with_block_ids(
     };
 
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"script-src {asset_origin}; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{font_runtime}{dark_mode_css}</style>{mermaid_scripts}</head><body>{body}</body></html>"
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src {asset_origin}; style-src 'unsafe-inline'; img-src 'self' data: {image_origin} http: https:; font-src 'self' data: {asset_origin} http: https:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'self' file:\">{base}<style>{STRUCTURAL_FALLBACK}</style><style>{css}</style><style>{editor_font}{MARKDOWN_DOM_COMPATIBILITY}{font_override}{font_runtime}{dark_mode_css}</style>{mermaid_scripts}</head><body>{body}</body></html>"
     )
 }
 
@@ -5285,6 +5295,11 @@ mod tests {
         assert!(html.contains(&format!(
             "script-src {}",
             custom_protocol_script_source("mdfont")
+        )));
+        assert!(html.contains("default-src 'none'"));
+        assert!(html.contains(&format!(
+            "img-src 'self' data: {}",
+            custom_protocol_script_source("mdfile")
         )));
         assert!(!html.contains("script-src 'unsafe-inline'"));
     }

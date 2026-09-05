@@ -1,9 +1,8 @@
-//! 导出渲染结果：HTML 与 PDF。
+//! 导出渲染结果：HTML。
 //!
-//! 导出与浏览器预览共享主题 CSS、Markdown 解析规则、字号覆盖和应用字体。
-//! HTML 会内嵌本地图片与字体；PDF 从同一份主题化 DOM 生成。
+//! HTML 导出与浏览器预览共享主题 CSS、Markdown 解析规则、字号覆盖和应用字体。
+//! PDF 导出由 WebView 的浏览器打印引擎负责，避免出现第二套 CSS 布局实现。
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use base64::Engine as _;
@@ -21,12 +20,6 @@ pub struct ExportOptions<'a> {
     pub theme_spec: crate::theme::ThemeSpec,
     pub base_directory: Option<&'a Path>,
     pub body_font_size: Option<f32>,
-}
-
-#[derive(Clone, Copy)]
-enum ImageMode {
-    StandaloneHtml,
-    Pdf,
 }
 
 pub fn render_html(document: &ParsedDocument) -> String {
@@ -48,104 +41,16 @@ pub fn export_html(
 }
 
 pub fn render_styled_html(document: &ParsedDocument, options: ExportOptions<'_>) -> String {
-    let (body, _) = render_export_body(document, options.base_directory, ImageMode::StandaloneHtml);
-    styled_document(&body, options, true)
+    let body = render_export_body(document, options.base_directory);
+    styled_document(&body, options)
 }
 
-pub fn export_pdf(
-    path: &Path,
-    document: &ParsedDocument,
-    options: ExportOptions<'_>,
-) -> Result<(), String> {
-    let (body, images) = render_export_body(document, options.base_directory, ImageMode::Pdf);
-    // printpdf's HTML layout treats the newline text nodes that pulldown-cmark
-    // emits between block elements as inline content. On a long document this
-    // makes the following paragraphs disappear from the layout while headings
-    // remain visible. Chromium (HTML export/preview) handles those nodes
-    // correctly, so normalize only the PDF input and leave HTML untouched.
-    let html_doc = pdf_safe_html(&styled_document(&body, options, false));
-
-    let mut fonts = BTreeMap::new();
-    fonts.insert(
-        "Markdown Editor Mono".to_string(),
-        printpdf::Base64OrRaw::Raw(jetbrains_mono_regular_bytes().to_vec()),
-    );
-    fonts.insert(
-        "Markdown Editor Mono Bold".to_string(),
-        printpdf::Base64OrRaw::Raw(jetbrains_mono_bold_bytes().to_vec()),
-    );
-    fonts.insert(
-        "LXGW WenKai Lite".to_string(),
-        printpdf::Base64OrRaw::Raw(lxgw_wenkai_regular_bytes().to_vec()),
-    );
-    fonts.insert(
-        "LXGW WenKai Lite Medium".to_string(),
-        printpdf::Base64OrRaw::Raw(lxgw_wenkai_medium_bytes().to_vec()),
-    );
-    let options = printpdf::GeneratePdfOptions {
-        page_width: Some(210.0),
-        page_height: Some(297.0),
-        // 主题本身控制 body 的留白。这里只保留防止内容贴边的安全边距。
-        margin_top: Some(8.0),
-        margin_right: Some(8.0),
-        margin_bottom: Some(8.0),
-        margin_left: Some(8.0),
-        ..Default::default()
-    };
-    let mut warnings = Vec::new();
-    let doc =
-        printpdf::PdfDocument::from_html(&html_doc, &images, &fonts, &options, &mut warnings)?;
-    let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
-    crate::storage::write_atomic(path, &bytes).map_err(|e| e.to_string())
-}
-
-fn compact_html_between_tags(html: &str) -> String {
-    let mut output = String::with_capacity(html.len());
-    let mut chars = html.char_indices().peekable();
-    while let Some((_, ch)) = chars.next() {
-        output.push(ch);
-        if ch != '>' {
-            continue;
-        }
-        let mut whitespace = String::new();
-        while let Some(&(_, next)) = chars.peek() {
-            if next.is_whitespace() {
-                whitespace.push(next);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if !matches!(chars.peek(), Some((_, '<'))) {
-            output.push_str(&whitespace);
-        }
-    }
-    output
-}
-
-/// Prepare browser HTML for printpdf's smaller HTML/CSS parser.
-///
-/// The browser preview can safely use `<strong>`/`<b>`. printpdf 0.12.x
-/// mishandles those inline elements:
-/// it keeps the emphasized word but drops the rest of the paragraph (and can
-/// stop laying out following blocks). A class-based span has the same visual
-/// intent and is handled correctly by printpdf, so this conversion is kept
-/// strictly on the PDF path. HTML export and the live preview remain
-/// unchanged.
-fn pdf_safe_html(html: &str) -> String {
-    compact_html_between_tags(html)
-        .replace("<strong>", "<span class=\"md-pdf-strong\">")
-        .replace("</strong>", "</span>")
-        .replace("<b>", "<span class=\"md-pdf-strong\">")
-        .replace("</b>", "</span>")
-}
-
-fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool) -> String {
+fn styled_document(body: &str, options: ExportOptions<'_>) -> String {
     let font_size = options
         .body_font_size
         .map(|size| crate::theme::font_size_override_css(options.theme_css, size))
         .unwrap_or_default();
-    let mermaid = if include_mermaid && body.contains("language-mermaid") {
+    let mermaid = if body.contains("language-mermaid") {
         format!(
             "<script>{}</script><script>{}</script>",
             include_str!("../assets/mermaid-11.16.0.min.js"),
@@ -154,11 +59,7 @@ fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool
     } else {
         String::new()
     };
-    let font_css = if include_mermaid {
-        embedded_font_css()
-    } else {
-        PDF_FONT_CSS.to_string()
-    };
+    let font_css = embedded_font_css();
     let dark_css = if options.dark_mode {
         crate::theme::dark_mode_css(&options.theme_spec)
     } else {
@@ -173,36 +74,19 @@ fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool
     )
 }
 
-fn render_export_body(
-    document: &ParsedDocument,
-    base_directory: Option<&Path>,
-    image_mode: ImageMode,
-) -> (String, BTreeMap<String, printpdf::Base64OrRaw>) {
-    let mut images = BTreeMap::new();
-    let mut image_index = 0usize;
-    let events = document.events().iter().map(|item| {
-        rewrite_export_image_event(
-            item.event.clone(),
-            base_directory,
-            image_mode,
-            &mut images,
-            &mut image_index,
-        )
-    });
+fn render_export_body(document: &ParsedDocument, base_directory: Option<&Path>) -> String {
+    let events = document
+        .events()
+        .iter()
+        .map(|item| rewrite_export_image_event(item.event.clone(), base_directory));
     let mut body = String::new();
     html::push_html(&mut body, events);
     annotate_code_languages(&mut body);
     normalize_footnote_dom(&mut body);
-    (body, images)
+    body
 }
 
-fn rewrite_export_image_event<'a>(
-    event: Event<'a>,
-    base_directory: Option<&Path>,
-    mode: ImageMode,
-    images: &mut BTreeMap<String, printpdf::Base64OrRaw>,
-    image_index: &mut usize,
-) -> Event<'a> {
+fn rewrite_export_image_event<'a>(event: Event<'a>, base_directory: Option<&Path>) -> Event<'a> {
     match event {
         Event::Start(Tag::Image {
             link_type,
@@ -210,15 +94,9 @@ fn rewrite_export_image_event<'a>(
             title,
             id,
         }) => {
-            let destination = export_image_destination(
-                dest_url.as_ref(),
-                base_directory,
-                mode,
-                images,
-                image_index,
-            )
-            .map(CowStr::from)
-            .unwrap_or(dest_url);
+            let destination = export_image_destination(dest_url.as_ref(), base_directory)
+                .map(CowStr::from)
+                .unwrap_or(dest_url);
             Event::Start(Tag::Image {
                 link_type,
                 dest_url: destination,
@@ -228,13 +106,13 @@ fn rewrite_export_image_event<'a>(
         }
         Event::Html(fragment) => Event::Html(
             crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
-                export_image_destination(destination, base_directory, mode, images, image_index)
+                export_image_destination(destination, base_directory)
             })
             .into(),
         ),
         Event::InlineHtml(fragment) => Event::InlineHtml(
             crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
-                export_image_destination(destination, base_directory, mode, images, image_index)
+                export_image_destination(destination, base_directory)
             })
             .into(),
         ),
@@ -242,27 +120,14 @@ fn rewrite_export_image_event<'a>(
     }
 }
 
-fn export_image_destination(
-    destination: &str,
-    base_directory: Option<&Path>,
-    mode: ImageMode,
-    images: &mut BTreeMap<String, printpdf::Base64OrRaw>,
-    image_index: &mut usize,
-) -> Option<String> {
+fn export_image_destination(destination: &str, base_directory: Option<&Path>) -> Option<String> {
     let path = local_image_path(destination, base_directory)?;
     let content_type = image_content_type(&path)?;
     let bytes = crate::io::read_file_limited(&path, crate::io::MAX_IMAGE_FILE_SIZE).ok()?;
-    Some(match mode {
-        ImageMode::StandaloneHtml => {
-            format!("data:{content_type};base64,{}", BASE64.encode(bytes))
-        }
-        ImageMode::Pdf => {
-            let key = format!("md-export-image-{image_index}");
-            *image_index += 1;
-            images.insert(key.clone(), printpdf::Base64OrRaw::Raw(bytes));
-            key
-        }
-    })
+    Some(format!(
+        "data:{content_type};base64,{}",
+        BASE64.encode(bytes)
+    ))
 }
 
 fn local_image_path(
@@ -410,11 +275,6 @@ pre[data-language]::before { content: attr(data-language); position: absolute; t
 ol:not(#footnotes), ul { padding-inline-start: clamp(1.5em, 3vw, 2.25em) !important; }
 ol:not(#footnotes) > li::marker { font-variant-numeric: tabular-nums; }
 @media print { html { print-color-adjust: exact; -webkit-print-color-adjust: exact; } body { box-sizing: border-box; } img, pre, table, blockquote { break-inside: avoid; } }
-"#;
-
-const PDF_FONT_CSS: &str = r#"
-body,pre,code,blockquote::before,blockquote::after { font-family: 'Markdown Editor Mono','LXGW WenKai Lite',monospace !important; }
-span.md-pdf-strong { font-family: 'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',monospace !important; font-weight: 700 !important; }
 "#;
 
 const MERMAID_BOOTSTRAP: &str = r#"
@@ -583,24 +443,6 @@ mod tests {
     }
 
     #[test]
-    fn pdf输入仅移除标签之间的换行() {
-        let html = "<h2>标题</h2>\n<p>正文</p><pre><code>一行\n&lt;二行&gt;</code></pre>";
-        let compact = compact_html_between_tags(html);
-        assert_eq!(
-            compact,
-            "<h2>标题</h2><p>正文</p><pre><code>一行\n&lt;二行&gt;</code></pre>"
-        );
-    }
-
-    #[test]
-    fn pdf输入将强调转换为兼容的span且保留后续正文() {
-        let safe = pdf_safe_html("<p><strong>说明</strong>：正文。</p><p>后文。</p>");
-        assert!(safe.contains("<span class=\"md-pdf-strong\">说明</span>：正文。</p>"));
-        assert!(safe.contains("<p>后文。</p>"));
-        assert!(!safe.contains("<strong>"));
-    }
-
-    #[test]
     fn html导出复用主题字号字体和本地图片() {
         let dir = std::env::temp_dir().join(format!("md_editor_html_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -666,18 +508,6 @@ mod tests {
         assert!(html.contains("background-color:#1C1D1F!important"));
     }
 
-    #[test]
-    fn pdf导出使用深色覆盖层() {
-        let mut options = test_options(None);
-        options.dark_mode = true;
-        options.theme_spec = crate::theme::ThemePackage::built_in_sspai()
-            .spec(true)
-            .unwrap();
-        let html = styled_document("<h1>深色</h1>", options, false);
-        assert!(html.contains(":root{color-scheme:dark;}"));
-        assert!(html.contains("background-color:#1C1D1F!important"));
-    }
-
     #[cfg(target_os = "windows")]
     #[test]
     fn windows绝对图片路径不会被误判为url() {
@@ -685,23 +515,5 @@ mod tests {
             local_image_path(r"C:\纹样\莲花.png", None),
             Some(std::path::PathBuf::from(r"C:\纹样\莲花.png"))
         );
-    }
-
-    #[test]
-    fn 导出pdf生成非空文件() {
-        let dir = std::env::temp_dir().join(format!("md_editor_pdf_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("out.pdf");
-        let md = "# 标题\n\n中文段落内容。\n\n- 条目一\n- 条目二\n";
-        let document = parsed(md);
-        match export_pdf(&p, &document, test_options(None)) {
-            Ok(()) => {
-                let bytes = std::fs::read(&p).unwrap();
-                assert!(bytes.starts_with(b"%PDF"), "文件应以 %PDF 开头");
-                assert!(bytes.len() > 1000, "PDF 不应为空");
-            }
-            Err(e) => panic!("PDF 导出失败：{}", e),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

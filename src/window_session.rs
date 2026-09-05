@@ -86,7 +86,13 @@ fn load_at(path: &Path) -> Option<WindowSession> {
         crate::storage::quarantine_corrupt(path);
         return None;
     }
-    let bytes = fs::read(path).ok()?;
+    let bytes = match crate::io::read_file_limited(path, MAX_WINDOW_SESSION_BYTES) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            crate::storage::quarantine_corrupt(path);
+            return None;
+        }
+    };
     let envelope: WindowSessionEnvelope = match serde_json::from_slice(&bytes) {
         Ok(envelope) => envelope,
         Err(_) => {

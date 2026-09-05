@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (for example v0.1.26)"
+        description: "Release tag to publish (for example v0.1.29)"
         required: true
         type: string
 
@@ -15,8 +15,48 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    name: Quality and dependency checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --all-targets
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
+
+  performance:
+    name: Long-document performance gate
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Enforce long-document budgets
+        shell: pwsh
+        run: .\scripts\benchmark-long-docs.ps1 -EnforceBudgets
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-long-document-performance
+          path: artifacts/performance
+          if-no-files-found: warn
+
   windows:
     name: Windows packages
+    needs: [quality, performance]
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +101,7 @@ jobs:
 
   macos:
     name: macOS universal package
+    needs: [quality, performance]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
