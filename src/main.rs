@@ -1330,7 +1330,13 @@ impl MdEditorApp {
             #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 if index == self.active_tab {
-                    self.browser_document_cache = None;
+                    // Keep the previous WebView document as the visual bridge while
+                    // the edit debounce window is still open.  Clearing this cache
+                    // here makes `browser_document(true)` create a new render
+                    // request immediately because it no longer has an old shell to
+                    // reuse, effectively disabling the debounce for fast parses.
+                    // `browser_document` already compares the source revision and
+                    // queues the new render once the window expires.
                     self.render_pending = None;
                 }
             }
@@ -3857,10 +3863,11 @@ impl eframe::App for MdEditorApp {
             } else if let Some(rect) = browser_rect {
                 self.poll_browser_render_results(&ctx);
                 self.browser_preview.discard_frozen_frame();
-                let preview_refresh_remaining = (self.view_mode == ViewMode::Split
-                    && self.last_edit_time.is_finite())
-                .then(|| PREVIEW_REFRESH_DEBOUNCE_SECONDS - (now - self.last_edit_time))
-                .filter(|remaining| *remaining > 0.0);
+                let preview_refresh_remaining = self
+                    .last_edit_time
+                    .is_finite()
+                    .then(|| PREVIEW_REFRESH_DEBOUNCE_SECONDS - (now - self.last_edit_time))
+                    .filter(|remaining| *remaining > 0.0);
                 if let Some(remaining) = preview_refresh_remaining {
                     ctx.request_repaint_after(Duration::from_secs_f64(remaining));
                 }
