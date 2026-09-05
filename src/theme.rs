@@ -793,6 +793,7 @@ pub fn font_size_override_css(css: &str, target_body_size: f32) -> String {
 /// Browser-only font layer whose values can be changed without rebuilding the
 /// document. Absolute pixel rules use the shared scale variable so headings,
 /// code and other fixed-size theme elements track the body size together.
+#[allow(dead_code)]
 pub fn font_size_runtime_css(css: &str, target_body_size: Option<f32>) -> String {
     let base_body_size = css_property(css, "body", "font-size")
         .as_deref()
@@ -807,6 +808,7 @@ pub fn font_size_runtime_css(css: &str, target_body_size: Option<f32>) -> String
     )
 }
 
+#[allow(dead_code)]
 fn append_scaled_font_rules_runtime(css: &str, output: &mut String) {
     let mut cursor = 0usize;
     while let Some(relative_open) = css[cursor..].find('{') {

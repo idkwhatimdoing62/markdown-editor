@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc, mpsc::Receiver};
+#[allow(unused_imports)]
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -42,6 +43,7 @@ const PRIMARY_SHORTCUT: &str = "⌘";
 const PRIMARY_SHORTCUT: &str = "Ctrl";
 
 const EXTERNAL_POLL_INTERVAL: f64 = 0.35;
+#[allow(dead_code)]
 const PREVIEW_REFRESH_DEBOUNCE_SECONDS: f64 = 0.2;
 const EXTERNAL_STABLE_DELAY: f64 = 0.45;
 
@@ -114,6 +116,7 @@ impl LaunchOptions {
         Self::from_args(std::env::args().skip(1))
     }
 
+    #[allow(clippy::while_let_on_iterator)]
     fn from_args(arguments: impl IntoIterator<Item = String>) -> Self {
         let mut open_paths = Vec::new();
         let mut force_new_window = false;
@@ -2476,7 +2479,6 @@ impl MdEditorApp {
         {
             let _ = ctx;
             self.status_note = "PDF 导出需要 Windows 或 macOS 的内置预览".to_string();
-            return;
         }
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         {
@@ -3175,24 +3177,24 @@ impl MdEditorApp {
             return;
         }
         let te_id = editor.inner.id;
-        if let Some(state) = egui::TextEdit::load_state(ctx, te_id) {
-            if let Some(cursor) = state.cursor.char_range() {
-                let char_idx = cursor.primary.index.0;
-                let caret_line = self
-                    .text
-                    .chars()
-                    .take(char_idx)
-                    .filter(|&c| c == '\n')
-                    .count();
-                if caret_line != self.last_caret_line {
-                    self.last_caret_line = caret_line;
-                    let total = self.text.chars().filter(|&c| c == '\n').count().max(1);
-                    let ratio = caret_line as f32 / total as f32;
-                    let max_p = (preview.content_size.y - preview.inner_rect.height()).max(0.0);
-                    let mut st = preview.state;
-                    st.offset.y = ratio * max_p;
-                    st.store(ctx, preview.id);
-                }
+        if let Some(state) = egui::TextEdit::load_state(ctx, te_id)
+            && let Some(cursor) = state.cursor.char_range()
+        {
+            let char_idx = cursor.primary.index.0;
+            let caret_line = self
+                .text
+                .chars()
+                .take(char_idx)
+                .filter(|&c| c == '\n')
+                .count();
+            if caret_line != self.last_caret_line {
+                self.last_caret_line = caret_line;
+                let total = self.text.chars().filter(|&c| c == '\n').count().max(1);
+                let ratio = caret_line as f32 / total as f32;
+                let max_p = (preview.content_size.y - preview.inner_rect.height()).max(0.0);
+                let mut st = preview.state;
+                st.offset.y = ratio * max_p;
+                st.store(ctx, preview.id);
             }
         }
     }
@@ -3529,6 +3531,8 @@ impl MdEditorApp {
 impl eframe::App for MdEditorApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        let _ = frame;
         // Keep the rendered egui palette in lockstep with the persisted appearance state.
         // This also repairs the first frame after startup/window restoration if another
         // egui component has reinstalled its default visuals.
@@ -3552,7 +3556,7 @@ impl eframe::App for MdEditorApp {
         let mut preview_heading_target = None;
         let mut editor_changed = false;
 
-        let mut dropped_paths = ctx.input(|input| {
+        let dropped_paths = ctx.input(|input| {
             input
                 .raw
                 .dropped_files
@@ -3560,6 +3564,8 @@ impl eframe::App for MdEditorApp {
                 .filter_map(|file| file.path.clone())
                 .collect::<Vec<_>>()
         });
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        let mut dropped_paths = dropped_paths;
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         dropped_paths.extend(self.browser_preview.take_dropped_paths());
         self.handle_instance_requests(&ctx);
@@ -3667,6 +3673,7 @@ impl eframe::App for MdEditorApp {
                     .map(|range| source_position_from_char(&self.text, range.start))
             })
             .flatten();
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
         let search_preview_clear = matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
             && scroll_to_search
             && search_range.is_none();
@@ -3709,10 +3716,16 @@ impl eframe::App for MdEditorApp {
                             .inner_margin(egui::Margin::symmetric(14, 0)),
                     )
                     .show(ui, |ui| {
-                        let target = reading_toc(ui, self.document.blocks());
                         #[cfg(any(target_os = "windows", target_os = "macos"))]
-                        if target.is_some() {
-                            preview_heading_target = target;
+                        {
+                            let target = reading_toc(ui, self.document.blocks());
+                            if target.is_some() {
+                                preview_heading_target = target;
+                            }
+                        }
+                        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+                        {
+                            let _ = reading_toc(ui, self.document.blocks());
                         }
                     });
                 egui::CentralPanel::default()
@@ -4266,6 +4279,7 @@ fn editor_offset_for_source_position(
     (editor.state.offset.y + cursor_screen_y - editor.inner_rect.top()).clamp(0.0, max_scroll)
 }
 
+#[allow(dead_code)]
 fn source_position_from_char(text: &str, char_index: usize) -> f32 {
     let mut line = 0usize;
     let mut line_start = 0usize;
@@ -4285,6 +4299,7 @@ fn source_position_from_char(text: &str, char_index: usize) -> f32 {
     line as f32 + column as f32 / line_length.max(1) as f32
 }
 
+#[allow(dead_code)]
 fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
     let target_line = source_position.max(0.0).floor() as usize;
     let fraction = source_position.max(0.0).fract();
@@ -4708,8 +4723,8 @@ mod app_tests {
         let icon = app_icon();
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
-        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
-        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+        assert!(icon.rgba.chunks(4).any(|pixel| pixel[3] == 0));
+        assert!(icon.rgba.chunks(4).any(|pixel| pixel[3] == 255));
     }
 
     #[test]

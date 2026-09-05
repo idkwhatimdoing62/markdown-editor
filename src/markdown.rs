@@ -106,10 +106,12 @@ impl ParsedDocument {
         &self.events
     }
 
+    #[allow(dead_code)]
     pub fn block_index(&self) -> &[BlockIndexEntry] {
         &self.block_index
     }
 
+    #[allow(dead_code)]
     pub fn has_mermaid(&self) -> bool {
         self.events.iter().any(|item| {
             matches!(
