@@ -1327,19 +1327,6 @@ impl MdEditorApp {
             }
             tab.document = result.document;
             tab.parse_pending = false;
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            {
-                if index == self.active_tab {
-                    // Keep the previous WebView document as the visual bridge while
-                    // the edit debounce window is still open.  Clearing this cache
-                    // here makes `browser_document(true)` create a new render
-                    // request immediately because it no longer has an old shell to
-                    // reuse, effectively disabling the debounce for fast parses.
-                    // `browser_document` already compares the source revision and
-                    // queues the new render once the window expires.
-                    self.render_pending = None;
-                }
-            }
             active_document_changed |= index == self.active_tab;
         }
         if active_document_changed {
