@@ -149,12 +149,28 @@ jobs:
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then tag="${INPUT_TAG}"; fi
           [[ "$tag" == v* ]] || { echo "Tag must start with v" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Prepare release notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if [[ ! -s release-notes.md ]]; then
+            echo "No changelog entry found for ${RELEASE_TAG}" >&2
+            exit 1
+          fi
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Markdown Editor ${{ steps.tag.outputs.tag }}
-          generate_release_notes: true
+          body_path: release-notes.md
+          generate_release_notes: false
           files: |
             dist/markdown-editor-v*-windows-x86_64.zip
             dist/markdown-editor-v*-windows-x86_64-setup.exe
