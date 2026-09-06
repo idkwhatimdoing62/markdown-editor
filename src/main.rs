@@ -200,7 +200,8 @@ enum ViewMode {
     Write,
     Preview,
     Split,
-    Live,`r`n}
+    Live,
+}
 
 #[derive(Clone)]
 struct DocumentTab {
