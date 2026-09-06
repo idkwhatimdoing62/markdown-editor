@@ -1382,6 +1382,8 @@ impl MdEditorApp {
         }
         if active_document_changed {
             self.refresh_status();
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            self.queue_browser_render(self.current_browser_document_key());
         }
         if any_result {
             ctx.request_repaint();
