@@ -199,7 +199,8 @@ enum DocStatus {
 enum ViewMode {
     Write,
     Preview,
-    Split,`r`n}
+    Split,
+}
 
 #[derive(Clone)]
 struct DocumentTab {
