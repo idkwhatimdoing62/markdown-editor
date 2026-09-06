@@ -3070,10 +3070,9 @@ impl MdEditorApp {
                         .on_hover_text("上一项 · Shift+Enter")
                         .clicked();
                 });
-                let preview_has_match = !matches!(
-                    self.view_mode,
-                    ViewMode::Preview | ViewMode::Live | ViewMode::Split
-                ) || self.preview_search_has_match();
+                let preview_has_match =
+                    !matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
+                        || self.preview_search_has_match();
                 let count = if !preview_has_match {
                     "预览无结果".to_string()
                 } else {
@@ -3724,22 +3723,19 @@ impl eframe::App for MdEditorApp {
             .flatten();
         let scroll_to_search = std::mem::take(&mut self.search_scroll_requested);
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let mut search_preview_target = (matches!(
-            self.view_mode,
-            ViewMode::Preview | ViewMode::Live | ViewMode::Split
-        ) && scroll_to_search
-            && self.preview_search_has_match())
-        .then(|| {
-            search_range
-                .as_ref()
-                .map(|range| source_position_from_char(&self.text, range.start))
-        })
-        .flatten();
+        let mut search_preview_target =
+            (matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
+                && scroll_to_search
+                && self.preview_search_has_match())
+            .then(|| {
+                search_range
+                    .as_ref()
+                    .map(|range| source_position_from_char(&self.text, range.start))
+            })
+            .flatten();
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let search_preview_clear = matches!(
-            self.view_mode,
-            ViewMode::Preview | ViewMode::Live | ViewMode::Split
-        ) && scroll_to_search
+        let search_preview_clear = matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
+            && scroll_to_search
             && search_range.is_none();
 
         match self.view_mode {
@@ -3769,7 +3765,7 @@ impl eframe::App for MdEditorApp {
                         );
                     });
             }
-            ViewMode::Preview | ViewMode::Live => {
+            ViewMode::Preview => {
                 let active_tab_id = self.id;
                 egui::Panel::left("reading_toc_panel")
                     .resizable(false)
