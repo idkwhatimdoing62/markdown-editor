@@ -5,6 +5,7 @@ mod export;
 mod file_association;
 mod html_image;
 mod io;
+mod live_edit;
 mod markdown;
 mod preview;
 mod search;
