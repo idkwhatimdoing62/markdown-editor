@@ -1448,10 +1448,9 @@ impl BrowserPreview {
             .document_source
             .as_ref()
             .and_then(|current| current.body_patch_into(document));
-        let patch_document = source_changed
-            && self.document_source.as_ref().is_some_and(|current| {
-                current.can_patch_into(document) || current.can_patch_virtual_into(document)
-            });
+        // Full navigation is the correctness fallback while the native child WebView receives the latest document.
+        // Incremental patching can leave a stale DOM when queued IPC updates race a previous patch.
+        let patch_document = false;
         if source_changed {
             if !patch_document {
                 self.reset_scroll_bridge_for_document();
