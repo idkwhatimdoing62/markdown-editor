@@ -249,6 +249,7 @@ struct ScrollBridge {
     dropped_paths: Vec<PathBuf>,
     ready: Option<WebViewReady>,
     pdf_ready: bool,
+    preview_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,6 +277,23 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   let anchorCache = null;
   let navigationRevision = 0;
   let searchRevision = 0;
+
+  // The document shell may contain a <base> tag for local assets. Resolve
+  // preview API requests against the preview origin instead of that base.
+  const previewOrigin = (() => {
+    try {
+      const url = new URL(location.href);
+      if (url.hostname === 'mdfont.localhost') {
+        return `${url.protocol}//mdpreview.localhost`;
+      }
+      if (url.protocol === 'mdfont:') {
+        return `mdpreview://${url.host}`;
+      }
+      return `${url.protocol}//${url.host}`;
+    } catch (_) {
+      return location.origin;
+    }
+  })();
 
   const beginNavigation = () => {
     navigationRevision += 1;
@@ -312,6 +330,31 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     let sibling = node?.nextSibling;
     while (sibling && sibling.nodeType !== Node.ELEMENT_NODE) sibling = sibling.nextSibling;
     return sibling;
+  };
+
+  const closedDetailsFor = (node) => {
+    let current = node?.parentElement || null;
+    let hiddenDetails = null;
+    while (current) {
+      if (current.tagName === 'DETAILS' && !current.open) hiddenDetails = current;
+      current = current.parentElement;
+    }
+    return hiddenDetails;
+  };
+
+  // Source markers inside a closed <details> remain in the DOM, but their
+  // content has no visible geometry. Never use their zero-sized/hidden child
+  // as a scroll anchor; project the whole hidden range onto the details box.
+  const scrollElementAfter = (marker) => {
+    if (closedDetailsFor(marker)) return null;
+    let current = marker;
+    while (current) {
+      const sibling = elementAfter(current);
+      if (sibling) return sibling;
+      current = current.parentElement;
+      if (current?.tagName === 'DETAILS' && !current.open) return null;
+    }
+    return null;
   };
 
   const isBoundaryComment = (node) => node?.nodeType === Node.COMMENT_NODE
@@ -355,7 +398,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     const markers = [...blockMarkers().entries()];
     let selected = null;
     for (const [blockId, marker] of markers) {
-      const element = elementAfter(marker);
+      const element = scrollElementAfter(marker);
       if (!element) continue;
       const top = Math.max(0, element.getBoundingClientRect().top + window.scrollY);
       if (top <= y + 1) {
@@ -371,10 +414,13 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   const maxScroll = () => Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
 
   const anchorY = (anchor) => {
-    let sibling = anchor.node.nextSibling;
-    while (sibling && sibling.nodeType !== Node.ELEMENT_NODE) sibling = sibling.nextSibling;
-    if (!sibling) return maxScroll();
-    return Math.min(maxScroll(), Math.max(0, sibling.getBoundingClientRect().top + window.scrollY));
+    const hiddenDetails = closedDetailsFor(anchor.node);
+    if (hiddenDetails) {
+      return Math.max(0, hiddenDetails.getBoundingClientRect().bottom + window.scrollY);
+    }
+    const sibling = scrollElementAfter(anchor.node);
+    if (!sibling) return Math.max(0, document.documentElement.scrollHeight);
+    return Math.max(0, sibling.getBoundingClientRect().top + window.scrollY);
   };
 
   const interpolate = (value, aValue, bValue, aResult, bResult) => {
@@ -432,7 +478,12 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     if (!saved) return false;
     if (saved.blockId !== undefined) {
       const marker = blockMarkers().get(String(saved.blockId));
-      const element = elementAfter(marker);
+      const hiddenDetails = closedDetailsFor(marker);
+      const element = scrollElementAfter(marker);
+      if (hiddenDetails) {
+        window.scrollTo(0, Math.max(0, hiddenDetails.getBoundingClientRect().bottom + window.scrollY));
+        return true;
+      }
       if (element) {
         const top = element.getBoundingClientRect().top + window.scrollY;
         const offset = Math.min(1, Math.max(0, Number(saved.offset) || 0));
@@ -502,7 +553,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   const animateToTarget = () => {
     const target = yForSource(targetSource);
     const distance = target - window.scrollY;
-    if (Math.abs(distance) < 0.75) {
+    if (Math.abs(distance) <= 1) {
       window.scrollTo(0, target);
       animationFrame = 0;
       return;
@@ -525,9 +576,38 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
     }
   };
 
+  window.__mdEditorScrollToEnd = (smooth = true) => {
+    beginNavigation();
+    cancelSourceAnimation();
+    const target = maxScroll();
+    suppressUntil = performance.now() + (smooth ? 600 : 180);
+    window.name = `md-source:${sourceForY(target)}`;
+    if (!smooth) {
+      window.scrollTo(0, target);
+      return;
+    }
+    const animate = () => {
+      const distance = target - window.scrollY;
+      // Chromium rounds scroll positions to physical pixels. Finish the last
+      // pixel explicitly instead of scheduling an animation that cannot move.
+      if (Math.abs(distance) <= 1) {
+        window.scrollTo(0, target);
+        animationFrame = 0;
+        return;
+      }
+      window.scrollTo(0, window.scrollY + distance * 0.38);
+      animationFrame = window.requestAnimationFrame(animate);
+    };
+    animationFrame = window.requestAnimationFrame(animate);
+  };
+
   window.__mdEditorSetBlockAnchor = (blockId, offset, fallbackSource = 0, smooth = true) => {
     beginNavigation();
     const marker = blockMarkers().get(String(blockId));
+    if (closedDetailsFor(marker)) {
+      window.__mdEditorSetSourcePosition?.(fallbackSource, smooth);
+      return;
+    }
     const element = elementAfter(marker);
     const normalizedOffset = Math.min(1, Math.max(0, Number(offset) || 0));
     if (!element) {
@@ -546,7 +626,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
       cancelSourceAnimation();
       const animate = () => {
         const distance = target - window.scrollY;
-        if (Math.abs(distance) < 0.75) {
+        if (Math.abs(distance) <= 1) {
           window.scrollTo(0, target);
           animationFrame = 0;
           return;
@@ -624,7 +704,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
   };
 
   const replaceBody = async (revision) => {
-    const response = await fetch(`/body?revision=${encodeURIComponent(revision)}`, { cache: 'no-store' });
+    const response = await fetch(new URL(`/body?revision=${encodeURIComponent(revision)}`, previewOrigin), { cache: 'no-store' });
     if (!response.ok) throw new Error(`preview body request failed: ${response.status}`);
     document.body.innerHTML = await response.text();
     anchorCache = null;
@@ -655,7 +735,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
             && patch.blockIds.length === patch.insertCount
             && patch.blockIds.length > 0) {
           const ids = patch.blockIds.join(',');
-          const response = await fetch(`/blocks?revision=${encodeURIComponent(revision)}&ids=${encodeURIComponent(ids)}`, { cache: 'no-store' });
+          const response = await fetch(new URL(`/blocks?revision=${encodeURIComponent(revision)}&ids=${encodeURIComponent(ids)}`, previewOrigin), { cache: 'no-store' });
           if (response.ok) {
             const payload = await response.json();
             const blocks = Array.isArray(payload) ? payload : payload.blocks;
@@ -684,7 +764,7 @@ const SCROLL_SYNC_SCRIPT: &str = r#"
         const blockQuery = patch
           ? `&start=${encodeURIComponent(patch.start)}&count=${encodeURIComponent(patch.insertCount)}`
           : '';
-        const blocksResponse = await fetch(`/blocks?revision=${encodeURIComponent(revision)}${blockQuery}`, { cache: 'no-store' });
+        const blocksResponse = await fetch(new URL(`/blocks?revision=${encodeURIComponent(revision)}${blockQuery}`, previewOrigin), { cache: 'no-store' });
         if (blocksResponse.ok) {
           const blockPayload = await blocksResponse.json();
           const blocks = Array.isArray(blockPayload) ? blockPayload : blockPayload.blocks;
@@ -788,13 +868,12 @@ const VIRTUAL_PREVIEW_SCRIPT: &str = r#"
     try {
       const url = new URL(location.href);
       if (url.hostname === 'mdfont.localhost') {
-        url.hostname = 'mdpreview.localhost';
-        return url.origin;
+        return `${url.protocol}//mdpreview.localhost`;
       }
       if (url.protocol === 'mdfont:') {
-        url.protocol = 'mdpreview:';
-        return url.origin;
+        return `mdpreview://${url.host}`;
       }
+      return `${url.protocol}//${url.host}`;
     } catch (_) {
       // Keep the current origin as a safe fallback for embedded test pages.
     }
@@ -1393,6 +1472,11 @@ impl BrowserPreview {
                             }
                         }
                         ipc_repaint_ctx.request_repaint();
+                    } else if let Some(error) = request.body().strip_prefix("md-patch-error:") {
+                        if let Ok(mut bridge) = scroll_bridge.lock() {
+                            bridge.preview_error = Some(error.to_string());
+                        }
+                        ipc_repaint_ctx.request_repaint();
                     }
                 })
                 .with_drag_drop_handler(move |event| {
@@ -1448,9 +1532,10 @@ impl BrowserPreview {
             .document_source
             .as_ref()
             .and_then(|current| current.body_patch_into(document));
-        // Full navigation is the correctness fallback while the native child WebView receives the latest document.
-        // Incremental patching can leave a stale DOM when queued IPC updates race a previous patch.
-        let patch_document = false;
+        let patch_document = source_changed
+            && self.document_source.as_ref().is_some_and(|current| {
+                current.can_patch_into(document) || current.can_patch_virtual_into(document)
+            });
         if source_changed {
             if !patch_document {
                 self.reset_scroll_bridge_for_document();
@@ -1652,6 +1737,13 @@ impl BrowserPreview {
             .lock()
             .ok()
             .and_then(|mut bridge| bridge.ready.take())
+    }
+
+    pub fn take_preview_error(&mut self) -> Option<String> {
+        self.scroll_bridge
+            .lock()
+            .ok()
+            .and_then(|mut bridge| bridge.preview_error.take())
     }
 
     pub fn local_image_request_count(&self) -> usize {
@@ -1910,6 +2002,18 @@ impl BrowserPreview {
                 if smooth { "true" } else { "false" }
             ))
             .map_err(|error| format!("无法同步预览滚动位置：{error}"))
+    }
+
+    pub fn scroll_to_end(&self, smooth: bool) -> Result<(), String> {
+        let Some(webview) = &self.webview else {
+            return Err("浏览器预览尚未就绪".to_string());
+        };
+        webview
+            .evaluate_script(&format!(
+                "window.__mdEditorScrollToEnd?.({});",
+                if smooth { "true" } else { "false" }
+            ))
+            .map_err(|error| format!("无法同步预览底部位置：{error}"))
     }
 
     pub fn scroll_to_block_anchor(
@@ -5010,6 +5114,17 @@ mod tests {
         assert!(SCROLL_SYNC_SCRIPT.contains("placeSearchAnchor(sourcePosition, backwards)"));
         assert!(SCROLL_SYNC_SCRIPT.contains("requestRevision !== searchRevision"));
         assert!(SCROLL_SYNC_SCRIPT.contains("window.find(needle"));
+    }
+
+    #[test]
+    fn 增量请求不受本地图片base地址影响() {
+        assert!(SCROLL_SYNC_SCRIPT.contains("const previewOrigin = (() =>"));
+        assert!(SCROLL_SYNC_SCRIPT.contains(
+            "fetch(new URL(`/body?revision=${encodeURIComponent(revision)}`, previewOrigin)"
+        ));
+        assert!(SCROLL_SYNC_SCRIPT.contains(
+            "fetch(new URL(`/blocks?revision=${encodeURIComponent(revision)}${blockQuery}`, previewOrigin)"
+        ));
     }
 
     #[test]

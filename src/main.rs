@@ -5,7 +5,6 @@ mod export;
 mod file_association;
 mod html_image;
 mod io;
-mod live_edit;
 mod markdown;
 mod preview;
 mod search;
@@ -3304,11 +3303,29 @@ impl MdEditorApp {
         let source_position = editor_source_position(editor, &self.text);
         let editor_changed =
             scroll_position_changed(self.prev_editor_ratio, editor_ratio, max_editor);
-        let preview_out_of_sync = self
-            .browser_preview
-            .source_position()
-            .is_none_or(|preview_position| (preview_position - source_position).abs() > 0.1);
-        if force_preview || editor_changed || preview_out_of_sync {
+        // Use physical pixels here. A ratio threshold can classify a long
+        // document as being at the end hundreds of pixels too early.
+        let editor_at_end = max_editor > 0.0 && (max_editor - editor.state.offset.y) <= 4.0;
+        let end_source_position = source_position_from_char(&self.text, self.text.chars().count());
+        if editor_at_end
+            && (force_preview
+                || editor_changed
+                || self.preview_source_position < end_source_position - 0.5)
+        {
+            self.browser_preview.scroll_to_end(false)?;
+            self.preview_source_position = end_source_position;
+            self.prev_editor_ratio = editor_ratio;
+            self.prev_preview_ratio = editor_ratio;
+            return Ok(());
+        }
+        // A user scroll in the WebView updates the editor ScrollArea at the
+        // end of this frame. Comparing the two panes again immediately can
+        // mistake that one-frame lag for drift and pull the preview back to
+        // the old editor position on the next wheel event. Let the pane that
+        // actually changed drive synchronization; use the preview position
+        // only to detect the initial unreported state.
+        let preview_needs_initial_sync = self.browser_preview.source_position().is_none();
+        if force_preview || editor_changed || preview_needs_initial_sync {
             if let Some(anchor) = self.block_anchor_for_source(source_position) {
                 self.browser_preview
                     .scroll_to_block_anchor(&anchor, !force_preview)?;
@@ -3611,7 +3628,6 @@ impl eframe::App for MdEditorApp {
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let mut preview_heading_target = None;
         let mut editor_changed = false;
-
         let dropped_paths = ctx.input(|input| {
             input
                 .raw
@@ -3959,10 +3975,6 @@ impl eframe::App for MdEditorApp {
                         {
                             self.status_note = error;
                         }
-                        if document_changed {
-                            self.pending_preview_restore =
-                                Some((self.id, self.preview_source_position));
-                        }
                         if self.view_mode == ViewMode::Preview {
                             if let Some(anchor) = self.browser_preview.take_user_scroll_anchor() {
                                 self.preview_source_position = anchor.source_position;
@@ -4010,6 +4022,9 @@ impl eframe::App for MdEditorApp {
                                 }
                             }
                             self.finish_benchmark_probe(ready);
+                        }
+                        if let Some(error) = self.browser_preview.take_preview_error() {
+                            self.status_note = format!("预览更新失败：{error}");
                         }
                     }
                 }
