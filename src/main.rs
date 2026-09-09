@@ -2038,7 +2038,19 @@ impl MdEditorApp {
                     let active_index = self.active_tab;
                     match apply_external_bytes(&mut self.tabs[active_index], bytes) {
                         Ok(ExternalChangeResult::Unchanged) => {}
-                        Ok(_) => draft_state_changed = true,
+                        Ok(result) => {
+                            draft_state_changed = true;
+                            if matches!(result, ExternalChangeResult::Reloaded) {
+                                // External reloads update the parsed document
+                                // synchronously, but the embedded WebView has
+                                // its own render cache. Queue it explicitly so
+                                // reading mode cannot keep showing the old page
+                                // after the application becomes active again.
+                                #[cfg(any(target_os = "windows", target_os = "macos"))]
+                                self.queue_browser_render(self.current_browser_document_key());
+                                ctx.request_repaint();
+                            }
+                        }
                         Err(error) => {
                             self.status_note = format!(
                                 "检测到外部修改，但无法加载：{}",
