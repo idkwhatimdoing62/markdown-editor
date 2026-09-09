@@ -11,6 +11,7 @@ mod search;
 mod single_instance;
 mod storage;
 mod theme;
+mod toc;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod web_preview;
 mod window_close;
@@ -36,6 +37,7 @@ use egui::containers::scroll_area::ScrollAreaOutput;
 use markdown::{Block, ParsedDocument};
 use notify::Watcher;
 use theme::{ThemePackage, ThemeSpec};
+use toc::reading_toc;
 
 #[cfg(target_os = "macos")]
 const PRIMARY_SHORTCUT: &str = "⌘";
@@ -930,9 +932,9 @@ fn shortened_tab_title(title: &str) -> String {
     format!("{head}…{tail}")
 }
 
-const CHROME_FONT_SIZE: f32 = 16.0;
-const CHROME_CONTROL_HEIGHT: f32 = 34.0;
-const CHROME_BAR_HEIGHT: f32 = 40.0;
+const CHROME_FONT_SIZE: f32 = 15.0;
+const CHROME_CONTROL_HEIGHT: f32 = 32.0;
+const CHROME_BAR_HEIGHT: f32 = 42.0;
 
 fn document_tab_button(
     ui: &mut egui::Ui,
@@ -973,14 +975,17 @@ fn document_tab_button(
     let hovered = tab_response.hovered() || close_response.hovered();
 
     if selected {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(4), ui.visuals().window_fill);
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(5),
+            ui.visuals().selection.bg_fill.gamma_multiply(0.32),
+        );
         ui.painter().line_segment(
             [
                 egui::pos2(rect.left() + 8.0, rect.bottom() - 1.0),
                 egui::pos2(rect.right() - 8.0, rect.bottom() - 1.0),
             ],
-            egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+            egui::Stroke::new(1.5, ui.visuals().selection.stroke.color),
         );
     } else if hovered {
         ui.painter().rect_filled(
@@ -1060,7 +1065,13 @@ fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Re
         egui::vec2(46.0, CHROME_CONTROL_HEIGHT),
         egui::Sense::click(),
     );
-    if response.hovered() {
+    if selected {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(5),
+            ui.visuals().selection.bg_fill,
+        );
+    } else if response.hovered() {
         ui.painter().rect_filled(
             rect,
             egui::CornerRadius::same(4),
@@ -1076,7 +1087,7 @@ fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Re
         rect.center(),
         egui::Align2::CENTER_CENTER,
         label,
-        egui::FontId::new(CHROME_FONT_SIZE, egui::FontFamily::Proportional),
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
         color,
     );
     if selected {
@@ -1091,92 +1102,9 @@ fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Re
     response
 }
 
-fn heading_title(inlines: &[markdown::Inline]) -> String {
-    fn append(inlines: &[markdown::Inline], output: &mut String) {
-        for inline in inlines {
-            match inline {
-                markdown::Inline::Text(text) | markdown::Inline::Code(text) => {
-                    output.push_str(text)
-                }
-                markdown::Inline::Emphasis(children)
-                | markdown::Inline::Strong(children)
-                | markdown::Inline::Strikethrough(children)
-                | markdown::Inline::Link { children, .. } => append(children, output),
-                markdown::Inline::Image { alt, .. } => output.push_str(alt),
-                markdown::Inline::SoftBreak | markdown::Inline::HardBreak => output.push(' '),
-            }
-        }
-    }
-
-    let mut title = String::new();
-    append(inlines, &mut title);
-    title.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn reading_headings(blocks: &[Block]) -> Vec<(u8, String)> {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            Block::Heading { level, inlines } => Some((*level, heading_title(inlines))),
-            _ => None,
-        })
-        .filter(|(_, title)| !title.is_empty())
-        .collect()
-}
-
-fn reading_toc(ui: &mut egui::Ui, blocks: &[Block]) -> Option<usize> {
-    let headings = reading_headings(blocks);
-    ui.add_space(10.0);
-    ui.label(
-        egui::RichText::new("章节目录")
-            .size(15.0)
-            .strong()
-            .color(ui.visuals().strong_text_color()),
-    );
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(5.0);
-
-    if headings.is_empty() {
-        ui.label(
-            egui::RichText::new("当前文档没有标题")
-                .size(13.0)
-                .color(ui.visuals().weak_text_color()),
-        );
-        return None;
-    }
-
-    let mut target = None;
-    egui::ScrollArea::vertical()
-        .id_salt("reading_toc_scroll")
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .show(ui, |ui| {
-            for (index, (level, title)) in headings.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.add_space((level.saturating_sub(1) as f32) * 12.0);
-                    let response = ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(title)
-                                    .size(13.5)
-                                    .color(ui.visuals().text_color()),
-                            )
-                            .frame(false)
-                            .truncate(),
-                        )
-                        .on_hover_text(title);
-                    if response.clicked() {
-                        target = Some(index);
-                    }
-                });
-            }
-        });
-    target
-}
-
 fn chrome_icon_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(28.0, CHROME_CONTROL_HEIGHT),
+        egui::vec2(30.0, CHROME_CONTROL_HEIGHT),
         egui::Sense::click(),
     );
     if response.hovered() {
@@ -3013,52 +2941,46 @@ impl MdEditorApp {
                     ui.label(&self.status_note);
                 } else if let DocStatus::SaveFailed(message) = &self.status {
                     ui.separator();
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
-                        format!("出错：{message}"),
-                    );
+                    ui.colored_label(ui.visuals().error_fg_color, format!("出错：{message}"));
                 }
                 return;
             }
             let (label, color) = match &self.status {
                 DocStatus::Unsaved => ("未保存".to_string(), ui.visuals().weak_text_color()),
-                DocStatus::Saved => (
-                    "已保存".to_string(),
-                    egui::Color32::from_rgb(0x2e, 0x9e, 0x44),
-                ),
-                DocStatus::Modified => (
-                    "已修改".to_string(),
-                    egui::Color32::from_rgb(0xe6, 0x7e, 0x22),
-                ),
-                DocStatus::Conflict => (
-                    "外部冲突".to_string(),
-                    egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
-                ),
-                DocStatus::SaveFailed(msg) => (
-                    format!("出错：{}", msg),
-                    egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
-                ),
+                DocStatus::Saved => ("已保存".to_string(), ui.visuals().hyperlink_color),
+                DocStatus::Modified => ("已修改".to_string(), ui.visuals().warn_fg_color),
+                DocStatus::Conflict => ("外部冲突".to_string(), ui.visuals().error_fg_color),
+                DocStatus::SaveFailed(msg) => {
+                    (format!("出错：{}", msg), ui.visuals().error_fg_color)
+                }
             };
-            ui.colored_label(color, label);
+            ui.colored_label(color, egui::RichText::new(label).size(12.0).strong());
             ui.separator();
             if let Some(p) = &self.path {
-                ui.label(p.display().to_string());
+                ui.label(
+                    egui::RichText::new(p.display().to_string())
+                        .weak()
+                        .size(12.0),
+                );
             } else {
-                ui.label("未命名");
+                ui.label(egui::RichText::new("未命名").weak().size(12.0));
             }
             ui.separator();
-            ui.label(format!(
-                "{} 字符 / {} 行",
-                self.text.chars().count(),
-                self.text.lines().count()
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} 字符 / {} 行",
+                    self.text.chars().count(),
+                    self.text.lines().count()
+                ))
+                .size(12.0),
+            );
             if (self.text.len() as u64) > markdown::MAX_FILE_SIZE {
                 ui.separator();
-                ui.colored_label(egui::Color32::from_rgb(0xc0, 0x39, 0x2b), "超过 10 MB 限制");
+                ui.colored_label(ui.visuals().error_fg_color, "超过 10 MB 限制");
             }
             if !self.status_note.is_empty() {
                 ui.separator();
-                ui.label(&self.status_note);
+                ui.label(egui::RichText::new(&self.status_note).size(12.0));
             }
         });
     }
@@ -3679,11 +3601,38 @@ impl eframe::App for MdEditorApp {
             egui::Panel::top("menu_panel")
                 .frame(
                     egui::Frame::new()
-                        .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(10, 2)),
+                        .fill(ui.visuals().window_fill)
+                        .inner_margin(egui::Margin::symmetric(14, 4))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                        )),
                 )
                 .show(ui, |ui| {
                     self.title_bar(ui);
+                });
+        } else if self.has_open_document() {
+            egui::Area::new(egui::Id::new("focus_mode_exit"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 10.0))
+                .order(egui::Order::Foreground)
+                .show(&ctx, |ui| {
+                    let response = ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("退出专注  F8")
+                                    .size(12.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .fill(ui.visuals().panel_fill.gamma_multiply(0.92))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            )),
+                        )
+                        .on_hover_text("显示菜单和状态栏");
+                    if response.clicked() {
+                        self.focus_mode = false;
+                    }
                 });
         }
 
@@ -3705,8 +3654,12 @@ impl eframe::App for MdEditorApp {
             egui::Panel::bottom("status_panel")
                 .frame(
                     egui::Frame::new()
-                        .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(12, 5)),
+                        .fill(ui.visuals().window_fill)
+                        .inner_margin(egui::Margin::symmetric(14, 5))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke.color,
+                        )),
                 )
                 .show(ui, |ui| self.status_bar(ui));
         }
@@ -3799,11 +3752,15 @@ impl eframe::App for MdEditorApp {
                 let active_tab_id = self.id;
                 egui::Panel::left("reading_toc_panel")
                     .resizable(false)
-                    .exact_size(228.0)
+                    .exact_size(toc::READING_TOC_WIDTH)
                     .frame(
                         egui::Frame::new()
                             .fill(ui.visuals().panel_fill)
-                            .inner_margin(egui::Margin::symmetric(14, 0)),
+                            .inner_margin(egui::Margin::symmetric(16, 0))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                ui.visuals().widgets.noninteractive.bg_stroke.color,
+                            )),
                     )
                     .show(ui, |ui| {
                         #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -4413,6 +4370,7 @@ fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
 #[cfg(test)]
 mod app_tests {
     use super::*;
+    use crate::toc::reading_headings;
 
     #[test]
     fn latest_request_queue_keeps_only_newest_and_closes_cleanly() {
