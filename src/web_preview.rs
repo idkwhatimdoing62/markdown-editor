@@ -2223,6 +2223,9 @@ fn capture_preview(
             ..std::mem::zeroed()
         };
         let mut bgra = vec![0_u8; width as usize * height as usize * 4];
+        // GetDIBits requires the bitmap to be detached from every device
+        // context before it is read back.
+        SelectObject(memory_dc, previous);
         let rows = if copied != 0 {
             GetDIBits(
                 memory_dc,
@@ -2237,7 +2240,6 @@ fn capture_preview(
             0
         };
 
-        SelectObject(memory_dc, previous);
         DeleteObject(bitmap as HGDIOBJ);
         DeleteDC(memory_dc);
         ReleaseDC(std::ptr::null_mut(), screen_dc);
