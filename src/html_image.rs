@@ -43,7 +43,11 @@ pub fn rewrite_sources(html: &str, mut rewrite: impl FnMut(&str) -> Option<Strin
         }
         if let Some(width) =
             attribute_value(html, name_start + 3, tag_end, "width").and_then(|attribute| {
-                decode_attribute(&html[attribute.value])
+                let raw = decode_attribute(&html[attribute.value]);
+                // `width="50%"`、`width="720px"` 这类带单位的值同样需要
+                // max-width 保护；取数值部分，非数值则只靠 max-width 兜底。
+                raw.trim()
+                    .trim_end_matches(['%', 'p', 'x', 'P', 'X'])
                     .trim()
                     .parse::<u32>()
                     .ok()

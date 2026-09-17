@@ -1,6 +1,7 @@
 //! 文件读写、冲突检测、草稿恢复。
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -34,9 +35,10 @@ pub fn check_size(size: u64) -> Result<(), ReadError> {
     }
 }
 
-pub fn read_markdown(path: &Path) -> Result<String, ReadError> {
+pub fn read_markdown_snapshot(path: &Path) -> Result<(String, Vec<u8>), ReadError> {
     let bytes = read_snapshot_checked(path)?;
-    decode_markdown_bytes(&bytes)
+    let text = decode_markdown_bytes(&bytes)?;
+    Ok((text, bytes))
 }
 
 pub fn decode_markdown_bytes(bytes: &[u8]) -> Result<String, ReadError> {
@@ -54,39 +56,111 @@ pub fn file_stamp(path: &Path) -> Result<FileStamp, ReadError> {
 }
 
 pub fn read_snapshot_checked(path: &Path) -> Result<Vec<u8>, ReadError> {
-    let metadata = fs::metadata(path).map_err(|error| ReadError::Io(error.to_string()))?;
-    check_size(metadata.len())?;
-    fs::read(path).map_err(|error| ReadError::Io(error.to_string()))
+    let file = fs::File::open(path).map_err(|error| ReadError::Io(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_SIZE.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ReadError::Io(error.to_string()))?;
+    check_size(bytes.len() as u64)?;
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SaveError {
     ExternalModified,
+    TooLarge { size: u64, limit: u64 },
     Io(String),
 }
+
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 pub fn save_with_conflict_check(
     path: &Path,
     text: &str,
     snapshot: &[u8],
 ) -> Result<Vec<u8>, SaveError> {
-    let current = fs::read(path).map_err(|e| SaveError::Io(e.to_string()))?;
+    if text.len() as u64 > MAX_FILE_SIZE {
+        return Err(SaveError::TooLarge {
+            size: text.len() as u64,
+            limit: MAX_FILE_SIZE,
+        });
+    }
+    // 磁盘文件带 BOM 时原样保留：读取侧剥掉 BOM 展示，保存侧补回去，
+    // 避免打开再保存悄悄改写字节（diff 噪声、破坏依赖 BOM 的 Windows 工具）。
+    let mut payload = Vec::with_capacity(UTF8_BOM.len() + text.len());
+    if snapshot.starts_with(UTF8_BOM) {
+        payload.extend_from_slice(UTF8_BOM);
+    }
+    payload.extend_from_slice(text.as_bytes());
+    let mut current = Vec::new();
+    let limit = snapshot.len().min(MAX_FILE_SIZE as usize).saturating_add(1) as u64;
+    // A file that vanished under us is an external change, not a save failure:
+    // the user can then choose to overwrite (recreate) or save elsewhere.
+    fs::File::open(path)
+        .map_err(save_error_without_target)?
+        .take(limit)
+        .read_to_end(&mut current)
+        .map_err(|e| SaveError::Io(e.to_string()))?;
     if current.as_slice() != snapshot {
         return Err(SaveError::ExternalModified);
     }
-    let bytes = text.as_bytes();
-    fs::write(path, bytes).map_err(|e| SaveError::Io(e.to_string()))?;
-    Ok(bytes.to_vec())
+    storage::write_atomic_if_unchanged(path, snapshot, &payload).map_err(|error| {
+        // `AlreadyExists` is the compare-and-swap rejection and `NotFound` means
+        // the destination disappeared mid-save; both are external changes.
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+        ) {
+            SaveError::ExternalModified
+        } else {
+            SaveError::Io(error.to_string())
+        }
+    })?;
+    sweep_save_sidecars(path);
+    Ok(payload)
 }
 
-pub fn save_overwrite(path: &Path, text: &str) -> Result<Vec<u8>, String> {
-    let bytes = text.as_bytes();
-    fs::write(path, bytes).map_err(|e| e.to_string())?;
-    Ok(bytes.to_vec())
+/// Map a failed read of the save destination to a save conflict.
+fn save_error_without_target(error: std::io::Error) -> SaveError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        SaveError::ExternalModified
+    } else {
+        SaveError::Io(error.to_string())
+    }
 }
 
-pub fn read_snapshot(path: &Path) -> Option<Vec<u8>> {
-    fs::read(path).ok()
+/// 保存成功后清掉目标文件旁本应用残留的 `.tmp`/`.bak` sidecar。
+fn sweep_save_sidecars(path: &Path) {
+    if let (Some(parent), Some(name)) = (
+        path.parent(),
+        path.file_name().and_then(|name| name.to_str()),
+    ) {
+        storage::cleanup_save_sidecars(parent, name);
+    }
+}
+
+/// 无条件覆盖写入。`preserve_bom_from` 提供原磁盘快照时，快照带 BOM 则
+/// 输出也带 BOM（覆盖保存冲突的路径）；另存为通常写新文件，传 `None`。
+pub fn save_overwrite(
+    path: &Path,
+    text: &str,
+    preserve_bom_from: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    if text.len() as u64 > MAX_FILE_SIZE {
+        return Err(format!(
+            "文件大小 {} 字节，超过 {} 字节限制",
+            text.len(),
+            MAX_FILE_SIZE
+        ));
+    }
+    let mut payload = Vec::with_capacity(UTF8_BOM.len() + text.len());
+    if preserve_bom_from.is_some_and(|snapshot| snapshot.starts_with(UTF8_BOM)) {
+        payload.extend_from_slice(UTF8_BOM);
+    }
+    payload.extend_from_slice(text.as_bytes());
+    storage::write_atomic(path, &payload).map_err(|e| e.to_string())?;
+    sweep_save_sidecars(path);
+    Ok(payload)
 }
 
 const DRAFT_SCHEMA_VERSION: u32 = 2;
@@ -124,13 +198,12 @@ impl DraftTab {
 
     fn has_valid_snapshot_encoding(&self) -> bool {
         use base64::Engine as _;
-        if self.path.is_none() && self.disk_snapshot_base64.is_empty() {
-            return true;
-        }
-        !self.disk_snapshot_base64.is_empty()
-            && base64::engine::general_purpose::STANDARD
-                .decode(&self.disk_snapshot_base64)
-                .is_ok_and(|snapshot| snapshot.len() as u64 <= MAX_FILE_SIZE + 3)
+        // 空字符串解码为空快照：磁盘文件为 0 字节是完全合法的状态，
+        // 不能因此否决整个草稿会话（否则"空文件 + 首次输入"永远无法
+        // 进入崩溃恢复）。
+        base64::engine::general_purpose::STANDARD
+            .decode(&self.disk_snapshot_base64)
+            .is_ok_and(|snapshot| snapshot.len() as u64 <= MAX_FILE_SIZE + 3)
     }
 }
 
@@ -291,6 +364,40 @@ pub fn save_draft(session: &DraftSession) -> std::io::Result<()> {
     save_draft_for_window(None, session)
 }
 
+/// Windows created with `--new-window` store their session under the process
+/// id. A clean exit deletes the file; a crashed one cannot, and nothing ever
+/// loads them again at startup. Active secondary windows rewrite their draft
+/// within a minute while dirty, so a file older than a day belongs to a
+/// process that is gone.
+pub fn cleanup_stale_window_drafts() {
+    const WINDOW_DRAFT_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+    let Some(state_dir) = draft_path().parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&state_dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("draft-window-") || !name.ends_with(".json") {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() >= WINDOW_DRAFT_MAX_AGE_SECONDS);
+        if expired {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 pub fn save_draft_for_window(
     window_id: Option<u32>,
     session: &DraftSession,
@@ -350,6 +457,42 @@ mod tests {
         assert_eq!(secondary.file_name().unwrap(), "draft-window-42.json");
     }
 
+    #[test]
+    fn 保存带bom的文件保留字节顺序标记() {
+        let dir = temp_dir();
+        let p = dir.join("bom.md");
+        let snapshot = [UTF8_BOM, "正文".as_bytes()].concat();
+        fs::write(&p, &snapshot).unwrap();
+        let saved = save_with_conflict_check(&p, "正文2", &snapshot).unwrap();
+        let expected = [UTF8_BOM, "正文2".as_bytes()].concat();
+        assert_eq!(saved, expected, "返回的新快照应带 BOM");
+        assert_eq!(fs::read(&p).unwrap(), expected, "磁盘字节不应改变编码");
+        // 无 BOM 文件保持无 BOM
+        let plain = dir.join("plain.md");
+        fs::write(&plain, b"v1").unwrap();
+        let saved = save_with_conflict_check(&plain, "v2", b"v1").unwrap();
+        assert_eq!(saved, b"v2".to_vec());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 空磁盘快照的文件标签不阻塞草稿保存() {
+        let dir = temp_dir();
+        let path = dir.join("empty-on-disk.md");
+        // 磁盘文件为 0 字节 + 本地已有输入：历史上这种标签会让整个草稿
+        // 会话保存失败，崩溃恢复从此失效。
+        let session = DraftSession::new(
+            1,
+            vec![DraftTab::new(1, Some(path), "首次输入".to_string(), b"")],
+        );
+        let draft_file = dir.join("draft.json");
+        save_draft_at(&draft_file, &session).expect("空快照文件标签应可保存草稿");
+        let loaded = load_draft_at(&draft_file, storage::unix_timestamp()).expect("草稿应可恢复");
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].text, "首次输入");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn temp_dir() -> PathBuf {
@@ -377,7 +520,10 @@ mod tests {
         let dir = temp_dir();
         let p = dir.join("bad.md");
         fs::write(&p, [0xff, 0xfe, 0x00, 0x41]).unwrap();
-        assert_eq!(read_markdown(&p), Err(ReadError::InvalidUtf8));
+        assert_eq!(
+            read_markdown_snapshot(&p).map(|(text, _)| text),
+            Err(ReadError::InvalidUtf8)
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -386,7 +532,10 @@ mod tests {
         let dir = temp_dir();
         let p = dir.join("big.md");
         fs::write(&p, vec![b'a'; (MAX_FILE_SIZE + 1024) as usize]).unwrap();
-        assert!(matches!(read_markdown(&p), Err(ReadError::TooLarge { .. })));
+        assert!(matches!(
+            read_markdown_snapshot(&p),
+            Err(ReadError::TooLarge { .. })
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -395,7 +544,7 @@ mod tests {
         let dir = temp_dir();
         let p = dir.join("doc.md");
         fs::write(&p, "v1").unwrap();
-        let snapshot = read_snapshot(&p).unwrap();
+        let snapshot = fs::read(&p).unwrap();
 
         // 磁盘内容与快照一致，正常保存
         assert_eq!(
@@ -414,15 +563,48 @@ mod tests {
     }
 
     #[test]
+    fn 目标文件被删除时保存按外部冲突处理() {
+        let dir = temp_dir();
+        let p = dir.join("gone.md");
+        fs::write(&p, "v1").unwrap();
+        let snapshot = fs::read(&p).unwrap();
+        fs::remove_file(&p).unwrap();
+
+        assert_eq!(
+            save_with_conflict_check(&p, "v2", &snapshot),
+            Err(SaveError::ExternalModified)
+        );
+        assert!(!p.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn 新文档可以直接创建并写入() {
         let dir = temp_dir();
         let p = dir.join("new.md");
         assert!(!p.exists());
         assert_eq!(
-            save_overwrite(&p, "新文档"),
+            save_overwrite(&p, "新文档", None),
             Ok("新文档".as_bytes().to_vec())
         );
         assert_eq!(fs::read_to_string(&p).unwrap(), "新文档");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 保存超过大小限制时拒绝且保留原文件() {
+        let dir = temp_dir();
+        let p = dir.join("limited.md");
+        fs::write(&p, "原文").unwrap();
+        let snapshot = fs::read(&p).unwrap();
+        let oversized = "x".repeat((MAX_FILE_SIZE + 1) as usize);
+        assert!(matches!(
+            save_with_conflict_check(&p, &oversized, &snapshot),
+            Err(SaveError::TooLarge { .. })
+        ));
+        assert_eq!(fs::read_to_string(&p).unwrap(), "原文");
+        assert!(save_overwrite(&p, &oversized, None).is_err());
+        assert_eq!(fs::read_to_string(&p).unwrap(), "原文");
         let _ = fs::remove_dir_all(&dir);
     }
 

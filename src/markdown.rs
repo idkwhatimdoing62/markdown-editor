@@ -1,12 +1,8 @@
 //! 把 Markdown 解析为可渲染的块模型。
 
-use std::borrow::Cow;
 use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
-
-pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
-const STRONG_BOUNDARY: &str = "<!--md-strong-boundary-->";
 
 pub fn parse_options() -> Options {
     Options::ENABLE_TABLES
@@ -15,150 +11,64 @@ pub fn parse_options() -> Options {
         | Options::ENABLE_TASKLISTS
 }
 
-/// Make a frequent authoring typo render as intended without changing the source text.
-///
-/// CommonMark does not treat `**text **` as strong emphasis because whitespace appears
-/// immediately before the closing delimiter. Move that whitespace behind the delimiter,
-/// while leaving fenced and inline code untouched.
-pub fn normalize_compat_markdown(markdown: &str) -> Cow<'_, str> {
-    let mut output: Option<String> = None;
-    let mut source_offset = 0;
-    let mut fence: Option<(u8, usize)> = None;
-
-    for line_with_ending in markdown.split_inclusive('\n') {
-        let (line, ending) = line_with_ending
-            .strip_suffix('\n')
-            .map_or((line_with_ending, ""), |line| (line, "\n"));
-        let marker = fence_marker(line);
-
-        if let Some((fence_char, fence_len)) = fence {
-            if let Some(output) = &mut output {
-                output.push_str(line);
-                output.push_str(ending);
-            }
-            if marker.is_some_and(|(ch, len)| ch == fence_char && len >= fence_len) {
-                fence = None;
-            }
-            source_offset += line_with_ending.len();
-            continue;
-        }
-
-        if let Some(opening) = marker {
-            fence = Some(opening);
-            if let Some(output) = &mut output {
-                output.push_str(line);
-                output.push_str(ending);
-            }
-            source_offset += line_with_ending.len();
-            continue;
-        }
-
-        let normalized = normalize_strong_whitespace_in_line(line);
-        if matches!(normalized, Cow::Owned(_)) && output.is_none() {
-            let mut initialized = String::with_capacity(markdown.len());
-            initialized.push_str(&markdown[..source_offset]);
-            output = Some(initialized);
-        }
-        if let Some(output) = &mut output {
-            output.push_str(&normalized);
-            output.push_str(ending);
-        }
-        source_offset += line_with_ending.len();
+/// Return whether a link destination is safe to pass to the operating system
+/// or an HTML renderer. Relative paths and ordinary web/mail protocols are
+/// allowed; executable URL schemes are rejected.
+pub fn is_safe_link_destination(destination: &str) -> bool {
+    // Browsers strip leading/trailing C0 control characters and spaces and
+    // remove every tab/CR/LF before resolving a URL, so `"  javascript:…"`
+    // and `"&#x0A;javascript:…"` still execute. Classify the same cleaned
+    // form the browser would see.
+    let destination = normalize_url_for_scheme_check(destination);
+    // `//host/share` is a protocol-relative URL and `\\host\share` is a
+    // Windows UNC path. Both resolve to a network location when handed to the
+    // operating system, which can leak credentials or block the UI while a
+    // share is probed, so neither is treated as an ordinary relative path.
+    if destination.starts_with("//") || destination.starts_with(r"\\") {
+        return false;
     }
-
-    match output {
-        Some(output) => Cow::Owned(output),
-        None => Cow::Borrowed(markdown),
+    // A Windows absolute path starts with a drive letter, which is not a URL
+    // scheme even though it contains a colon.
+    if destination.len() >= 3
+        && destination.as_bytes()[1] == b':'
+        && matches!(destination.as_bytes()[2], b'\\' | b'/')
+    {
+        return true;
+    }
+    let scheme_end = destination.find(':').filter(|index| {
+        destination[..*index]
+            .chars()
+            .all(|ch| ch.is_ascii_alphabetic())
+    });
+    match scheme_end.map(|index| destination[..index].to_ascii_lowercase()) {
+        Some(scheme) => matches!(scheme.as_str(), "http" | "https" | "mailto" | "ftp"),
+        None => true,
     }
 }
 
-fn fence_marker(line: &str) -> Option<(u8, usize)> {
-    let trimmed = line.trim_start();
-    let marker = *trimmed.as_bytes().first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
+/// Strip the characters browsers ignore when resolving a URL: leading and
+/// trailing C0-control/space characters, plus any embedded tab/CR/LF.
+pub fn normalize_url_for_scheme_check(destination: &str) -> std::borrow::Cow<'_, str> {
+    let needs_trim = destination.chars().next().is_some_and(|ch| ch <= ' ')
+        || destination.chars().next_back().is_some_and(|ch| ch <= ' ');
+    let has_embedded = destination.contains(['\t', '\n', '\r']);
+    if !needs_trim && !has_embedded {
+        return std::borrow::Cow::Borrowed(destination);
     }
-    let count = trimmed.bytes().take_while(|byte| *byte == marker).count();
-    (count >= 3).then_some((marker, count))
-}
-
-fn normalize_strong_whitespace_in_line(line: &str) -> Cow<'_, str> {
-    let bytes = line.as_bytes();
-    if !bytes.windows(2).any(|window| window == b"**") {
-        return Cow::Borrowed(line);
-    }
-    let mut output = String::with_capacity(line.len());
-    let mut index = 0;
-    let mut inline_code_ticks: Option<usize> = None;
-    let mut strong_content_start: Option<usize> = None;
-    let mut changed = false;
-
-    while index < bytes.len() {
-        if bytes[index] == b'`' {
-            let count = bytes[index..]
-                .iter()
-                .take_while(|byte| **byte == b'`')
-                .count();
-            match inline_code_ticks {
-                Some(opening) if opening == count => inline_code_ticks = None,
-                None => inline_code_ticks = Some(count),
-                _ => {}
-            }
-            output.push_str(&line[index..index + count]);
-            index += count;
-            continue;
-        }
-
-        if inline_code_ticks.is_none() && bytes[index..].starts_with(b"**") {
-            if let Some(content_start) = strong_content_start.take() {
-                let trailing_bytes = output[content_start..]
-                    .chars()
-                    .rev()
-                    .take_while(|ch| matches!(ch, ' ' | '\t'))
-                    .map(char::len_utf8)
-                    .sum::<usize>();
-                if trailing_bytes > 0 && output.len() > content_start + trailing_bytes {
-                    let whitespace = output.split_off(output.len() - trailing_bytes);
-                    output.push_str("**");
-                    output.push_str(&whitespace);
-                    changed = true;
-                    index += 2;
-                    continue;
-                }
-                output.push_str("**");
-                index += 2;
-                if index < bytes.len()
-                    && !line[index..]
-                        .chars()
-                        .next()
-                        .expect("valid UTF-8 boundary")
-                        .is_whitespace()
-                {
-                    output.push_str(STRONG_BOUNDARY);
-                    changed = true;
-                }
-                continue;
-            } else {
-                strong_content_start = Some(output.len() + 2);
-            }
-            output.push_str("**");
-            index += 2;
-            continue;
-        }
-
-        let ch = line[index..].chars().next().expect("valid UTF-8 boundary");
-        output.push(ch);
-        index += ch.len_utf8();
-    }
-
-    if changed {
-        Cow::Owned(output)
+    let trimmed = destination.trim_matches(|ch: char| ch <= ' ');
+    if !has_embedded {
+        std::borrow::Cow::Owned(trimmed.to_string())
     } else {
-        Cow::Borrowed(line)
+        std::borrow::Cow::Owned(
+            trimmed
+                .chars()
+                .filter(|ch| *ch != '\t' && *ch != '\n' && *ch != '\r')
+                .collect(),
+        )
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Inline {
     Text(String),
     Emphasis(Vec<Inline>),
@@ -178,7 +88,7 @@ pub enum Inline {
     HardBreak,
 }
 
-#[derive(Debug, Clone, PartialEq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Heading {
         level: u8,
@@ -205,29 +115,34 @@ pub enum Block {
 
 /// Markdown 的单一解析产物。
 ///
-/// 内部预览读取 `blocks`；浏览器预览和导出读取同一次解析产生的
-/// `events`。任何消费者都不得再次从源码创建 `pulldown_cmark::Parser`。
+/// 原生预览、目录、搜索和导出读取同一次解析产生的 `blocks`/`events`。
+/// 任何消费者都不得再次从源码创建 `pulldown_cmark::Parser`。
 #[derive(Debug, Clone)]
 pub struct ParsedDocument {
     source: String,
-    normalized: Option<String>,
     blocks: Vec<Block>,
     events: Vec<SpannedEvent>,
+    block_ranges: Vec<Range<usize>>,
+    headings: Vec<HeadingInfo>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SpannedEvent {
     pub event: Event<'static>,
     pub range: Range<usize>,
 }
 
+/// Stable, renderer-neutral metadata derived from a heading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadingInfo {
+    pub level: u8,
+    pub text: String,
+    pub id: String,
+}
+
 impl ParsedDocument {
     pub fn source(&self) -> &str {
         &self.source
-    }
-
-    pub fn normalized_source(&self) -> &str {
-        self.normalized.as_deref().unwrap_or(&self.source)
     }
 
     pub fn blocks(&self) -> &[Block] {
@@ -238,14 +153,14 @@ impl ParsedDocument {
         &self.events
     }
 
-    pub fn has_mermaid(&self) -> bool {
-        self.events.iter().any(|item| {
-            matches!(
-                &item.event,
-                Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info)))
-                    if info.split_whitespace().next().is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
-            )
-        })
+    /// Source spans for top-level blocks. Ranges are always measured against
+    /// the original source because parsing is strict and never rewrites it.
+    pub fn block_ranges(&self) -> &[Range<usize>] {
+        &self.block_ranges
+    }
+
+    pub fn headings(&self) -> &[HeadingInfo] {
+        &self.headings
     }
 }
 
@@ -256,8 +171,7 @@ impl Default for ParsedDocument {
 }
 
 pub fn parse_document(markdown: &str) -> ParsedDocument {
-    let normalized = normalize_compat_markdown(markdown);
-    let events = Parser::new_ext(&normalized, parse_options())
+    let events = Parser::new_ext(markdown, parse_options())
         .into_offset_iter()
         .map(|(event, range)| SpannedEvent {
             event: event.into_static(),
@@ -265,239 +179,117 @@ pub fn parse_document(markdown: &str) -> ParsedDocument {
         })
         .collect::<Vec<_>>();
     let mut builder = Builder::default();
-    for item in &events {
-        builder.push(item.event.clone());
-    }
-    let normalized = match normalized {
-        Cow::Borrowed(_) => None,
-        Cow::Owned(value) => Some(value),
-    };
-    ParsedDocument {
-        source: markdown.to_string(),
-        normalized,
-        blocks: builder.finish(),
-        events,
-    }
-}
-
-/// Reuse a parsed document for edits whose Markdown context is provably local.
-/// Line-only edits reuse all blocks; textual edits reparse one simple
-/// top-level block. Structural blocks conservatively fall back to a full parse.
-pub fn parse_document_incremental(
-    previous: &ParsedDocument,
-    markdown: &str,
-) -> Option<ParsedDocument> {
-    if previous.source == markdown || previous.normalized.is_some() {
-        return None;
-    }
-    let old = previous.source.as_bytes();
-    let new = markdown.as_bytes();
-    let prefix = old
-        .iter()
-        .zip(new.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut old_end = old.len();
-    let mut new_end = new.len();
-    while old_end > prefix && new_end > prefix && old[old_end - 1] == new[new_end - 1] {
-        old_end -= 1;
-        new_end -= 1;
-    }
-    let old_mid = &old[prefix..old_end];
-    let new_mid = &new[prefix..new_end];
-    let line_only =
-        |slice: &[u8]| !slice.is_empty() && slice.iter().all(|byte| matches!(byte, b'\r' | b'\n'));
-    if !matches!(normalize_compat_markdown(markdown), Cow::Borrowed(_)) {
-        return None;
-    }
-
-    let old_mid_len = old_end - prefix;
-    let new_mid_len = new_end - prefix;
-    let delta = new_mid_len as isize - old_mid_len as isize;
-
-    if line_only(old_mid) || line_only(new_mid) {
-        if !safe_line_edit(old, prefix, old_end) {
-            return None;
-        }
-        let ranges = top_level_block_ranges(previous)?;
-        if ranges.len() != previous.blocks.len()
-            || ranges.iter().zip(&previous.blocks).any(|(range, block)| {
-                let edit_inside_block = (range.start < prefix && prefix < range.end)
-                    || (range.start < old_end && old_end < range.end);
-                edit_inside_block && !is_line_edit_block_safe(block)
-            })
-        {
-            return None;
-        }
-        let shift = |offset: usize| {
-            if offset <= prefix {
-                offset
-            } else if offset >= old_end {
-                offset.saturating_add_signed(delta)
-            } else {
-                prefix + new_mid_len
-            }
-        };
-        let events = previous
-            .events
-            .iter()
-            .map(|item| SpannedEvent {
-                event: item.event.clone(),
-                range: shift(item.range.start)..shift(item.range.end),
-            })
-            .collect();
-        return Some(ParsedDocument {
-            source: markdown.to_string(),
-            normalized: None,
-            blocks: previous.blocks.clone(),
-            events,
-        });
-    }
-
-    let ranges = top_level_block_ranges(previous)?;
-    if ranges.len() != previous.blocks.len()
-        || previous
-            .blocks
-            .iter()
-            .any(|block| !is_incremental_block_safe(block))
-    {
-        return None;
-    }
-    let block_index = ranges
-        .iter()
-        .position(|range| prefix >= range.start && old_end <= range.end)?;
-    if ranges
-        .iter()
-        .enumerate()
-        .any(|(index, range)| index != block_index && prefix >= range.start && old_end <= range.end)
-    {
-        return None;
-    }
-    let old_range = &ranges[block_index];
-    let new_block_end = old_range.end.checked_add_signed(delta)?;
-    if new_block_end < old_range.start || new_block_end > markdown.len() {
-        return None;
-    }
-    let reparsed = parse_document(&markdown[old_range.start..new_block_end]);
-    if reparsed.normalized.is_some()
-        || reparsed.blocks.len() != 1
-        || !is_incremental_block_safe(&reparsed.blocks[0])
-        || reparsed
-            .events
-            .iter()
-            .any(|item| item.range.end > new_block_end - old_range.start)
-    {
-        return None;
-    }
-
-    let mut blocks = previous.blocks.clone();
-    blocks[block_index] = reparsed.blocks[0].clone();
-    let mut events = Vec::with_capacity(previous.events.len() + reparsed.events.len());
-    events.extend(
-        previous
-            .events
-            .iter()
-            .filter(|item| item.range.end <= old_range.start)
-            .cloned(),
-    );
-    events.extend(reparsed.events.into_iter().map(|item| SpannedEvent {
-        event: item.event,
-        range: (old_range.start + item.range.start)..(old_range.start + item.range.end),
-    }));
-    events.extend(
-        previous
-            .events
-            .iter()
-            .filter(|item| item.range.start >= old_range.end)
-            .map(|item| SpannedEvent {
-                event: item.event.clone(),
-                range: item.range.start.saturating_add_signed(delta)
-                    ..item.range.end.saturating_add_signed(delta),
-            }),
-    );
-    Some(ParsedDocument {
-        source: markdown.to_string(),
-        normalized: None,
-        blocks,
-        events,
-    })
-}
-
-fn top_level_block_ranges(document: &ParsedDocument) -> Option<Vec<Range<usize>>> {
+    // 区间收集与建块走同一个事件循环：每个顶层块记录一条源码区间。脚注
+    // 定义由 Builder 展开成"合成 `[label]` 段落 + N 个正文块"，全部块共享
+    // 该定义的源码区间，从而保持 blocks()/block_ranges() 一一对应——此前
+    // 固定压入两条区间，多块脚注会让后续所有块错位、整篇退化为全文源码
+    // 编辑。
+    let mut block_ranges = Vec::new();
     let mut depth = 0usize;
-    let mut start = None;
-    let mut ranges = Vec::new();
-    for item in &document.events {
+    let mut container_start = 0usize;
+    let mut footnote_first_block: Option<usize> = None;
+    for item in &events {
+        if let Event::Start(tag) = &item.event {
+            if depth == 0 {
+                container_start = item.range.start;
+                footnote_first_block =
+                    matches!(tag, Tag::FootnoteDefinition(_)).then(|| builder.root.len());
+            }
+            depth += 1;
+        }
+        builder.push(&item.event);
         match &item.event {
-            Event::Start(tag) if is_block_tag(tag) => {
+            Event::Start(_) => {}
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    start = Some(item.range.start);
+                    let range = container_start..item.range.end;
+                    match footnote_first_block.take() {
+                        Some(first) => {
+                            for _ in first..builder.root.len() {
+                                block_ranges.push(range.clone());
+                            }
+                        }
+                        None => block_ranges.push(range),
+                    }
                 }
-                depth += 1;
             }
-            Event::End(tag_end) if is_block_tag_end(*tag_end) => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    ranges.push(start.take()?..item.range.end);
-                }
-            }
-            Event::Rule if depth == 0 => ranges.push(item.range.clone()),
+            Event::Rule if depth == 0 => block_ranges.push(item.range.clone()),
             _ => {}
         }
     }
-    (depth == 0 && start.is_none()).then_some(ranges)
+    let blocks = builder.finish();
+    ParsedDocument {
+        source: markdown.to_string(),
+        headings: collect_headings(&blocks),
+        blocks,
+        events,
+        block_ranges,
+    }
 }
 
-fn is_incremental_block_safe(block: &Block) -> bool {
-    matches!(
-        block,
-        Block::Heading { .. } | Block::Paragraph(_) | Block::Code { .. } | Block::Rule
-    )
+fn collect_headings(blocks: &[Block]) -> Vec<HeadingInfo> {
+    fn visit(
+        blocks: &[Block],
+        result: &mut Vec<HeadingInfo>,
+        used: &mut std::collections::HashMap<String, usize>,
+    ) {
+        for block in blocks {
+            match block {
+                Block::Heading { level, inlines } => {
+                    let text = plain_of_inlines(inlines);
+                    let base = heading_slug(&text);
+                    let count = used.entry(base.clone()).or_insert(0);
+                    *count += 1;
+                    let id = if *count == 1 {
+                        base
+                    } else {
+                        format!("{}-{}", base, count)
+                    };
+                    result.push(HeadingInfo {
+                        level: *level,
+                        text,
+                        id,
+                    });
+                }
+                Block::List { items, .. } => {
+                    for item in items {
+                        visit(item, result, used);
+                    }
+                }
+                Block::Quote(children) => visit(children, result, used),
+                _ => {}
+            }
+        }
+    }
+
+    let mut result = Vec::new();
+    visit(blocks, &mut result, &mut std::collections::HashMap::new());
+    result
 }
 
-fn is_line_edit_block_safe(block: &Block) -> bool {
-    matches!(
-        block,
-        Block::Heading { .. } | Block::Paragraph(_) | Block::Rule
-    )
-}
-
-pub(crate) fn is_block_tag(tag: &Tag<'_>) -> bool {
-    matches!(
-        tag,
-        Tag::Paragraph
-            | Tag::Heading { .. }
-            | Tag::BlockQuote(_)
-            | Tag::CodeBlock(_)
-            | Tag::HtmlBlock
-            | Tag::List(_)
-            | Tag::FootnoteDefinition(_)
-            | Tag::DefinitionList
-            | Tag::Table(_)
-            | Tag::MetadataBlock(_)
-    )
-}
-
-pub(crate) fn is_block_tag_end(tag_end: TagEnd) -> bool {
-    matches!(
-        tag_end,
-        TagEnd::Paragraph
-            | TagEnd::Heading(_)
-            | TagEnd::BlockQuote(_)
-            | TagEnd::CodeBlock
-            | TagEnd::HtmlBlock
-            | TagEnd::List(_)
-            | TagEnd::FootnoteDefinition
-            | TagEnd::DefinitionList
-            | TagEnd::Table
-            | TagEnd::MetadataBlock(_)
-    )
-}
-
-fn safe_line_edit(source: &[u8], start: usize, end: usize) -> bool {
-    start == 0
-        || end == source.len()
-        || (start > 0 && source[start - 1] == b'\n' && end < source.len() && source[end] == b'\n')
+fn heading_slug(text: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in text.trim().chars() {
+        if ch.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.extend(ch.to_lowercase());
+            pending_dash = false;
+        } else {
+            // Treat punctuation as a word boundary as well. This keeps ids
+            // readable for Chinese headings such as “你好，世界” and makes
+            // duplicate headings deterministic without preserving symbols.
+            pending_dash = true;
+        }
+    }
+    if slug.is_empty() {
+        "heading".to_string()
+    } else {
+        slug
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +380,7 @@ enum Frame {
         inlines: Vec<Inline>,
     },
     List {
+        ordered: bool,
         start: u64,
         items: Vec<Vec<Block>>,
         cur: Vec<Block>,
@@ -618,7 +411,9 @@ enum Frame {
 }
 
 impl Builder {
-    fn push(&mut self, event: Event<'_>) {
+    /// 借用事件即可：只有真正要保留的字符串才克隆，长文档每次按键不再
+    /// 为整个事件流付一次额外克隆的开销。
+    fn push(&mut self, event: &Event<'_>) {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag_end) => self.end(tag_end),
@@ -628,25 +423,24 @@ impl Builder {
             Event::HardBreak => self.inline(Inline::HardBreak),
             Event::Rule => self.block(Block::Rule),
             Event::TaskListMarker(checked) => {
-                self.text(if checked { "[x] " } else { "[ ] " }.to_string())
+                self.text(if *checked { "[x] " } else { "[ ] " }.to_string())
             }
-            Event::Html(h) if h.as_ref() == STRONG_BOUNDARY => {}
             Event::Html(h) => match self.stack.last_mut() {
-                Some(Frame::Raw { text }) | Some(Frame::Code { text, .. }) => text.push_str(&h),
+                Some(Frame::Raw { text }) | Some(Frame::Code { text, .. }) => text.push_str(h),
                 _ => self.text(h.to_string()),
             },
-            Event::FootnoteReference(name) => self.inline(Inline::Text(format!("[^{}]", name))),
+            Event::FootnoteReference(name) => self.inline(Inline::Text(format!("[{name}]"))),
             _ => {}
         }
     }
 
-    fn start(&mut self, tag: Tag<'_>) {
+    fn start(&mut self, tag: &Tag<'_>) {
         match tag {
             Tag::Paragraph => self.stack.push(Frame::Paragraph {
                 inlines: Vec::new(),
             }),
             Tag::Heading { level, .. } => self.stack.push(Frame::Heading {
-                level: level as u8,
+                level: *level as u8,
                 inlines: Vec::new(),
             }),
             Tag::BlockQuote(_) => self.stack.push(Frame::Quote { blocks: Vec::new() }),
@@ -664,6 +458,7 @@ impl Builder {
                 text: String::new(),
             }),
             Tag::List(start) => self.stack.push(Frame::List {
+                ordered: start.is_some(),
                 start: start.unwrap_or(1),
                 items: Vec::new(),
                 cur: Vec::new(),
@@ -692,13 +487,13 @@ impl Builder {
             Tag::Strikethrough => self.push_inline_frame(InlineKind::Strikethrough, "", ""),
             Tag::Link {
                 dest_url, title, ..
-            } => self.push_inline_frame(InlineKind::Link, &dest_url, &title),
+            } => self.push_inline_frame(InlineKind::Link, dest_url, title),
             Tag::Image {
                 dest_url, title, ..
-            } => self.push_inline_frame(InlineKind::Image, &dest_url, &title),
-            Tag::FootnoteDefinition(_) => self.stack.push(Frame::Raw {
-                text: String::new(),
-            }),
+            } => self.push_inline_frame(InlineKind::Image, dest_url, title),
+            Tag::FootnoteDefinition(name) => {
+                self.block(Block::Paragraph(vec![Inline::Text(format!("[{name}]"))]))
+            }
             _ => self.stack.push(Frame::Raw {
                 text: String::new(),
             }),
@@ -714,7 +509,7 @@ impl Builder {
         });
     }
 
-    fn end(&mut self, tag_end: TagEnd) {
+    fn end(&mut self, tag_end: &TagEnd) {
         match tag_end {
             TagEnd::Paragraph => {
                 if let Some(Frame::Paragraph { inlines }) = self.stack.pop()
@@ -738,13 +533,15 @@ impl Builder {
                     self.block(Block::Code { lang, text });
                 }
             }
-            TagEnd::HtmlBlock | TagEnd::FootnoteDefinition => {
+            TagEnd::HtmlBlock => {
                 if let Some(Frame::Raw { text }) = self.stack.pop() {
                     self.block(Block::Raw(text));
                 }
             }
-            TagEnd::List(ordered) => {
+            TagEnd::FootnoteDefinition => {}
+            TagEnd::List(_) => {
                 if let Some(Frame::List {
+                    ordered,
                     start,
                     mut items,
                     cur,
@@ -943,6 +740,7 @@ impl Builder {
                     self.root.push(Block::Heading { level, inlines });
                 }
                 Frame::List {
+                    ordered,
                     start,
                     mut items,
                     cur,
@@ -951,7 +749,7 @@ impl Builder {
                         items.push(cur);
                     }
                     self.root.push(Block::List {
-                        ordered: false,
+                        ordered,
                         start,
                         items,
                     });
@@ -1000,86 +798,6 @@ fn plain_of_inlines(inlines: &[Inline]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn incremental_parse_reuses_ast_for_safe_blank_line_insertion() {
-        let previous = parse_document("# 标题\n\n正文\n");
-        let next = parse_document_incremental(&previous, "\n# 标题\n\n正文\n")
-            .expect("leading blank line should preserve markdown structure");
-
-        assert_eq!(next.blocks(), previous.blocks());
-        assert_eq!(next.events().len(), previous.events().len());
-        assert_eq!(next.source(), "\n# 标题\n\n正文\n");
-        assert!(
-            next.events()
-                .iter()
-                .all(|event| event.range.end <= next.source().len())
-        );
-    }
-
-    #[test]
-    fn incremental_parse_falls_back_when_text_content_changes() {
-        let previous = parse_document("# 标题\n\n正文\n");
-        let next = parse_document_incremental(&previous, "# 标题\n\n修改后的正文\n");
-        assert!(
-            next.is_some(),
-            "a single paragraph should use block-level parsing"
-        );
-        assert_eq!(next.unwrap().source(), "# 标题\n\n修改后的正文\n");
-    }
-
-    #[test]
-    fn incremental_parse_reparses_only_the_edited_top_level_block() {
-        let previous = parse_document("# 一\n\n甲\n\n# 二\n\n乙\n");
-        let next = parse_document_incremental(&previous, "# 一\n\n修改后的甲\n\n# 二\n\n乙\n")
-            .expect("single paragraph edit should be incremental");
-        let full = parse_document("# 一\n\n修改后的甲\n\n# 二\n\n乙\n");
-
-        assert_eq!(next.blocks(), full.blocks());
-        assert_eq!(next.events(), full.events());
-    }
-
-    #[test]
-    fn incremental_parse_reparses_heading_and_code_blocks() {
-        for (previous_source, next_source) in [
-            ("# 标题\n\n正文\n", "# 新标题\n\n正文\n"),
-            (
-                "正文\n\n```rust\nlet a = 1;\n```\n",
-                "正文\n\n```rust\nlet answer = 42;\n```\n",
-            ),
-        ] {
-            let previous = parse_document(previous_source);
-            let next = parse_document_incremental(&previous, next_source)
-                .expect("simple block edit should be incremental");
-            let full = parse_document(next_source);
-            assert_eq!(next.blocks(), full.blocks());
-            assert_eq!(next.events(), full.events());
-        }
-    }
-
-    #[test]
-    fn incremental_parse_handles_text_edit_at_end_of_document() {
-        let previous = parse_document("前文\n\n末尾\n");
-        let next = parse_document_incremental(&previous, "前文\n\n末尾追加\n")
-            .expect("editing the final paragraph should be incremental");
-        let full = parse_document("前文\n\n末尾追加\n");
-        assert_eq!(next.blocks(), full.blocks());
-        assert_eq!(next.events(), full.events());
-    }
-
-    #[test]
-    fn incremental_parse_falls_back_for_cross_block_list_semantics() {
-        let previous = parse_document("- 一\n- 二\n");
-        assert!(parse_document_incremental(&previous, "- 一\n- 修改后的二\n").is_none());
-    }
-
-    #[test]
-    fn incremental_parse_falls_back_for_blank_line_inside_code_block() {
-        let previous = parse_document("```text\na\n\nb\n```\n");
-        let next = "```text\na\n\n\nb\n```\n";
-
-        assert!(parse_document_incremental(&previous, next).is_none());
-    }
 
     #[derive(Debug, Default, PartialEq, Eq)]
     struct StructureCounts {
@@ -1171,32 +889,12 @@ mod tests {
     }
 
     #[test]
-    fn moves_whitespace_behind_strong_closing_delimiter() {
-        let source = "1. **结构层： **训练一个统一的纹样 LoRA。";
-        assert_eq!(
-            normalize_compat_markdown(source),
-            "1. **结构层：** 训练一个统一的纹样 LoRA。"
-        );
-    }
-
-    #[test]
-    fn leaves_strong_markers_inside_code_unchanged() {
-        let source = "`**inline **`\n\n```text\n**fenced **\n```\n";
-        assert!(matches!(
-            normalize_compat_markdown(source),
-            Cow::Borrowed(_)
-        ));
-    }
-
-    #[test]
-    fn inserts_an_invisible_boundary_for_adjacent_chinese_text() {
+    fn strict_parser_keeps_source_and_block_ranges_for_adjacent_strong_text() {
         let source = "- **识别与生成：**区分植物";
-        assert_eq!(
-            normalize_compat_markdown(source),
-            "- **识别与生成：**<!--md-strong-boundary-->区分植物"
-        );
-        let blocks = parse(source);
-        assert_eq!(plain_text(&blocks), "识别与生成：区分植物");
+        let document = parse_document(source);
+        assert_eq!(document.source(), source);
+        assert_eq!(document.block_ranges().len(), document.blocks().len());
+        assert_eq!(plain_text(document.blocks()), "**识别与生成：**区分植物");
     }
 
     #[test]
@@ -1270,6 +968,69 @@ mod tests {
     }
 
     #[test]
+    fn 链接协议安全边界明确() {
+        assert!(is_safe_link_destination("https://example.com"));
+        assert!(is_safe_link_destination("notes/next.md"));
+        assert!(is_safe_link_destination(r"C:\notes\next.md"));
+        assert!(is_safe_link_destination("mailto:team@example.com"));
+        assert!(!is_safe_link_destination("javascript:alert(1)"));
+        assert!(!is_safe_link_destination("vbscript:msgbox(1)"));
+        assert!(!is_safe_link_destination("data:text/html,<script>"));
+    }
+
+    #[test]
+    fn 网络位置链接不会被当成相对路径() {
+        // 协议相对 URL 与 UNC 路径都会交给系统打开网络位置。
+        assert!(!is_safe_link_destination("//evil.example/share"));
+        assert!(!is_safe_link_destination(r"\\evil\share"));
+        assert!(!is_safe_link_destination("  //evil.example/share"));
+        assert!(is_safe_link_destination("notes/next.md"));
+        assert!(is_safe_link_destination(r"C:\notes\next.md"));
+    }
+
+    #[test]
+    fn 前导空白与控制字符不能伪装成相对路径() {
+        // Browsers strip leading/trailing C0+space and remove tabs/newlines
+        // before resolving, so these must not pass as relative paths.
+        assert!(!is_safe_link_destination(" javascript:alert(1)"));
+        assert!(!is_safe_link_destination("\tjavascript:alert(1)"));
+        assert!(!is_safe_link_destination("\njavascript:alert(1)"));
+        assert!(!is_safe_link_destination("java\nscript:alert(1)"));
+        assert!(!is_safe_link_destination("\u{1}javascript:alert(1)"));
+        assert!(!is_safe_link_destination("  data:text/html,<script>  "));
+        assert!(is_safe_link_destination("  https://example.com  "));
+        assert!(is_safe_link_destination("notes/next.md"));
+    }
+
+    #[test]
+    fn 脚注在桌面块模型中保留引用和正文() {
+        let blocks = parse("正文[^1]\n\n[^1]: 说明文字\n");
+        assert!(blocks.iter().all(|block| !matches!(block, Block::Raw(_))));
+        assert_eq!(plain_text(&blocks), "正文[1]\n[1]\n说明文字");
+    }
+
+    #[test]
+    fn 文档元数据提供稳定标题锚点() {
+        let document =
+            parse_document("# 你好，世界\n\n# 你好，世界\n\n```Rust,ignore\nlet x = 1;\n```\n");
+        assert_eq!(
+            document.headings(),
+            &[
+                HeadingInfo {
+                    level: 1,
+                    text: "你好，世界".into(),
+                    id: "你好-世界".into(),
+                },
+                HeadingInfo {
+                    level: 1,
+                    text: "你好，世界".into(),
+                    id: "你好-世界-2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn 单一解析产物的事件流和内部模型结构一致() {
         let source = r#"# 总览
 
@@ -1309,5 +1070,205 @@ fn main() {}
         assert_eq!(browser_html.matches("<img ").count(), expected.images);
         assert_eq!(browser_html.matches("<a ").count(), expected.links);
         assert_eq!(browser_html.matches("<strong>").count(), expected.strong);
+    }
+
+    // A compact renderer-neutral fixture keeps the supported syntax profile explicit.
+    const SYNTAX_PROFILE_FIXTURE: &str = r#"# 主题
+
+段落含有 *强调*、**重点**、~~删除~~、`代码`、[链接](https://example.com "示例") 和 ![图](images/picture.png)。
+
+> 引用内容
+
+- [ ] 待办
+- [x] 已完成
+
+1. 第一项
+2. 第二项
+
+| 名称 | 数量 |
+| :--- | ---: |
+| 苹果 | 3 |
+
+```rust
+fn main() {}
+```
+
+脚注引用[^note]
+
+[^note]: 脚注正文
+"#;
+
+    #[test]
+    fn syntax_profile_fixture_preserves_core_ast_shape() {
+        let document = parse_document(SYNTAX_PROFILE_FIXTURE);
+        let blocks = document.blocks();
+        assert!(matches!(
+            blocks.first(),
+            Some(Block::Heading { level: 1, inlines }) if plain_of_inlines(inlines) == "主题"
+        ));
+        assert!(matches!(
+            blocks.get(1),
+            Some(Block::Paragraph(inlines))
+                if inlines.iter().any(|inline| matches!(inline, Inline::Emphasis(_)))
+                    && inlines.iter().any(|inline| matches!(inline, Inline::Strong(_)))
+                    && inlines.iter().any(|inline| matches!(inline, Inline::Strikethrough(_)))
+                    && inlines.iter().any(|inline| matches!(inline, Inline::Code(_)))
+                    && inlines.iter().any(|inline| matches!(inline, Inline::Link { url, title, .. }
+                        if url == "https://example.com" && title == "示例"))
+                    && inlines.iter().any(|inline| matches!(inline, Inline::Image { url, alt }
+                        if url == "images/picture.png" && alt == "图"))
+        ));
+        assert!(matches!(
+            blocks.get(2),
+            Some(Block::Quote(children)) if children.len() == 1
+                && plain_text(children) == "引用内容"
+        ));
+        assert!(matches!(
+            blocks.get(3),
+            Some(Block::List { ordered: false, start: 1, items }) if items.len() == 2
+        ));
+        assert!(matches!(
+            blocks.get(4),
+            Some(Block::List { ordered: true, start: 1, items }) if items.len() == 2
+        ));
+        assert!(matches!(
+            blocks.get(5),
+            Some(Block::Table { headers, rows }) if headers.len() == 2
+                && rows.len() == 1
+                && plain_of_inlines(&rows[0][0]) == "苹果"
+                && plain_of_inlines(&rows[0][1]) == "3"
+        ));
+        assert!(blocks.iter().any(|block| matches!(
+            block,
+            Block::Code { lang, text } if lang == "rust" && text.contains("fn main()")
+        )));
+        assert!(plain_text(blocks).contains("脚注引用"));
+        assert_eq!(
+            document.headings(),
+            &[HeadingInfo {
+                level: 1,
+                text: "主题".to_string(),
+                id: "主题".to_string(),
+            }]
+        );
+        assert!(
+            document
+                .events()
+                .iter()
+                .all(|event| event.range.start <= event.range.end)
+        );
+    }
+
+    #[test]
+    fn heading_after_image_keeps_heading_semantics() {
+        let document = parse_document(
+            "![图](images/picture.png)\n\n## 冻结事实，避免处理中途换数据\n\n正文\n",
+        );
+        assert!(matches!(
+            document.blocks().get(1),
+            Some(Block::Heading { level: 2, inlines })
+                if plain_of_inlines(inlines) == "冻结事实，避免处理中途换数据"
+        ));
+    }
+
+    #[test]
+    fn syntax_profile_fixture_is_deterministic_for_ast_and_events() {
+        let first = parse_document(SYNTAX_PROFILE_FIXTURE);
+        let second = parse_document(SYNTAX_PROFILE_FIXTURE);
+        assert_eq!(first.blocks(), second.blocks());
+        assert_eq!(
+            first
+                .events()
+                .iter()
+                .map(|item| item.range.clone())
+                .collect::<Vec<_>>(),
+            second
+                .events()
+                .iter()
+                .map(|item| item.range.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(first.source(), SYNTAX_PROFILE_FIXTURE);
+        assert_eq!(first.source(), second.source());
+    }
+
+    #[test]
+    fn top_level_block_ranges_cover_original_source() {
+        let source = "# 标题\n\n第一段。\n\n第二段。\n";
+        let document = parse_document(source);
+        let ranges = document.block_ranges();
+        assert_eq!(ranges.len(), document.blocks().len());
+        assert_eq!(&source[ranges[0].clone()], "# 标题\n");
+        assert_eq!(&source[ranges[1].clone()], "第一段。\n");
+        assert_eq!(&source[ranges[2].clone()], "第二段。\n");
+    }
+
+    #[test]
+    fn top_level_block_ranges_include_rules() {
+        let document = parse_document("前文\n\n---\n\n后文\n");
+        assert_eq!(document.block_ranges().len(), document.blocks().len());
+    }
+
+    #[test]
+    fn footnote_block_ranges_cover_synthetic_marker_and_body() {
+        let source = "正文[^1]\n\n[^1]: 说明文字\n";
+        let document = parse_document(source);
+        assert_eq!(document.block_ranges().len(), document.blocks().len());
+        assert_eq!(document.blocks().len(), 3);
+        assert_eq!(
+            &source[document.block_ranges()[1].clone()],
+            "[^1]: 说明文字\n"
+        );
+        assert_eq!(
+            &source[document.block_ranges()[2].clone()],
+            "[^1]: 说明文字\n"
+        );
+    }
+
+    #[test]
+    fn 多块脚注保持块与源码区间一一对应() {
+        let source = "正文[^1]\n\n[^1]: 第一段\n\n    第二段缩进\n\n后续段落\n";
+        let document = parse_document(source);
+        // 之前：脚注区间固定只压两条，后续段落的区间错位，预览整体退化为
+        // 全文源码编辑模式。
+        assert_eq!(document.block_ranges().len(), document.blocks().len());
+        assert_eq!(document.blocks().len(), 5);
+        let ranges = document.block_ranges();
+        let after = source.find("后续段落").expect("源码应包含后续段落");
+        assert_eq!(ranges[4].start, after, "最后一块的区间必须指向它自己");
+        assert!(
+            ranges[1..4]
+                .iter()
+                .all(|range| range.start < after && range.end <= after),
+            "脚注的 3 个块（标记 + 两段正文）共享同一定义区间"
+        );
+    }
+
+    #[test]
+    fn empty_footnote_does_not_create_a_spurious_range() {
+        let source = "正文[^1]\n\n[^1]:\n";
+        let document = parse_document(source);
+        assert_eq!(document.block_ranges().len(), document.blocks().len());
+    }
+
+    #[test]
+    fn nested_rules_do_not_create_extra_top_level_ranges() {
+        let document = parse_document("> 前文\n>\n> ---\n\n- 项目\n\n  ---\n");
+        assert_eq!(document.block_ranges().len(), document.blocks().len());
+    }
+
+    #[test]
+    fn malformed_markdown_remains_bounded_and_repeatable() {
+        let source = "# 未闭合 **强调\n\n- [x] 未结束列表\n\n```rust\n<&>\n";
+        let first = parse_document(source);
+        let second = parse_document(source);
+        assert_eq!(first.blocks(), second.blocks());
+        assert_eq!(first.events().len(), second.events().len());
+        assert!(
+            first
+                .events()
+                .iter()
+                .all(|event| event.range.end <= source.len())
+        );
     }
 }

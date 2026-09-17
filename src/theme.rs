@@ -1,14 +1,15 @@
-//! 可导入的 JSON 文档主题包。
+//! 文档主题包：内置“专注写作”与用户配置目录中保存的主题。
 
-use std::path::PathBuf;
-use std::{fs::File, io::Read, path::Path};
+use std::path::{Path, PathBuf};
 
 use egui::Color32;
 use serde::{Deserialize, Serialize};
 
 use crate::storage;
 
-pub const BUILT_IN_SSPAI_CSS: &str = include_str!("../assets/sspai.css");
+/// 内置“专注写作”主题：素净配色、无装饰性色块，仅服务阅读与写作。
+pub const BUILT_IN_FOCUS_CSS: &str = include_str!("../assets/focus.css");
+const MAX_THEME_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -23,7 +24,7 @@ pub struct ThemePackage {
     pub name: String,
     #[serde(default)]
     pub author: String,
-    /// 原始 CSS。浏览器预览直接执行它，不再转换为 egui 样式。
+    /// 原始 CSS，供 HTML 导出使用；编辑器混合编辑界面使用结构化 egui 样式。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub css: Option<String>,
     pub light: ThemeColors,
@@ -98,7 +99,6 @@ pub struct ThemeSpec {
     pub table_alt: Color32,
     pub heading_style: HeadingStyle,
     pub content_width: f32,
-    pub preview_padding: i8,
     pub block_spacing: f32,
     pub line_height: f32,
     pub list_item_spacing: f32,
@@ -108,49 +108,51 @@ pub struct ThemeSpec {
 }
 
 impl ThemePackage {
-    pub fn built_in_sspai() -> Self {
+    /// 内置“专注写作”主题：纸白画布、石墨文字、克制的蓝灰强调色，
+    /// 标题不加装饰样式，表格与引用只保留最小可辨的层次。
+    pub fn built_in_focused() -> Self {
         Self {
-            name: "少数派经典".to_string(),
+            name: "专注写作".to_string(),
             author: "Built-in".to_string(),
-            css: Some(BUILT_IN_SSPAI_CSS.to_string()),
+            css: Some(BUILT_IN_FOCUS_CSS.to_string()),
             light: ThemeColors {
-                canvas: "#FFFFFF".to_string(),
-                editor_canvas: "#FFFFFF".to_string(),
-                panel: "#FAFAFA".to_string(),
-                text: "#333333".to_string(),
-                muted: "#888888".to_string(),
-                heading: "#333333".to_string(),
-                accent: "#FF7E79".to_string(),
-                border: "#EEEEEE".to_string(),
-                code_bg: "#F8F8F8".to_string(),
-                quote_bg: "#FFFFFF".to_string(),
-                table_alt: "#FFF1F0".to_string(),
+                canvas: "#FCFCFA".to_string(),
+                editor_canvas: "#FCFCFA".to_string(),
+                panel: "#F6F6F4".to_string(),
+                text: "#2B2B2B".to_string(),
+                muted: "#8B8B88".to_string(),
+                heading: "#1F1F1F".to_string(),
+                accent: "#4A6FA5".to_string(),
+                border: "#E4E4E1".to_string(),
+                code_bg: "#F4F4F1".to_string(),
+                quote_bg: "#FAFAF8".to_string(),
+                table_alt: "#F7F7F5".to_string(),
             },
             dark: ThemeColors {
-                canvas: "#1C1D1F".to_string(),
-                editor_canvas: "#18191B".to_string(),
-                panel: "#18191B".to_string(),
-                text: "#E8E9EB".to_string(),
-                muted: "#96989D".to_string(),
-                heading: "#E8E9EB".to_string(),
-                accent: "#FF7E79".to_string(),
-                border: "#2F3034".to_string(),
-                code_bg: "#151618".to_string(),
-                quote_bg: "#232427".to_string(),
-                table_alt: "#371F20".to_string(),
+                canvas: "#191A1C".to_string(),
+                editor_canvas: "#161718".to_string(),
+                panel: "#161718".to_string(),
+                text: "#D8D9D6".to_string(),
+                muted: "#8B8D90".to_string(),
+                heading: "#E6E6E3".to_string(),
+                accent: "#86A8CC".to_string(),
+                border: "#2B2D2F".to_string(),
+                code_bg: "#1F2123".to_string(),
+                quote_bg: "#1C1D1F".to_string(),
+                table_alt: "#1D1F21".to_string(),
             },
             layout: ThemeLayout {
-                heading_style: HeadingStyle::Tech,
-                body_font_size: 15.0,
-                content_width: 820.0,
+                heading_style: HeadingStyle::Plain,
+                body_font_size: 16.5,
+                content_width: 780.0,
                 preview_padding: 40,
-                block_spacing: 20.0,
-                line_height: 1.64,
-                list_item_spacing: 11.25,
-                code_radius: 4,
+                block_spacing: 16.0,
+                line_height: 1.7,
+                list_item_spacing: 8.0,
+                code_radius: 6,
                 code_padding_x: 16,
                 code_padding_y: 13,
-                table_spacing_x: 22.0,
+                table_spacing_x: 20.0,
                 table_spacing_y: 10.0,
             },
         }
@@ -165,154 +167,10 @@ impl ThemePackage {
         }
     }
 
-    pub fn from_file(path: &Path) -> Result<Self, String> {
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        match ext.as_str() {
-            "json" => {
-                let text =
-                    std::fs::read_to_string(path).map_err(|e| format!("无法读取主题包：{e}"))?;
-                Self::from_json(&text)
-            }
-            "css" => {
-                let css =
-                    std::fs::read_to_string(path).map_err(|e| format!("无法读取 CSS：{e}"))?;
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("CSS Theme");
-                Self::from_css(name, &css)
-            }
-            "zip" => Self::from_zip(path),
-            _ => Err("仅支持 .json、.css 和包含 CSS/JSON 的 .zip 主题包".to_string()),
-        }
-    }
-
-    fn from_zip(path: &Path) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| format!("无法打开 ZIP：{e}"))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("ZIP 格式无效：{e}"))?;
-        let mut css_candidate: Option<(String, String)> = None;
-        for index in 0..archive.len() {
-            let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
-            if entry.is_dir() || entry.size() > 2 * 1024 * 1024 {
-                continue;
-            }
-            let name = entry.name().to_string();
-            let lower = name.to_ascii_lowercase();
-            if !lower.ends_with(".json") && !lower.ends_with(".css") {
-                continue;
-            }
-            let mut text = String::new();
-            entry
-                .read_to_string(&mut text)
-                .map_err(|e| format!("无法读取 ZIP 中的 {name}：{e}"))?;
-            if lower.ends_with(".json") {
-                if let Ok(package) = Self::from_json(&text) {
-                    return Ok(package);
-                }
-            } else if css_candidate.is_none() {
-                css_candidate = Some((name, text));
-            }
-        }
-        let Some((name, css)) = css_candidate else {
-            return Err("ZIP 中没有找到可用的 .css 或主题 .json 文件".to_string());
-        };
-        let stem = Path::new(&name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("CSS Theme");
-        Self::from_css(stem, &css)
-    }
-
-    pub fn from_css(name: &str, css: &str) -> Result<Self, String> {
-        if !css.contains('{') || !css.contains('}') {
-            return Err("CSS 中没有找到有效规则".to_string());
-        }
-        let fallback_light = ThemeSpec::fallback(false);
-        let fallback_dark = ThemeSpec::fallback(true);
-        let body_bg = css_color(css, "body", "background")
-            .or_else(|| css_color(css, "body", "background-color"))
-            .unwrap_or(fallback_light.canvas);
-        let text = css_color(css, "body", "color").unwrap_or(fallback_light.text);
-        let accent = css_color(css, "h2", "border-left")
-            .or_else(|| css_color(css, "a", "color"))
-            .unwrap_or(fallback_light.accent);
-        let heading = css_color(css, "h1", "color")
-            .or_else(|| css_color(css, "h2", "color"))
-            .unwrap_or(text);
-        let muted = css_color(css, "blockquote", "color").unwrap_or(fallback_light.muted);
-        let code_bg = css_color(css, "pre", "background")
-            .or_else(|| css_color(css, "pre", "background-color"))
-            .unwrap_or(fallback_light.code_bg);
-        let quote_bg = css_color(css, "blockquote", "background")
-            .or_else(|| css_color(css, "blockquote", "background-color"))
-            .unwrap_or(body_bg);
-        let border = css_color(css, "hr", "border-top")
-            .or_else(|| css_color(css, "pre", "border"))
-            .unwrap_or(fallback_light.border);
-        let code_radius = css_number(css, "pre", "border-radius").unwrap_or(8.0) as u8;
-        let body_font_size = css_number(css, "body", "font-size").unwrap_or(15.0);
-        let css_line_height = css_number(css, "p", "line-height")
-            .or_else(|| css_number(css, "body", "line-height"))
-            .unwrap_or(1.55);
-        let rendered_body_size = body_font_size.clamp(12.0, 22.0);
-        let line_height = css_line_height.clamp(1.2, 1.9);
-        let block_spacing = css_margin_side(css, "p", false, body_font_size).unwrap_or(10.0);
-        let list_item_spacing = css_margin_side(css, "li", false, body_font_size).unwrap_or(6.0);
-        let heading_style = if css_property(css, "h2", "border-left").is_some() {
-            HeadingStyle::Tech
-        } else {
-            HeadingStyle::Plain
-        };
-
-        let light = ThemeColors::from_spec_colors(
-            body_bg,
-            body_bg,
-            body_bg,
-            text,
-            muted,
-            heading,
-            accent,
-            border,
-            code_bg,
-            quote_bg,
-            mix_color(body_bg, accent, 0.07),
-        );
-        let dark = ThemeColors::from_spec_colors(
-            fallback_dark.canvas,
-            fallback_dark.editor_canvas,
-            fallback_dark.panel,
-            fallback_dark.text,
-            fallback_dark.muted,
-            fallback_dark.heading,
-            accent,
-            fallback_dark.border,
-            fallback_dark.code_bg,
-            fallback_dark.quote_bg,
-            mix_color(fallback_dark.canvas, accent, 0.12),
-        );
-        Ok(Self {
-            name: name.to_string(),
-            author: "CSS Import".to_string(),
-            css: Some(css.to_string()),
-            light,
-            dark,
-            layout: ThemeLayout {
-                heading_style,
-                body_font_size: rendered_body_size,
-                code_radius,
-                line_height,
-                block_spacing,
-                list_item_spacing,
-                ..Default::default()
-            },
-        })
-    }
-
     pub fn from_json(text: &str) -> Result<Self, String> {
+        if text.len() > MAX_THEME_TEXT_BYTES {
+            return Err("主题包 JSON 超过 2 MiB 限制".to_string());
+        }
         let package: Self =
             serde_json::from_str(text).map_err(|e| format!("主题包 JSON 无效：{e}"))?;
         if package.name.trim().is_empty() {
@@ -323,15 +181,10 @@ impl ThemePackage {
         Ok(package)
     }
 
-    /// 返回浏览器预览使用的完整 CSS。
-    ///
-    /// 旧版本保存的 sspai 主题没有 `css` 字段，这里自动迁移到内置原版。
+    /// 返回 HTML 导出使用的完整 CSS。没有携带 CSS 的旧包（例如已移除的
+    /// sspai 时代主题）返回 `None`，由调用方回退到内置专注写作 CSS。
     pub fn browser_css(&self) -> Option<&str> {
-        self.css.as_deref().or_else(|| {
-            let is_legacy_sspai =
-                self.name.trim().eq_ignore_ascii_case("sspai") || self.name.trim() == "少数派经典";
-            is_legacy_sspai.then_some(BUILT_IN_SSPAI_CSS)
-        })
+        self.css.as_deref()
     }
 
     pub fn spec(&self, dark: bool) -> Result<ThemeSpec, String> {
@@ -361,7 +214,6 @@ impl ThemePackage {
             },
             heading_style: self.layout.heading_style,
             content_width: self.layout.content_width.clamp(560.0, 1200.0),
-            preview_padding: self.layout.preview_padding.clamp(12, 80),
             block_spacing: if self.author == "CSS Import"
                 && (self.layout.block_spacing - 10.0).abs() < f32::EPSILON
             {
@@ -396,64 +248,33 @@ impl ThemePackage {
     }
 }
 
-impl ThemeColors {
-    #[allow(clippy::too_many_arguments)]
-    fn from_spec_colors(
-        canvas: Color32,
-        editor_canvas: Color32,
-        panel: Color32,
-        text: Color32,
-        muted: Color32,
-        heading: Color32,
-        accent: Color32,
-        border: Color32,
-        code_bg: Color32,
-        quote_bg: Color32,
-        table_alt: Color32,
-    ) -> Self {
-        Self {
-            canvas: color_hex(canvas),
-            editor_canvas: color_hex(editor_canvas),
-            panel: color_hex(panel),
-            text: color_hex(text),
-            muted: color_hex(muted),
-            heading: color_hex(heading),
-            accent: color_hex(accent),
-            border: color_hex(border),
-            code_bg: color_hex(code_bg),
-            quote_bg: color_hex(quote_bg),
-            table_alt: color_hex(table_alt),
-        }
-    }
-}
-
 impl ThemeSpec {
     pub fn fallback(dark: bool) -> Self {
         let (canvas, editor, panel, text, muted, accent, border, code, quote, table) = if dark {
             (
+                Color32::from_rgb(25, 26, 28),
+                Color32::from_rgb(22, 23, 24),
+                Color32::from_rgb(22, 23, 24),
+                Color32::from_rgb(216, 217, 214),
+                Color32::from_rgb(139, 141, 144),
+                Color32::from_rgb(134, 168, 204),
+                Color32::from_rgb(43, 45, 47),
+                Color32::from_rgb(31, 33, 35),
                 Color32::from_rgb(28, 29, 31),
-                Color32::from_rgb(24, 25, 27),
-                Color32::from_rgb(24, 25, 27),
-                Color32::from_rgb(232, 233, 235),
-                Color32::from_rgb(150, 152, 157),
-                Color32::from_rgb(99, 164, 230),
-                Color32::from_rgb(47, 48, 52),
-                Color32::from_rgb(21, 22, 24),
-                Color32::from_rgb(35, 36, 39),
-                Color32::from_rgb(38, 42, 46),
+                Color32::from_rgb(29, 31, 33),
             )
         } else {
             (
-                Color32::from_rgb(250, 250, 249),
+                Color32::from_rgb(252, 252, 250),
+                Color32::from_rgb(252, 252, 250),
+                Color32::from_rgb(246, 246, 244),
+                Color32::from_rgb(43, 43, 43),
+                Color32::from_rgb(139, 139, 136),
+                Color32::from_rgb(74, 111, 165),
+                Color32::from_rgb(228, 228, 225),
+                Color32::from_rgb(244, 244, 241),
+                Color32::from_rgb(250, 250, 248),
                 Color32::from_rgb(247, 247, 245),
-                Color32::from_rgb(247, 247, 245),
-                Color32::from_rgb(32, 33, 35),
-                Color32::from_rgb(112, 114, 118),
-                Color32::from_rgb(38, 116, 181),
-                Color32::from_rgb(228, 228, 224),
-                Color32::from_rgb(243, 244, 246),
-                Color32::from_rgb(247, 247, 245),
-                Color32::from_rgb(238, 242, 246),
             )
         };
         Self {
@@ -469,71 +290,24 @@ impl ThemeSpec {
             quote_bg: quote,
             table_alt: table,
             heading_style: HeadingStyle::Plain,
-            content_width: 820.0,
-            preview_padding: 40,
-            block_spacing: 10.0,
-            line_height: 1.55,
-            list_item_spacing: 6.0,
-            code_radius: 8,
+            content_width: 780.0,
+            block_spacing: 16.0,
+            line_height: 1.7,
+            list_item_spacing: 8.0,
+            code_radius: 6,
             code_padding: [16, 13],
-            table_spacing: [22.0, 10.0],
+            table_spacing: [20.0, 10.0],
         }
     }
 }
 
-/// 追加到原始主题 CSS 末尾的深色外观覆盖层。
-///
-/// 主题包的原始 CSS 仍然保持原样执行；这一层只负责把应用的深色契约
-///（画布、正文、代码块、引用、表格和链接）传递给浏览器预览与导出。
-pub fn dark_mode_css(spec: &ThemeSpec) -> String {
-    let color = |value: Color32| color_hex(value);
-    format!(
-        ":root{{color-scheme:dark;}}\
-         html,body,.markdown-body{{background-color:{}!important;color:{}!important;}}\
-         body{{border-color:{}!important;}}\
-         p,li,td,th,dt,dd,figcaption,summary{{color:{}!important;}}\
-         h1,h2,h3,h4,h5,h6{{color:{}!important;}}\
-         a{{color:{}!important;}}\
-         blockquote{{background-color:{}!important;border-color:{}!important;color:{}!important;}}\
-         pre,code,pre code{{background-color:{}!important;color:{}!important;border-color:{}!important;}}\
-         table,th,td{{background-color:{}!important;border-color:{}!important;}}\
-         tbody tr:nth-child(even){{background-color:{}!important;}}\
-         hr{{border-color:{}!important;}}",
-        color(spec.canvas),
-        color(spec.text),
-        color(spec.border),
-        color(spec.text),
-        color(spec.heading),
-        color(spec.accent),
-        color(spec.quote_bg),
-        color(spec.accent),
-        color(spec.muted),
-        color(spec.code_bg),
-        color(spec.text),
-        color(spec.border),
-        color(spec.panel),
-        color(spec.border),
-        color(spec.table_alt),
-        color(spec.border),
-    )
-}
-
 const THEME_STATE_LIMIT: u64 = 20 * 1024 * 1024;
-
-const APPEARANCE_STATE_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SavedThemeEnvelope {
     schema_version: u32,
     saved_at_unix: u64,
     package: ThemePackage,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct SavedAppearanceEnvelope {
-    schema_version: u32,
-    saved_at_unix: u64,
-    dark: bool,
 }
 
 pub fn saved_theme_path() -> PathBuf {
@@ -623,62 +397,6 @@ pub fn save_imported(package: &ThemePackage) -> Result<(), String> {
     save_imported_at(&saved_theme_path(), package)
 }
 
-pub fn clear_saved() {
-    let _ = std::fs::remove_file(saved_theme_path());
-    let _ = std::fs::remove_file(legacy_theme_path());
-}
-
-fn appearance_path() -> PathBuf {
-    storage::config_dir().join("appearance.json")
-}
-
-fn load_dark_at(path: &Path) -> bool {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    if metadata.len() == 0 || metadata.len() > APPEARANCE_STATE_LIMIT {
-        storage::quarantine_corrupt(path);
-        return false;
-    }
-    let Ok(bytes) = std::fs::read(path) else {
-        return false;
-    };
-    let Ok(envelope) = serde_json::from_slice::<SavedAppearanceEnvelope>(&bytes) else {
-        storage::quarantine_corrupt(path);
-        return false;
-    };
-    let invalid_version = envelope.schema_version != storage::STORAGE_SCHEMA_VERSION;
-    let invalid_time =
-        envelope.saved_at_unix > storage::unix_timestamp().saturating_add(24 * 60 * 60);
-    if invalid_version || invalid_time {
-        storage::quarantine_corrupt(path);
-        return false;
-    }
-    envelope.dark
-}
-
-pub fn load_dark_mode() -> bool {
-    let path = appearance_path();
-    if let Some(parent) = path.parent() {
-        storage::cleanup_sidecars(parent);
-    }
-    load_dark_at(&path)
-}
-
-fn save_dark_at(path: &Path, dark: bool) -> Result<(), String> {
-    let envelope = SavedAppearanceEnvelope {
-        schema_version: storage::STORAGE_SCHEMA_VERSION,
-        saved_at_unix: storage::unix_timestamp(),
-        dark,
-    };
-    let bytes = serde_json::to_vec_pretty(&envelope).map_err(|error| error.to_string())?;
-    storage::write_atomic(path, &bytes).map_err(|error| error.to_string())
-}
-
-pub fn save_dark_mode(dark: bool) -> Result<(), String> {
-    save_dark_at(&appearance_path(), dark)
-}
-
 fn parse_color(value: &str) -> Result<Color32, String> {
     let hex = value.trim().trim_start_matches('#');
     let expanded;
@@ -699,11 +417,7 @@ fn parse_color(value: &str) -> Result<Color32, String> {
     ))
 }
 
-fn color_hex(color: Color32) -> String {
-    format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b())
-}
-
-fn mix_color(background: Color32, foreground: Color32, amount: f32) -> Color32 {
+pub(crate) fn mix_color(background: Color32, foreground: Color32, amount: f32) -> Color32 {
     let amount = amount.clamp(0.0, 1.0);
     let mix = |bg: u8, fg: u8| (bg as f32 * (1.0 - amount) + fg as f32 * amount).round() as u8;
     Color32::from_rgb(
@@ -758,65 +472,19 @@ pub fn font_size_override_css(css: &str, target_body_size: f32) -> String {
     scaled_rules
 }
 
-/// Browser-only font layer whose values can be changed without rebuilding the
-/// document. Absolute pixel rules use the shared scale variable so headings,
-/// code and other fixed-size theme elements track the body size together.
-pub fn font_size_runtime_css(css: &str, target_body_size: Option<f32>) -> String {
-    let base_body_size = css_property(css, "body", "font-size")
-        .as_deref()
-        .and_then(absolute_px)
-        .unwrap_or(15.0);
-    let target_body_size = target_body_size.unwrap_or(base_body_size);
-    let scale = target_body_size / base_body_size.max(1.0);
-    let mut scaled_rules = String::new();
-    append_scaled_font_rules_runtime(css, &mut scaled_rules);
-    format!(
-        ":root {{ --md-body-font-size: {target_body_size:.2}px; --md-font-scale: {scale:.6}; }} body {{ font-size: var(--md-body-font-size) !important; }}{scaled_rules}"
-    )
-}
-
-fn append_scaled_font_rules_runtime(css: &str, output: &mut String) {
-    let mut cursor = 0usize;
-    while let Some(relative_open) = css[cursor..].find('{') {
-        let open = cursor + relative_open;
-        let raw_prelude = css[cursor..open].trim();
-        let prelude = raw_prelude
-            .rsplit_once(';')
-            .map_or(raw_prelude, |(_, tail)| tail)
-            .trim();
-        let Some(close) = matching_brace(css, open) else {
-            break;
-        };
-        let declarations = &css[open + 1..close];
-        if prelude.starts_with("@media")
-            || prelude.starts_with("@supports")
-            || prelude.starts_with("@container")
-            || prelude.starts_with("@layer")
-        {
-            let mut nested = String::new();
-            append_scaled_font_rules_runtime(declarations, &mut nested);
-            if !nested.is_empty() {
-                output.push_str(prelude);
-                output.push('{');
-                output.push_str(&nested);
-                output.push('}');
-            }
-        } else if !prelude.is_empty()
-            && !prelude.starts_with('@')
-            && let Some(size) = declaration_value(declarations, "font-size")
-                .as_deref()
-                .and_then(absolute_px)
-        {
-            output.push_str(prelude);
-            output.push_str(" { font-size: calc(");
-            output.push_str(&format!("{size:.2}px * var(--md-font-scale)"));
-            output.push_str(") !important; }");
-        }
-        cursor = close + 1;
-    }
-}
-
 fn append_scaled_font_rules(css: &str, scale: f32, output: &mut String) {
+    append_scaled_font_rules_bounded(css, scale, output, 0);
+}
+
+/// Hard cap on nested at-rule recursion. Imported themes are attacker-adjacent
+/// input (any file the user picks); without a cap a few thousand `@media {`
+/// layers overflow the stack and take the app down.
+const MAX_CSS_NESTING_DEPTH: usize = 32;
+
+fn append_scaled_font_rules_bounded(css: &str, scale: f32, output: &mut String, depth: usize) {
+    if depth >= MAX_CSS_NESTING_DEPTH {
+        return;
+    }
     let mut cursor = 0usize;
     while let Some(relative_open) = css[cursor..].find('{') {
         let open = cursor + relative_open;
@@ -836,7 +504,7 @@ fn append_scaled_font_rules(css: &str, scale: f32, output: &mut String) {
             || prelude.starts_with("@layer")
         {
             let mut nested = String::new();
-            append_scaled_font_rules(declarations, scale, &mut nested);
+            append_scaled_font_rules_bounded(declarations, scale, &mut nested, depth + 1);
             if !nested.is_empty() {
                 output.push_str(prelude);
                 output.push('{');
@@ -909,67 +577,16 @@ fn declaration_value(declarations: &str, property: &str) -> Option<String> {
 fn absolute_px(value: &str) -> Option<f32> {
     let value = value.trim();
     let value = value.strip_suffix("!important").unwrap_or(value).trim();
-    if value.len() < 3 || !value[value.len() - 2..].eq_ignore_ascii_case("px") {
+    // Compare the suffix byte-wise: a `"px"` check at `len - 2` would panic
+    // when imported CSS ends a font-size value with a multi-byte character.
+    let bytes = value.as_bytes();
+    if bytes.len() < 3
+        || !matches!(bytes[bytes.len() - 2], b'p' | b'P')
+        || !matches!(bytes[bytes.len() - 1], b'x' | b'X')
+    {
         return None;
     }
     value[..value.len() - 2].trim().parse().ok()
-}
-
-fn css_color(css: &str, selector: &str, property: &str) -> Option<Color32> {
-    let value = css_property(css, selector, property)?;
-    if let Some(start) = value.find('#') {
-        let hex: String = value[start + 1..]
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit())
-            .collect();
-        return parse_color(&hex).ok();
-    }
-    match value.trim().to_ascii_lowercase().as_str() {
-        "white" => Some(Color32::WHITE),
-        "black" => Some(Color32::BLACK),
-        _ => None,
-    }
-}
-
-fn css_number(css: &str, selector: &str, property: &str) -> Option<f32> {
-    let value = css_property(css, selector, property)?;
-    let number: String = value
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit() && *c != '.')
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    number.parse().ok()
-}
-
-fn css_margin_side(css: &str, selector: &str, top: bool, font_size: f32) -> Option<f32> {
-    let direct = if top { "margin-top" } else { "margin-bottom" };
-    if let Some(value) = css_property(css, selector, direct) {
-        return css_length_px(&value, font_size);
-    }
-    let margin = css_property(css, selector, "margin")?;
-    let values: Vec<&str> = margin.split_whitespace().collect();
-    let index = match (values.len(), top) {
-        (1, _) => 0,
-        (2, _) => 0,
-        (3, true) | (4, true) => 0,
-        (3, false) | (4, false) => 2,
-        _ => return None,
-    };
-    css_length_px(values[index], font_size)
-}
-
-fn css_length_px(value: &str, font_size: f32) -> Option<f32> {
-    let number: String = value
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit() && *c != '.')
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let value_number: f32 = number.parse().ok()?;
-    if value.trim().to_ascii_lowercase().ends_with("em") {
-        Some(value_number * font_size)
-    } else {
-        Some(value_number)
-    }
 }
 
 #[cfg(test)]
@@ -992,57 +609,43 @@ mod tests {
     }
 
     #[test]
-    fn typora_css可以转换为主题包() {
-        let css = "body { color:#333; background:#fff; font-size:15px; } p { margin:0 0 20px; line-height:1.8; } li { margin-bottom:.75em; } h2 { border-left:6px solid #ff7e79; } pre { background:#f8f8f8; border-radius:4px; }";
-        let package = ThemePackage::from_css("sspai", css).expect("CSS 应可转换");
-        let light = package.spec(false).unwrap();
-        assert_eq!(package.name, "sspai");
-        assert_eq!(light.canvas, Color32::WHITE);
-        assert_eq!(light.accent, Color32::from_rgb(255, 126, 121));
-        assert_eq!(light.table_alt, Color32::from_rgb(255, 246, 246));
-        assert_eq!(light.heading_style, HeadingStyle::Tech);
-        assert_eq!(light.code_radius, 4);
-        assert_eq!(light.block_spacing, 20.0);
-        assert!((light.line_height - 1.8).abs() < 0.001);
-        assert_eq!(light.list_item_spacing, 11.25);
-        assert_eq!(package.recommended_body_font_size(), 15.0);
-        assert_eq!(package.browser_css(), Some(css));
-    }
-
-    #[test]
-    fn 浏览器字号层使用可热更新的缩放变量() {
-        let css = "body { font-size:15px; } h1 { font-size: 30px; } @media (min-width: 1px) { code { font-size: 12px; } }";
-        let runtime = font_size_runtime_css(css, Some(18.0));
-        assert!(runtime.contains("--md-body-font-size: 18.00px"));
-        assert!(runtime.contains("--md-font-scale: 1.200000"));
-        assert!(runtime.contains("30.00px * var(--md-font-scale)"));
-        assert!(runtime.contains("@media (min-width: 1px)"));
-        assert!(runtime.contains("12.00px * var(--md-font-scale)"));
-    }
-
-    #[test]
-    fn 内置少数派主题参数有效() {
-        let package = ThemePackage::built_in_sspai();
+    fn 内置专注主题保持素净() {
+        let package = ThemePackage::built_in_focused();
         let light = package.spec(false).unwrap();
         let dark = package.spec(true).unwrap();
-        assert_eq!(package.name, "少数派经典");
-        assert_eq!(light.canvas, Color32::WHITE);
-        assert_eq!(light.accent, Color32::from_rgb(255, 126, 121));
-        assert_eq!(light.heading_style, HeadingStyle::Tech);
-        assert_eq!(package.recommended_body_font_size(), 15.0);
-        assert!(package.browser_css().unwrap().contains("padding: 10%"));
+        assert_eq!(package.name, "专注写作");
+        assert_eq!(light.canvas, Color32::from_rgb(0xFC, 0xFC, 0xFA));
+        assert_eq!(light.accent, Color32::from_rgb(0x4A, 0x6F, 0xA5));
+        assert_eq!(light.heading_style, HeadingStyle::Plain);
+        assert_eq!(package.recommended_body_font_size(), 16.5);
+        assert!(package.browser_css().unwrap().contains("max-width: 780px"));
         assert_ne!(light.canvas, dark.canvas);
     }
 
     #[test]
-    fn 深色覆盖层包含主题的关键颜色契约() {
-        let spec = ThemePackage::built_in_sspai().spec(true).unwrap();
-        let css = dark_mode_css(&spec);
-        assert!(css.contains(":root{color-scheme:dark;}"));
-        assert!(css.contains("background-color:#1C1D1F!important"));
-        assert!(css.contains("color:#E8E9EB!important"));
-        assert!(css.contains("pre,code"));
-        assert!(css.contains("tbody tr:nth-child(even)"));
+    fn 字体像素值以多字节字符结尾不会panic() {
+        // A `px` suffix check at `len - 2` used to slice inside a multi-byte
+        // character when imported CSS ended a font-size value with it.
+        let css = "body { font-size: 15px; } p { font-size: 15汉; }";
+        let override_css = font_size_override_css(css, 17.0);
+        assert!(override_css.contains("font-size: 17.00px !important;"));
+        assert!(!override_css.contains("15汉"));
+    }
+
+    #[test]
+    fn 深层嵌套媒体查询不会栈溢出() {
+        let mut deep = "@media screen { ".repeat(4000);
+        deep.push_str("body { font-size: 20px; } ");
+        deep.push_str(&"}".repeat(4000));
+        let css = format!("body {{ font-size: 15px; color:#333; background:#fff; }} {deep}");
+        let override_css = font_size_override_css(&css, 17.0);
+        // 超出深度上限的嵌套层被丢弃，但函数必须正常返回；
+        // 顶层规则仍然缩放。
+        assert!(override_css.contains("font-size: 17.00px !important;"));
+        // 浅层嵌套依旧生效
+        let shallow = "body { font-size: 15px; } @media print { p { font-size: 12px; } }";
+        let scaled = font_size_override_css(shallow, 15.0);
+        assert!(scaled.contains("font-size: 12.00px !important;"));
     }
 
     #[test]
@@ -1053,7 +656,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("current.json");
-        let package = ThemePackage::built_in_sspai();
+        let package = ThemePackage::built_in_focused();
         save_imported_at(&path, &package).unwrap();
         let loaded = load_saved_at(&path).expect("版本有效的主题应可恢复");
         assert_eq!(loaded.name, package.name);
@@ -1084,59 +687,12 @@ mod tests {
     }
 
     #[test]
-    fn 外观偏好携带版本并可恢复() {
-        let directory = std::env::temp_dir().join(format!(
-            "markdown-editor-appearance-state-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("appearance.json");
-        save_dark_at(&path, true).unwrap();
-        assert!(load_dark_at(&path));
-        let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"schema_version\": 1"));
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn 损坏外观偏好降级为亮色并隔离() {
-        let directory = std::env::temp_dir().join(format!(
-            "markdown-editor-appearance-corrupt-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("appearance.json");
-        std::fs::write(&path, b"not-json").unwrap();
-        assert!(!load_dark_at(&path));
-        assert!(!path.exists());
-        assert!(std::fs::read_dir(&directory).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("appearance.json.corrupt-")
-        }));
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[test]
-    fn 缺少外观字段的版本化配置会被隔离() {
-        let directory = std::env::temp_dir().join(format!(
-            "markdown-editor-appearance-incomplete-test-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("appearance.json");
-        std::fs::write(
-            &path,
-            format!(
-                "{{\"schema_version\":1,\"saved_at_unix\":{}}}",
-                storage::unix_timestamp()
-            ),
-        )
-        .unwrap();
-        assert!(!load_dark_at(&path));
-        assert!(!path.exists());
-        let _ = std::fs::remove_dir_all(directory);
+    fn 超大主题文本会被拒绝() {
+        let oversized = " ".repeat(MAX_THEME_TEXT_BYTES + 1);
+        assert!(
+            ThemePackage::from_json(&oversized)
+                .unwrap_err()
+                .contains("超过 2 MiB")
+        );
     }
 }

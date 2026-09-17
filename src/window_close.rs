@@ -44,6 +44,9 @@ pub struct CloseGuard {
 impl CloseGuard {
     pub fn request_close(&mut self, unsaved_documents: Vec<UnsavedDocument>) -> CloseAction {
         if matches!(self.state, CloseState::Approved) {
+            // 批准是一次性的：窗口随后立即关闭。消费掉这次批准，保证
+            // 异常路径下窗口存活时，新出现的未保存内容仍会触发确认。
+            self.state = CloseState::Idle;
             CloseAction::Allow
         } else if matches!(self.state, CloseState::Confirming { .. }) {
             CloseAction::Confirm

@@ -1,14 +1,17 @@
-# Markdown 编辑器与预览器
+# Markdown 编辑器
 
-一个使用 Rust、egui 和系统 WebView 构建的 Windows/macOS Markdown 编辑器。左侧专注写作，右侧使用浏览器引擎实时执行 Markdown 主题 CSS。
+一个使用 Rust 和 egui 构建的原生 Markdown 编辑器。采用 Typora 风格的混合编辑：文档始终可编辑，只有当前段落展开编辑器，其余内容保持排版，界面轻量、安静。
+
+当前架构先稳定 `Core + Worker + Snapshot + Revision Guard`：源码、解析树和文档状态由与界面无关的 Rust core 持有，Markdown 解析与全文搜索在后台 worker 执行，egui 的预览与目录每帧只读取当前不可变快照。旧解析或搜索结果不会覆盖新版本；解析追赶期间仍可编辑。文件打开和 HTML/PDF 导出会在后续阶段迁移到同一 worker 边界，详见 [ADR-0004](docs/adr/0004-core-worker-snapshot-revision.md)。
 
 ## 主要功能
 
-- 多文件标签页，以及写作、阅读、分栏与专注模式
+- 多文件标签页，支持当前段落所见即所得编辑与专注模式
 - CommonMark、表格、脚注、任务列表、围栏代码块和 Mermaid 图表
-- WebView2（Windows）或 WKWebView（macOS）实时预览，忠实执行导入的 CSS 主题
-- 支持导入 `.css`、`.zip` 和 JSON 主题包
-- 内置少数派经典主题，可设置正文字号
+- 原生 egui 混合编辑，目录和段落编辑共用同一份 Markdown 解析结果
+- Enter 自动续写列表标记（有序列表递增序号、任务列表续写为未勾选），空列表项上再按 Enter 退出列表
+- 专注模式（F8）自动置灰当前段落以外的内容
+- 内置“专注写作”主题：素净配色、无装饰，可设置正文字号
 - 围栏代码块右上角显示语言
 - 打开、保存、另存为、外部修改冲突检测和草稿恢复
 - 支持拖入文件打开，并可注册为 `.md`、`.markdown` 的默认应用
@@ -17,7 +20,7 @@
 
 ## 环境要求
 
-- Windows 10/11，运行时需要 [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
+- Windows 10/11
 - macOS 11 或更高版本，支持 Apple Silicon 与 Intel
 - 从源码构建需要稳定版 Rust 工具链
 
@@ -35,15 +38,6 @@ cargo build --release
 ```
 
 构建产物位于 `target/release/markdown-editor.exe`。
-
-长文档解析、预览 HTML、WebView 和完整进程树内存基准：
-
-```powershell
-.\scripts\benchmark-long-docs.ps1
-.\scripts\benchmark-long-docs.ps1 -EnforceBudgets
-```
-
-结果写入 `artifacts/performance/latest.json`，设计和预算说明见 [ADR-0003](docs/adr/0003-long-document-performance-budget.md)。
 
 生成安装版需要 Inno Setup 6：
 
@@ -77,11 +71,12 @@ macOS App 声明支持 `md` 与 `markdown` 文档，可在 Finder 的“显示�
 - `Ctrl+W`：关闭当前标签
 - `Ctrl+Tab`：切换到下一个标签
 - `Ctrl+Shift+Tab`：切换到上一个标签
-- `Ctrl+1`：写作
-- `Ctrl+2`：阅读
-- `Ctrl+3`：分栏
-- `Ctrl+/`：切换写作/阅读
-- `F8`：专注模式
+- `Ctrl+E`：聚焦当前段落（未选择段落时聚焦第一段）
+- 点击其他排版块：切换当前编辑对象，其余内容保持排版
+- `Esc`：收起当前段落编辑区
+- `F8`：专注模式（置灰当前段落以外的内容）
+- `F9`：打字机模式（编辑段落保持在视口中央）
+- `Ctrl+鼠标滚轮`：缩放正文字号
 
 macOS 使用 `⌘` 代替上述快捷键中的 `Ctrl`。
 
