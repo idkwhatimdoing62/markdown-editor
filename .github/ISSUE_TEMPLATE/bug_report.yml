@@ -1,0 +1,69 @@
+name: Bug 报告
+description: 报告一个可复现的问题
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请尽量给出可复现的最小步骤。涉及界面/排版的，附截图会快很多。
+        安全问题请走 SECURITY.md 里的私密通道，不要发在这里。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 应用内「关于」或 Releases 页面上的版本号
+      placeholder: v0.1.39
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: 系统
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS（Apple Silicon）
+        - macOS（Intel）
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 从打开应用开始，一步步写清楚
+      placeholder: |
+        1. 打开一个含表格的 Markdown
+        2. 点第 3 段的表格
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望
+      description: 你预期会发生什么
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际
+      description: 实际发生了什么；有报错或状态栏提示请原样贴出
+    validations:
+      required: true
+  - type: textarea
+    id: document
+    attributes:
+      label: 相关 Markdown 片段
+      description: 能触发问题的最小文档片段（可脱敏）
+      render: markdown
+    validations:
+      required: false
+  - type: input
+    id: scale
+    attributes:
+      label: 文档规模
+      description: 出问题时文档大概多大、多少行（长文档问题必需）
+      placeholder: 约 800 KB，2 万行
+    validations:
+      required: false

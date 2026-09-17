@@ -1,0 +1,35 @@
+name: 功能建议
+description: 提出一个新功能或体验改进
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 先讲场景与痛点，再讲方案。例如「写长文档时 X 让我每次都要多按三次键」
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望的方案
+      description: 界面怎么表现、快捷键是什么、和现有行为如何共存
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你试过的替代做法
+      description: 现在是怎么绕过这个问题的？其他编辑器怎么处理的？
+    validations:
+      required: false
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: 与项目约束的关系
+      description: 这个项目对界面有一组硬基准（见 README 的「视觉基准」）与两条架构约束（ADR-0002 单一解析产物、ADR-0004 revision 守卫）
+      options:
+        - label: 这个建议不涉及间距/对比度/字阶等视觉基准
+          required: false
+        - label: 这个建议不需要重新解析文档或绕过 revision 守卫
+          required: false

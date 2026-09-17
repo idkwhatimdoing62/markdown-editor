@@ -2,6 +2,10 @@
 name = "markdown-editor"
 version = "0.1.39"
 edition = "2024"
+description = "Rust + egui 原生 Markdown 编辑器：Typora 式段落级混合编辑，长文档视口剔除，导出 HTML/PDF"
+license = "MIT"
+repository = "https://github.com/idkwhatimdoing62/markdown-editor"
+readme = "README.md"
 
 [dependencies]
 base64 = "0.22"

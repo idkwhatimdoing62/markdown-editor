@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 下载与安装说明
+    url: https://github.com/idkwhatimdoing62/markdown-editor#下载与安装
+    about: 安装包、系统要求、默认应用设置与常见拦截提示都写在 README 里
+  - name: 安全问题
+    url: https://github.com/idkwhatimdoing62/markdown-editor/security/advisories/new
+    about: 请用私密通道报告安全漏洞，不要开公开 issue
