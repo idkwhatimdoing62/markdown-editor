@@ -2495,10 +2495,12 @@ mod tests {
 
     #[test]
     fn 图片路径支持相对目录和百分号空格() {
-        let base = std::path::Path::new(r"C:\notes");
+        // 断言用平台原生的 base：Windows 上验证盘符绝对路径下的拼接，
+        // Unix 上验证 %20 解码与相对拼接同样成立。
+        let base = std::path::Path::new(if cfg!(windows) { r"C:\notes" } else { "/notes" });
         assert_eq!(
             super::resolve_image_path("assets/my%20image.png", Some(base)),
-            Some(std::path::PathBuf::from(r"C:\notes\assets\my image.png"))
+            Some(base.join("assets").join("my image.png"))
         );
     }
 
