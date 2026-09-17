@@ -1,32 +1,35 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod document_core;
 mod export;
 #[cfg(target_os = "windows")]
 mod file_association;
 mod html_image;
 mod io;
 mod markdown;
+mod parse_worker;
 mod preview;
 mod search;
+mod search_worker;
 mod single_instance;
 mod storage;
 mod theme;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-mod web_preview;
 mod window_close;
 mod window_session;
 
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
+use std::ops::{Deref, DerefMut, Range};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc, mpsc::Receiver};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use document_core::{DocumentState, DocumentStatus, Revision};
 use eframe::egui;
-use egui::containers::scroll_area::ScrollAreaOutput;
-use markdown::{Block, ParsedDocument};
+use markdown::Block;
 use notify::Watcher;
+use parse_worker::{ParseRequest, ParseResult, ParseWorker};
+use search_worker::{SearchRequest, SearchResult, SearchWorker};
 use theme::{ThemePackage, ThemeSpec};
 
 #[cfg(target_os = "macos")]
@@ -35,10 +38,17 @@ const PRIMARY_SHORTCUT: &str = "⌘";
 const PRIMARY_SHORTCUT: &str = "Ctrl";
 
 const EXTERNAL_POLL_INTERVAL: f64 = 0.35;
+// File notifications wake the UI immediately. Keep a one-second fallback for
+// platforms or editors that do not emit a usable notification, while avoiding
+// a 350 ms repaint loop when the workspace is idle.
+const EXTERNAL_FALLBACK_INTERVAL: f64 = 1.0;
 const EXTERNAL_STABLE_DELAY: f64 = 0.45;
+const DRAFT_AUTOSAVE_INTERVAL: f64 = 30.0;
+const DRAFT_AUTOSAVE_RETRY_INTERVAL: f64 = 1.0;
 
 fn main() -> eframe::Result {
     let launch = LaunchOptions::from_env();
+    io::cleanup_stale_window_drafts();
     let restore_previous_window = launch.should_restore_window();
     let instance_requests = if !launch.uses_single_instance() {
         None
@@ -48,7 +58,7 @@ fn main() -> eframe::Result {
             single_instance::Acquisition::Forwarded => return Ok(()),
             single_instance::Acquisition::Unavailable(error) => {
                 rfd::MessageDialog::new()
-                    .set_title("Markdown 编辑器与预览器")
+                    .set_title("Markdown 编辑器")
                     .set_description(&error)
                     .set_level(rfd::MessageLevel::Error)
                     .show();
@@ -61,7 +71,7 @@ fn main() -> eframe::Result {
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([720.0, 480.0])
             .with_icon(app_icon())
-            .with_title("Markdown 编辑器与预览器"),
+            .with_title("Markdown 编辑器"),
         ..Default::default()
     };
     let draft_window_id = launch.force_new_window.then_some(std::process::id());
@@ -74,15 +84,6 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let mut app = MdEditorApp::new(cc, draft_window_id, restore_previous_window);
             app.instance_requests = instance_requests;
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some(report_path) = launch.benchmark_report {
-                app.view_mode = ViewMode::Preview;
-                app.benchmark_probe = Some(BenchmarkProbe {
-                    started: Instant::now(),
-                    report_path,
-                    completed: false,
-                });
-            }
             if let Some(session) = previous_window {
                 app.restore_window_session(session);
             }
@@ -97,8 +98,6 @@ fn main() -> eframe::Result {
 struct LaunchOptions {
     open_paths: Vec<PathBuf>,
     force_new_window: bool,
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    benchmark_report: Option<PathBuf>,
 }
 
 impl LaunchOptions {
@@ -109,17 +108,9 @@ impl LaunchOptions {
     fn from_args(arguments: impl IntoIterator<Item = String>) -> Self {
         let mut open_paths = Vec::new();
         let mut force_new_window = false;
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let mut benchmark_report = None;
-        let mut args = arguments.into_iter();
-        while let Some(argument) = args.next() {
+        for argument in arguments {
             if argument == "--new-window" {
                 force_new_window = true;
-                continue;
-            }
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if argument == "--benchmark-webview-report" {
-                benchmark_report = args.next().map(PathBuf::from);
                 continue;
             }
             if !argument.starts_with('-') {
@@ -137,28 +128,15 @@ impl LaunchOptions {
         Self {
             open_paths,
             force_new_window,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            benchmark_report,
         }
     }
 
     fn uses_single_instance(&self) -> bool {
-        !self.force_new_window && !self.is_benchmark()
+        !self.force_new_window
     }
 
     fn should_restore_window(&self) -> bool {
-        self.open_paths.is_empty() && !self.force_new_window && !self.is_benchmark()
-    }
-
-    fn is_benchmark(&self) -> bool {
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        {
-            self.benchmark_report.is_some()
-        }
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        {
-            false
-        }
+        self.open_paths.is_empty() && !self.force_new_window
     }
 }
 
@@ -174,40 +152,45 @@ fn app_icon() -> Arc<egui::IconData> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum DocStatus {
-    Unsaved,
-    Saved,
-    Modified,
-    Conflict,
-    SaveFailed(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ViewMode {
-    Write,
-    Preview,
-    Split,
-}
+type DocStatus = DocumentStatus;
 
 #[derive(Clone)]
 struct DocumentTab {
     id: u64,
-    text: String,
+    core: DocumentState,
     path: Option<PathBuf>,
     disk_snapshot: Vec<u8>,
-    status: DocStatus,
-    document: ParsedDocument,
-    document_revision: u64,
+    /// Bumped whenever `disk_snapshot` changes, so the dirty check below can be
+    /// cached without comparing the whole document again.
+    snapshot_epoch: u64,
+    /// `(document_revision, snapshot_epoch, conflict, dirty)`.
+    dirty_cache: std::cell::Cell<Option<(Revision, u64, bool, bool)>>,
     status_note: String,
     conflict: Option<PathBuf>,
+    parse_requested_revision: Option<Revision>,
     draft_last_write: f64,
     last_edit_time: f64,
-    prev_editor_ratio: f32,
-    prev_preview_ratio: f32,
-    preview_source_position: f32,
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    last_caret_line: usize,
+    /// Viewport-culling layout cache: rendered height per top-level block
+    /// (`0.0` = never measured). Cleared when width/zoom change.
+    preview_heights: Vec<f32>,
+    preview_height_epoch: Option<(u32, u32)>,
+}
+
+// Keep the migration source-compatible with the existing UI while making the
+// document source/AST/revision a single core-owned value. Field access such as
+// `tab.text` transparently dereferences to `DocumentState`.
+impl Deref for DocumentTab {
+    type Target = DocumentState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
+
+impl DerefMut for DocumentTab {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.core
+    }
 }
 
 struct PendingExternalChange {
@@ -223,10 +206,12 @@ struct ExternalFileWatcher {
 }
 
 impl ExternalFileWatcher {
-    fn new() -> Option<Self> {
+    fn new(ctx: egui::Context) -> Option<Self> {
         let (sender, receiver) = mpsc::channel();
+        let repaint_ctx = ctx.clone();
         let watcher = notify::recommended_watcher(move |result| {
             let _ = sender.send(result);
+            repaint_ctx.request_repaint();
         })
         .ok()?;
         Some(Self {
@@ -264,29 +249,6 @@ impl ExternalFileWatcher {
     }
 }
 
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-struct BenchmarkProbe {
-    started: Instant,
-    report_path: PathBuf,
-    completed: bool,
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-#[derive(Clone, PartialEq, Eq)]
-struct BrowserDocumentKey {
-    tab_id: u64,
-    document_revision: u64,
-    theme_revision: u64,
-    body_font_size_bits: u32,
-    base_directory: Option<PathBuf>,
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-struct BrowserDocumentCache {
-    key: BrowserDocumentKey,
-    document: Arc<web_preview::PreviewDocument>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExternalChangeResult {
     Unchanged,
@@ -303,46 +265,73 @@ enum ExternalProbe {
 
 impl DocumentTab {
     fn blank(id: u64) -> Self {
+        let mut core = DocumentState::from_source(String::new(), 0);
+        core.status = DocStatus::Unsaved;
         Self {
             id,
-            text: String::new(),
+            core,
             path: None,
             disk_snapshot: Vec::new(),
-            status: DocStatus::Unsaved,
-            document: markdown::parse_document(""),
-            document_revision: 0,
+            snapshot_epoch: 0,
+            dirty_cache: std::cell::Cell::new(None),
             status_note: String::new(),
             conflict: None,
+            parse_requested_revision: None,
             draft_last_write: 0.0,
             last_edit_time: f64::INFINITY,
-            prev_editor_ratio: 0.0,
-            prev_preview_ratio: 0.0,
-            preview_source_position: 0.0,
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            last_caret_line: 0,
+            preview_heights: Vec::new(),
+            preview_height_epoch: None,
         }
     }
 
     fn from_file(id: u64, path: PathBuf, text: String, snapshot: Vec<u8>) -> Self {
-        let document = markdown::parse_document(&text);
+        let mut core = DocumentState::from_source(text, 1);
+        core.status = DocStatus::Saved;
         Self {
             id,
-            text,
+            core,
             path: Some(path),
             disk_snapshot: snapshot,
-            status: DocStatus::Saved,
-            document,
-            document_revision: 1,
+            snapshot_epoch: 0,
+            dirty_cache: std::cell::Cell::new(None),
             status_note: String::new(),
             conflict: None,
+            parse_requested_revision: None,
             draft_last_write: 0.0,
             last_edit_time: f64::INFINITY,
-            prev_editor_ratio: 0.0,
-            prev_preview_ratio: 0.0,
-            preview_source_position: 0.0,
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            last_caret_line: 0,
+            preview_heights: Vec::new(),
+            preview_height_epoch: None,
         }
+    }
+
+    /// Whether the tab holds content that is not on disk yet.
+    ///
+    /// The answer is a full byte comparison of the document, and the frame path
+    /// asks for it repeatedly (tab bar, window title, autosave), so it is cached
+    /// until the source revision, the disk snapshot, or the conflict flag
+    /// changes.
+    fn is_dirty(&self) -> bool {
+        let conflict = matches!(self.status, DocStatus::Conflict);
+        let key = (self.document_revision, self.snapshot_epoch, conflict);
+        if let Some((revision, epoch, cached_conflict, dirty)) = self.dirty_cache.get()
+            && (revision, epoch, cached_conflict) == key
+        {
+            return dirty;
+        }
+        let dirty = document_is_dirty(
+            self.path.as_ref(),
+            &self.text,
+            &self.disk_snapshot,
+            &self.status,
+        );
+        self.dirty_cache.set(Some((key.0, key.1, key.2, dirty)));
+        dirty
+    }
+
+    /// Replace the disk snapshot and invalidate the cached dirty state.
+    fn replace_disk_snapshot(&mut self, bytes: Vec<u8>) {
+        self.disk_snapshot = bytes;
+        self.snapshot_epoch = self.snapshot_epoch.wrapping_add(1);
     }
 }
 
@@ -360,7 +349,13 @@ fn document_is_dirty(
 }
 
 fn snapshot_matches_text(snapshot: &[u8], text: &str) -> bool {
-    io::decode_markdown_bytes(snapshot).is_ok_and(|snapshot_text| snapshot_text == text)
+    // Compare as bytes after removing the optional BOM. Decoding a copy of
+    // the whole snapshot (the previous behaviour) allocated the document
+    // size per tab per frame and showed up while typing in long documents.
+    let body = snapshot
+        .strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(snapshot);
+    body.len() == text.len() && body == text.as_bytes()
 }
 
 fn apply_external_bytes(
@@ -372,7 +367,7 @@ fn apply_external_bytes(
     }
     let disk_text = io::decode_markdown_bytes(&bytes)?;
     if disk_text == tab.text {
-        tab.disk_snapshot = bytes;
+        tab.replace_disk_snapshot(bytes);
         tab.status = DocStatus::Saved;
         tab.conflict = None;
         tab.status_note = "已同步外部保存".to_string();
@@ -388,10 +383,10 @@ fn apply_external_bytes(
         return Ok(ExternalChangeResult::Conflict);
     }
 
-    tab.text = disk_text;
-    tab.disk_snapshot = bytes;
-    tab.document = markdown::parse_document(&tab.text);
-    tab.document_revision = tab.document_revision.wrapping_add(1);
+    tab.core.set_source(disk_text);
+    tab.replace_disk_snapshot(bytes);
+    tab.core.reparse_current_source();
+    tab.parse_requested_revision = None;
     tab.status = DocStatus::Saved;
     tab.conflict = None;
     tab.status_note = format!("已自动加载外部修改 {}", clock_time());
@@ -437,24 +432,24 @@ fn restore_draft_tab(draft: io::DraftTab) -> DocumentTab {
             "已恢复未命名草稿".to_string(),
         ),
     };
-    let document = markdown::parse_document(&draft.text);
     DocumentTab {
         id: draft.id,
-        text: draft.text,
+        core: {
+            let mut core = DocumentState::from_source(draft.text, 1);
+            core.status = status;
+            core
+        },
         path: draft.path,
         disk_snapshot,
-        status,
-        document,
-        document_revision: 1,
+        snapshot_epoch: 0,
+        dirty_cache: std::cell::Cell::new(None),
         status_note,
         conflict,
+        parse_requested_revision: None,
         draft_last_write: 0.0,
         last_edit_time: f64::NEG_INFINITY,
-        prev_editor_ratio: 0.0,
-        prev_preview_ratio: 0.0,
-        preview_source_position: 0.0,
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        last_caret_line: 0,
+        preview_heights: Vec::new(),
+        preview_height_epoch: None,
     }
 }
 
@@ -488,9 +483,9 @@ fn shortened_tab_title(title: &str) -> String {
     format!("{head}…{tail}")
 }
 
-const CHROME_FONT_SIZE: f32 = 16.0;
-const CHROME_CONTROL_HEIGHT: f32 = 34.0;
-const CHROME_BAR_HEIGHT: f32 = 40.0;
+const CHROME_FONT_SIZE: f32 = 14.0;
+const CHROME_CONTROL_HEIGHT: f32 = 30.0;
+const CHROME_BAR_HEIGHT: f32 = 36.0;
 
 fn document_tab_button(
     ui: &mut egui::Ui,
@@ -531,14 +526,12 @@ fn document_tab_button(
     let hovered = tab_response.hovered() || close_response.hovered();
 
     if selected {
-        ui.painter()
-            .rect_filled(rect, egui::CornerRadius::same(4), ui.visuals().window_fill);
         ui.painter().line_segment(
             [
                 egui::pos2(rect.left() + 8.0, rect.bottom() - 1.0),
                 egui::pos2(rect.right() - 8.0, rect.bottom() - 1.0),
             ],
-            egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+            egui::Stroke::new(1.0, ui.visuals().strong_text_color()),
         );
     } else if hovered {
         ui.painter().rect_filled(
@@ -613,42 +606,7 @@ fn document_tab_button(
     (tab_response.clicked() && !close_clicked, close_clicked)
 }
 
-fn chrome_nav_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(46.0, CHROME_CONTROL_HEIGHT),
-        egui::Sense::click(),
-    );
-    if response.hovered() {
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(4),
-            ui.visuals().widgets.hovered.weak_bg_fill,
-        );
-    }
-    let color = if selected {
-        ui.visuals().strong_text_color()
-    } else {
-        ui.visuals().widgets.inactive.fg_stroke.color
-    };
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        label,
-        egui::FontId::new(CHROME_FONT_SIZE, egui::FontFamily::Proportional),
-        color,
-    );
-    if selected {
-        ui.painter().line_segment(
-            [
-                egui::pos2(rect.left() + 12.0, rect.bottom() - 1.0),
-                egui::pos2(rect.right() - 12.0, rect.bottom() - 1.0),
-            ],
-            egui::Stroke::new(1.5, ui.visuals().strong_text_color()),
-        );
-    }
-    response
-}
-
+#[cfg(test)]
 fn heading_title(inlines: &[markdown::Inline]) -> String {
     fn append(inlines: &[markdown::Inline], output: &mut String) {
         for inline in inlines {
@@ -671,6 +629,7 @@ fn heading_title(inlines: &[markdown::Inline]) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[cfg(test)]
 fn reading_headings(blocks: &[Block]) -> Vec<(u8, String)> {
     blocks
         .iter()
@@ -682,8 +641,7 @@ fn reading_headings(blocks: &[Block]) -> Vec<(u8, String)> {
         .collect()
 }
 
-fn reading_toc(ui: &mut egui::Ui, blocks: &[Block]) -> Option<usize> {
-    let headings = reading_headings(blocks);
+fn reading_toc(ui: &mut egui::Ui, headings: &[markdown::HeadingInfo]) -> Option<usize> {
     ui.add_space(10.0);
     ui.label(
         egui::RichText::new("章节目录")
@@ -692,8 +650,9 @@ fn reading_toc(ui: &mut egui::Ui, blocks: &[Block]) -> Option<usize> {
             .color(ui.visuals().strong_text_color()),
     );
     ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(5.0);
+    // Keep the table of contents airy; the heading and indentation already
+    // provide enough grouping without a hard divider.
+    ui.add_space(9.0);
 
     if headings.is_empty() {
         ui.label(
@@ -709,20 +668,20 @@ fn reading_toc(ui: &mut egui::Ui, blocks: &[Block]) -> Option<usize> {
         .id_salt("reading_toc_scroll")
         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .show(ui, |ui| {
-            for (index, (level, title)) in headings.iter().enumerate() {
+            for (index, heading) in headings.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.add_space((level.saturating_sub(1) as f32) * 12.0);
+                    ui.add_space((heading.level.saturating_sub(1) as f32) * 12.0);
                     let response = ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new(title)
+                                egui::RichText::new(&heading.text)
                                     .size(13.5)
                                     .color(ui.visuals().text_color()),
                             )
                             .frame(false)
                             .truncate(),
                         )
-                        .on_hover_text(title);
+                        .on_hover_text(&heading.text);
                     if response.clicked() {
                         target = Some(index);
                     }
@@ -734,7 +693,7 @@ fn reading_toc(ui: &mut egui::Ui, blocks: &[Block]) -> Option<usize> {
 
 fn chrome_icon_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(28.0, CHROME_CONTROL_HEIGHT),
+        egui::vec2(26.0, CHROME_CONTROL_HEIGHT),
         egui::Sense::click(),
     );
     if response.hovered() {
@@ -764,20 +723,28 @@ struct MdEditorApp {
     search_results: search::SearchResults,
     search_tab_id: Option<u64>,
     search_document_revision: u64,
+    search_generation: u64,
+    search_pending: Option<(u64, Revision, u64)>,
     search_focus_requested: bool,
     search_scroll_requested: bool,
     search_backwards: bool,
+    /// The search input has keyboard focus this frame. While it does, search
+    /// hits must not move the edit block: egui focus is last-wins, so a
+    /// request_focus from the block editor would steal the query keystrokes.
+    search_input_has_focus: bool,
     pending_close: Option<usize>,
     window_close_guard: window_close::CloseGuard,
     recovery: Option<io::DraftSession>,
     dark: bool,
-    editor_focused: bool,
-    view_mode: ViewMode,
     focus_mode: bool,
+    typewriter_mode: bool,
+    active_edit_block: Option<usize>,
+    active_edit_range: Option<Range<usize>>,
+    pending_edit_cursor: Option<usize>,
+    edit_focus_requested: bool,
     show_status: bool,
     body_font_size: f32,
     theme_package: Option<ThemePackage>,
-    theme_revision: u64,
     auto_reload_external: bool,
     last_external_poll: f64,
     external_watcher: Option<ExternalFileWatcher>,
@@ -787,13 +754,23 @@ struct MdEditorApp {
     draft_window_id: Option<u32>,
     persisted_window_session: Option<window_session::WindowSession>,
     window_session_initialized: bool,
-    pending_preview_restore: Option<(u64, f32)>,
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    browser_preview: web_preview::BrowserPreview,
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    benchmark_probe: Option<BenchmarkProbe>,
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    browser_document_cache: Option<BrowserDocumentCache>,
+    image_cache: preview::ImageCache,
+    parse_worker: ParseWorker,
+    search_worker: SearchWorker,
+    /// Status-bar character/line totals, keyed by tab and revision. Recomputed
+    /// only after an edit — the status bar repaints at least once per second
+    /// through the external-poll timer and must not rescan 10 MB each frame.
+    text_stats_cache: Option<(u64, Revision, usize, usize)>,
+    /// Signature of the draft session written last, so an idle but dirty tab
+    /// does not rewrite the same file every autosave interval.
+    last_draft_signature: Option<Vec<(u64, Revision, u64)>>,
+    /// Current search hit converted to byte offsets, keyed by tab, revision and
+    /// hit. The character→byte walk is linear in the document and must not run
+    /// on every frame while the search panel is open.
+    search_byte_cache: Option<(u64, Revision, Range<usize>, Range<usize>)>,
+    /// Last title sent to the viewport; used to avoid spamming
+    /// `ViewportCommand::Title` every frame.
+    last_window_title: Option<String>,
 }
 
 impl std::ops::Deref for MdEditorApp {
@@ -818,7 +795,7 @@ impl MdEditorApp {
     ) -> Self {
         setup_fonts(&cc.egui_ctx);
         let theme_package = theme::load_saved();
-        let built_in_theme = ThemePackage::built_in_sspai();
+        let built_in_theme = ThemePackage::built_in_focused();
         let initial_body_font_size = theme_package
             .as_ref()
             .map(ThemePackage::recommended_body_font_size)
@@ -841,36 +818,152 @@ impl MdEditorApp {
             search_results: search::SearchResults::default(),
             search_tab_id: None,
             search_document_revision: 0,
+            search_generation: 0,
+            search_pending: None,
             search_focus_requested: false,
             search_scroll_requested: false,
             search_backwards: false,
+            search_input_has_focus: false,
             pending_close: None,
             window_close_guard: window_close::CloseGuard::default(),
             recovery,
             dark: false,
-            editor_focused: false,
-            view_mode: ViewMode::Write,
             focus_mode: false,
+            typewriter_mode: false,
+            active_edit_block: None,
+            active_edit_range: None,
+            pending_edit_cursor: None,
+            edit_focus_requested: false,
             show_status: true,
             body_font_size: initial_body_font_size,
             theme_package,
-            theme_revision: 1,
             auto_reload_external: true,
             last_external_poll: f64::NEG_INFINITY,
-            external_watcher: ExternalFileWatcher::new(),
+            external_watcher: ExternalFileWatcher::new(cc.egui_ctx.clone()),
             observed_file_stamps: HashMap::new(),
             pending_external_changes: HashMap::new(),
             instance_requests: None,
             draft_window_id,
             persisted_window_session: None,
             window_session_initialized: false,
-            pending_preview_restore: None,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            browser_preview: web_preview::BrowserPreview::default(),
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            benchmark_probe: None,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            browser_document_cache: None,
+            image_cache: preview::ImageCache::default(),
+            parse_worker: ParseWorker::new(),
+            search_worker: SearchWorker::new(),
+            text_stats_cache: None,
+            last_draft_signature: None,
+            search_byte_cache: None,
+            last_window_title: None,
+        }
+    }
+
+    /// Queue parsing for one source revision without ever blocking the UI
+    /// thread. The worker owns its immutable `Arc<str>` input and returns an
+    /// immutable AST tagged with the same revision.
+    fn submit_parse_for_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if tab.is_parsed_current() {
+            tab.parse_requested_revision = None;
+            return;
+        }
+        let revision = tab.document_revision;
+        if tab.parse_requested_revision == Some(revision) {
+            return;
+        }
+        let request = ParseRequest {
+            tab_id: tab.id,
+            revision,
+            // The source is cloned once at the hand-off boundary. The UI no
+            // longer shares a mutable String with the worker.
+            source: Arc::from(tab.text.as_str()),
+        };
+        tab.parse_requested_revision = Some(revision);
+        let request_id = request.tab_id;
+        let request_revision = request.revision;
+        if self.parse_worker.submit(request).is_err() {
+            // The worker is gone (spawn failed or it panicked). Fall back to
+            // a synchronous parse so the tab converges; keeping the revision
+            // marked as pending would spin the 16 ms repaint forever.
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == request_id)
+                && tab.parse_requested_revision == Some(request_revision)
+            {
+                tab.parse_requested_revision = None;
+                tab.core.reparse_current_source();
+            }
+            self.status_note = "Markdown 后台解析不可用，已改用同步解析".to_string();
+        }
+    }
+
+    /// Mark a source mutation exactly once and enqueue its revision. Keeping
+    /// this transition in one place prevents a frame-level change detector
+    /// from incrementing the revision repeatedly while parsing is pending.
+    fn mark_tab_source_changed(&mut self, index: usize, now: f64) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.core.mark_source_changed();
+            tab.parse_requested_revision = None;
+            tab.last_edit_time = now;
+        }
+        if index == self.active_tab {
+            self.refresh_status();
+        }
+        self.submit_parse_for_tab(index);
+    }
+
+    /// Install only results that still describe the current tab revision.
+    /// Results for closed tabs, old revisions, or mismatched source text are
+    /// intentionally discarded.
+    fn apply_parse_result(&mut self, result: ParseResult) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == result.tab_id) else {
+            return false;
+        };
+        let tab = &mut self.tabs[index];
+        if result.revision != tab.document_revision {
+            return false;
+        }
+        if !tab.core.install_parsed(result.revision, result.document) {
+            return false;
+        }
+        tab.parse_requested_revision = None;
+        true
+    }
+
+    fn poll_parse_results(&mut self, ctx: &egui::Context) {
+        let (results, disconnected) = self.parse_worker.drain();
+        if !results.is_empty() {
+            for result in results {
+                self.apply_parse_result(result);
+            }
+            ctx.request_repaint();
+        }
+        if disconnected {
+            self.recover_parse_worker();
+            ctx.request_repaint();
+        }
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.parse_requested_revision.is_some())
+        {
+            // Keep polling while a worker result is outstanding, but do not
+            // run a permanent repaint loop once all tabs are settled.
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    /// The parse worker died (panic or closed mailbox). Resolve every
+    /// outstanding request with a synchronous parse so no tab keeps a pending
+    /// revision — otherwise the repaint keep-alive above would spin forever.
+    fn recover_parse_worker(&mut self) {
+        let mut recovered = false;
+        for tab in &mut self.tabs {
+            if tab.parse_requested_revision.take().is_some() || !tab.is_parsed_current() {
+                tab.core.reparse_current_source();
+                recovered = true;
+            }
+        }
+        if recovered {
+            self.status_note = "Markdown 后台解析线程已退出，本次已同步完成解析".to_string();
         }
     }
 
@@ -878,14 +971,11 @@ impl MdEditorApp {
         if index >= self.tabs.len() {
             return;
         }
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        if let Some(source_position) = self.browser_preview.source_position() {
-            self.tabs[self.active_tab].preview_source_position = source_position;
-        }
-        let tab = &self.tabs[index];
-        self.pending_preview_restore = Some((tab.id, tab.preview_source_position));
         self.active_tab = index;
-        self.editor_focused = false;
+        self.active_edit_block = None;
+        self.active_edit_range = None;
+        self.pending_edit_cursor = None;
+        self.edit_focus_requested = false;
     }
 
     fn switch_tab(&mut self, index: usize) {
@@ -919,13 +1009,15 @@ impl MdEditorApp {
     fn new_tab(&mut self) {
         if self.workspace_empty {
             self.workspace_empty = false;
-            self.view_mode = ViewMode::Write;
-            self.editor_focused = true;
+            self.active_edit_block = None;
+            self.active_edit_range = None;
+            self.edit_focus_requested = true;
             return;
         }
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.push_tab(DocumentTab::blank(id));
+        self.edit_focus_requested = true;
     }
 
     fn has_open_document(&self) -> bool {
@@ -953,19 +1045,104 @@ impl MdEditorApp {
         self.search_open = false;
         self.search_focus_requested = false;
         self.search_scroll_requested = false;
+        self.search_pending = None;
     }
 
     fn refresh_search(&mut self) {
         if !self.has_open_document() {
             self.search_results = search::SearchResults::default();
             self.search_tab_id = None;
+            self.search_pending = None;
             return;
         }
-        self.search_results = search::SearchResults::new(&self.text, &self.search_query);
-        self.search_tab_id = Some(self.id);
-        self.search_document_revision = self.document_revision;
-        self.search_scroll_requested = self.search_open;
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        let tab_id = self.id;
+        let revision = self.document_revision;
+        self.search_tab_id = Some(tab_id);
+        self.search_document_revision = revision;
+        self.search_scroll_requested = false;
         self.search_backwards = false;
+        self.search_results = search::SearchResults::default();
+        if self.search_query.is_empty() {
+            self.search_pending = None;
+            return;
+        }
+
+        self.search_pending = Some((tab_id, revision, generation));
+        let request = SearchRequest {
+            tab_id,
+            revision,
+            generation,
+            source: Arc::from(self.text.as_str()),
+            query: self.search_query.clone(),
+        };
+        if self.search_worker.submit(request).is_err() {
+            // Worker unavailable: search synchronously instead of leaving a
+            // pending request that would keep the repaint loop alive.
+            let results = search::SearchResults::new(&self.text, &self.search_query);
+            self.search_results = results;
+            self.search_pending = None;
+            self.search_scroll_requested = true;
+            self.status_note = "全文搜索后台任务不可用，已改用同步搜索".to_string();
+        }
+    }
+
+    fn apply_search_result(&mut self, result: SearchResult) -> bool {
+        if !self.search_open
+            || result.tab_id != self.id
+            || result.revision != self.document_revision
+            || result.generation != self.search_generation
+            || self.search_pending != Some((result.tab_id, result.revision, result.generation))
+        {
+            return false;
+        }
+        self.search_results = result.results;
+        self.search_pending = None;
+        self.search_scroll_requested = true;
+        true
+    }
+
+    /// Byte offsets of the current search hit in the active document.
+    ///
+    /// Search results use character offsets while parser ranges use bytes; the
+    /// conversion walks the text, so the answer is cached per tab, revision and
+    /// hit instead of being recomputed on every frame.
+    fn search_byte_range(&mut self) -> Option<Range<usize>> {
+        let char_range = self.search_results.current_range()?;
+        let tab_id = self.id;
+        let revision = self.document_revision;
+        if let Some((cached_tab, cached_revision, cached_chars, bytes)) = &self.search_byte_cache
+            && *cached_tab == tab_id
+            && *cached_revision == revision
+            && *cached_chars == char_range
+        {
+            return Some(bytes.clone());
+        }
+        let bytes = preview::byte_range_for_chars(&self.text, &char_range);
+        self.search_byte_cache = Some((tab_id, revision, char_range, bytes.clone()));
+        Some(bytes)
+    }
+
+    fn poll_search_results(&mut self, ctx: &egui::Context) {
+        let (results, disconnected) = self.search_worker.drain();
+        let mut applied = false;
+        for result in results {
+            applied |= self.apply_search_result(result);
+        }
+        if disconnected && self.search_pending.take().is_some() && self.search_open {
+            // The worker died with a request outstanding: compute the answer
+            // synchronously so the 16 ms repaint keep-alive stops.
+            let results = search::SearchResults::new(&self.text, &self.search_query);
+            self.search_results = results;
+            applied = true;
+        }
+        if applied {
+            ctx.request_repaint();
+        }
+        if self.search_pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 
     fn refresh_search_if_needed(&mut self) {
@@ -975,16 +1152,6 @@ impl MdEditorApp {
         {
             self.refresh_search();
         }
-    }
-
-    fn preview_search_has_match(&self) -> bool {
-        self.search_query.is_empty()
-            || !search::SearchResults::new(
-                &markdown::plain_text(self.document.blocks()),
-                &self.search_query,
-            )
-            .ranges()
-            .is_empty()
     }
 
     fn search_next(&mut self) {
@@ -1002,22 +1169,11 @@ impl MdEditorApp {
     }
 
     fn is_active_dirty(&self) -> bool {
-        document_is_dirty(
-            self.path.as_ref(),
-            &self.text,
-            &self.disk_snapshot,
-            &self.status,
-        )
+        self.tabs[self.active_tab].is_dirty()
     }
 
     fn is_tab_dirty(&self, index: usize) -> bool {
-        let tab = &self.tabs[index];
-        document_is_dirty(
-            tab.path.as_ref(),
-            &tab.text,
-            &tab.disk_snapshot,
-            &tab.status,
-        )
+        self.tabs[index].is_dirty()
     }
 
     fn tab_title(&self, index: usize) -> String {
@@ -1101,6 +1257,10 @@ impl MdEditorApp {
         }
         let old_active = self.active_tab;
         let removed_path = self.tabs[index].path.clone();
+        let removed_tab_id = self.tabs[index].id;
+        self.parse_worker.cancel_tab(removed_tab_id);
+        self.search_worker.cancel_tab(removed_tab_id);
+        self.image_cache.clear();
         self.tabs.remove(index);
         if let Some(path) = removed_path {
             self.unwatch_external_path(&path);
@@ -1111,10 +1271,8 @@ impl MdEditorApp {
             self.next_tab_id += 1;
             self.tabs.push(DocumentTab::blank(id));
             self.active_tab = 0;
-            self.editor_focused = false;
             self.workspace_empty = true;
             self.focus_mode = false;
-            self.pending_preview_restore = None;
             self.close_search();
         } else {
             let new_active = if index < old_active {
@@ -1142,7 +1300,7 @@ impl MdEditorApp {
         self.theme_package
             .as_ref()
             .and_then(|t| t.spec(self.dark).ok())
-            .or_else(|| ThemePackage::built_in_sspai().spec(self.dark).ok())
+            .or_else(|| ThemePackage::built_in_focused().spec(self.dark).ok())
             .unwrap_or_else(|| ThemeSpec::fallback(self.dark))
     }
 
@@ -1150,119 +1308,11 @@ impl MdEditorApp {
         apply_visuals(ctx, self.dark, &self.theme_spec());
     }
 
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn browser_document(&mut self) -> Arc<web_preview::PreviewDocument> {
-        let base_directory = self
-            .path
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map(Path::to_path_buf);
-        let key = BrowserDocumentKey {
-            tab_id: self.tabs.get(self.active_tab).map_or(0, |tab| tab.id),
-            document_revision: self.document_revision,
-            theme_revision: self.theme_revision,
-            body_font_size_bits: self.body_font_size.to_bits(),
-            base_directory: base_directory.clone(),
-        };
-        if let Some(cache) = &self.browser_document_cache
-            && cache.key == key
-        {
-            return Arc::clone(&cache.document);
-        }
-
-        let built_in = ThemePackage::built_in_sspai();
-        let package = self.theme_package.as_ref().unwrap_or(&built_in);
-        let css = package.browser_css().unwrap_or(theme::BUILT_IN_SSPAI_CSS);
-        let default_size = package.recommended_body_font_size();
-        let font_override =
-            ((self.body_font_size - default_size).abs() > 0.01).then_some(self.body_font_size);
-        let document = Arc::new(web_preview::preview_document(
-            &self.document,
-            css,
-            base_directory.as_deref(),
-            font_override,
-        ));
-        self.browser_document_cache = Some(BrowserDocumentCache {
-            key,
-            document: Arc::clone(&document),
-        });
-        document
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn finish_benchmark_probe(&mut self, ready: web_preview::WebViewReady) {
-        let source_bytes = self.text.len();
-        let block_count = self.document.blocks().len();
-        let event_count = self.document.events().len();
-        let Some(probe) = &mut self.benchmark_probe else {
-            return;
-        };
-        if probe.completed {
-            return;
-        }
-        let report = serde_json::json!({
-            "schema_version": 1,
-            "pid": std::process::id(),
-            "source_bytes": source_bytes,
-            "blocks": block_count,
-            "events": event_count,
-            "startup_to_webview_ready_ms": probe.started.elapsed().as_secs_f64() * 1000.0,
-            "content_height_css_px": ready.content_height,
-            "viewport_height_css_px": ready.viewport_height,
-            "dom_element_count": ready.element_count,
-            "error": ready.error,
-        });
-        let result = (|| -> Result<(), String> {
-            if let Some(parent) = probe.report_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-            }
-            let json = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
-            std::fs::write(&probe.report_path, json).map_err(|error| error.to_string())
-        })();
-        probe.completed = result.is_ok();
-        self.status_note = match result {
-            Ok(()) => format!("WebView 基准完成：{}", probe.report_path.display()),
-            Err(error) => format!("WebView 基准写入失败：{error}"),
-        };
-    }
-
-    fn import_theme(&mut self, ctx: &egui::Context) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Theme Package", &["json", "css", "zip"])
-            .pick_file()
-        else {
-            return;
-        };
-        let result = ThemePackage::from_file(&path).and_then(|package| {
-            theme::save_imported(&package)?;
-            Ok(package)
-        });
-        match result {
-            Ok(package) => {
-                let name = package.name.clone();
-                self.body_font_size = package.recommended_body_font_size();
-                self.theme_package = Some(package);
-                self.theme_revision = self.theme_revision.wrapping_add(1);
-                self.apply_current_theme(ctx);
-                self.status_note = format!("已加载主题：{name}");
-            }
-            Err(e) => self.status = DocStatus::SaveFailed(e),
-        }
-    }
-
-    fn remove_theme(&mut self, ctx: &egui::Context) {
-        self.theme_package = None;
-        self.theme_revision = self.theme_revision.wrapping_add(1);
-        self.body_font_size = ThemePackage::built_in_sspai().recommended_body_font_size();
-        theme::clear_saved();
-        self.apply_current_theme(ctx);
-        self.status_note = "已移除外部主题，恢复少数派经典".to_string();
-    }
-
     fn refresh_status(&mut self) {
         self.status = match &self.path {
             Some(_) => {
-                if self.disk_snapshot.as_slice() == self.text.as_bytes() {
+                // BOM-aware comparison, consistent with `document_is_dirty`.
+                if snapshot_matches_text(&self.disk_snapshot, &self.text) {
                     DocStatus::Saved
                 } else {
                     DocStatus::Modified
@@ -1278,37 +1328,42 @@ impl MdEditorApp {
         };
     }
 
+    /// Inspect one tab's on-disk file without cloning its snapshot. The tab is
+    /// read through an immutable borrow while the bookkeeping maps are mutated
+    /// separately, so polling a 10 MB document no longer copies the snapshot
+    /// once per tab every frame.
     fn probe_external_change(
-        &mut self,
+        observed_file_stamps: &mut HashMap<PathBuf, io::FileStamp>,
+        pending_external_changes: &mut HashMap<PathBuf, PendingExternalChange>,
+        tabs: &[DocumentTab],
+        tab_index: usize,
         path: &Path,
-        snapshot: &[u8],
         now: f64,
         force_read: bool,
     ) -> ExternalProbe {
+        let snapshot: &[u8] = &tabs[tab_index].disk_snapshot;
         let stamp = match io::file_stamp(path) {
             Ok(stamp) => stamp,
             Err(error) => {
-                self.observed_file_stamps.remove(path);
-                self.pending_external_changes.remove(path);
+                observed_file_stamps.remove(path);
+                pending_external_changes.remove(path);
                 return ExternalProbe::Missing(describe_read_error(&error));
             }
         };
 
-        let stamp_changed = self.observed_file_stamps.get(path) != Some(&stamp);
+        let stamp_changed = observed_file_stamps.get(path) != Some(&stamp);
         if stamp_changed || force_read {
-            self.observed_file_stamps
-                .insert(path.to_path_buf(), stamp.clone());
+            observed_file_stamps.insert(path.to_path_buf(), stamp.clone());
             match io::read_snapshot_checked(path) {
                 Ok(bytes) if bytes.as_slice() == snapshot => {
-                    self.pending_external_changes.remove(path);
+                    pending_external_changes.remove(path);
                 }
                 Ok(bytes) => {
-                    let changed = self
-                        .pending_external_changes
+                    let changed = pending_external_changes
                         .get(path)
                         .is_none_or(|pending| pending.stamp != stamp || pending.bytes != bytes);
                     if changed {
-                        self.pending_external_changes.insert(
+                        pending_external_changes.insert(
                             path.to_path_buf(),
                             PendingExternalChange {
                                 stamp,
@@ -1323,13 +1378,10 @@ impl MdEditorApp {
             return ExternalProbe::Waiting;
         }
 
-        let is_stable = self
-            .pending_external_changes
-            .get(path)
-            .is_some_and(|pending| {
-                pending.stamp == stamp && now - pending.first_seen >= EXTERNAL_STABLE_DELAY
-            });
-        if is_stable && let Some(pending) = self.pending_external_changes.remove(path) {
+        let is_stable = pending_external_changes.get(path).is_some_and(|pending| {
+            pending.stamp == stamp && now - pending.first_seen >= EXTERNAL_STABLE_DELAY
+        });
+        if is_stable && let Some(pending) = pending_external_changes.remove(path) {
             return ExternalProbe::Stable(pending.bytes);
         }
         ExternalProbe::Waiting
@@ -1339,13 +1391,31 @@ impl MdEditorApp {
         if !self.auto_reload_external {
             return;
         }
-        ctx.request_repaint_after(Duration::from_secs_f64(EXTERNAL_POLL_INTERVAL));
         let changed_paths = self
             .external_watcher
             .as_ref()
             .map(ExternalFileWatcher::drain_changed_paths)
             .unwrap_or_default();
-        if now - self.last_external_poll < EXTERNAL_POLL_INTERVAL && changed_paths.is_empty() {
+        // Without a file-backed tab there is nothing to re-read, so no timer is
+        // scheduled: an idle untitled window stays asleep instead of waking up
+        // several times a second.
+        if !self.tabs.iter().any(|tab| tab.path.is_some()) && changed_paths.is_empty() {
+            return;
+        }
+        let has_watched_paths = self
+            .external_watcher
+            .as_ref()
+            .is_some_and(|watcher| !watcher.watched.is_empty());
+        let poll_interval = if has_watched_paths
+            && changed_paths.is_empty()
+            && self.pending_external_changes.is_empty()
+        {
+            EXTERNAL_FALLBACK_INTERVAL
+        } else {
+            EXTERNAL_POLL_INTERVAL
+        };
+        ctx.request_repaint_after(Duration::from_secs_f64(poll_interval));
+        if now - self.last_external_poll < poll_interval && changed_paths.is_empty() {
             return;
         }
         self.last_external_poll = now;
@@ -1353,12 +1423,26 @@ impl MdEditorApp {
 
         let active_path = self.path.clone();
         if let Some(path) = active_path {
-            let snapshot = self.disk_snapshot.clone();
-            match self.probe_external_change(&path, &snapshot, now, changed_paths.contains(&path)) {
+            let active_index = self.active_tab;
+            let force_read = changed_paths.contains(&path);
+            match Self::probe_external_change(
+                &mut self.observed_file_stamps,
+                &mut self.pending_external_changes,
+                &self.tabs,
+                active_index,
+                &path,
+                now,
+                force_read,
+            ) {
                 ExternalProbe::Stable(bytes) => {
-                    let active_index = self.active_tab;
                     match apply_external_bytes(&mut self.tabs[active_index], bytes) {
                         Ok(ExternalChangeResult::Unchanged) => {}
+                        Ok(ExternalChangeResult::Reloaded) => {
+                            self.active_edit_block = None;
+                            self.active_edit_range = None;
+                            self.edit_focus_requested = false;
+                            draft_state_changed = true;
+                        }
                         Ok(_) => draft_state_changed = true,
                         Err(error) => {
                             self.status_note = format!(
@@ -1385,8 +1469,16 @@ impl MdEditorApp {
             let Some(path) = self.tabs[index].path.clone() else {
                 continue;
             };
-            let snapshot = self.tabs[index].disk_snapshot.clone();
-            match self.probe_external_change(&path, &snapshot, now, changed_paths.contains(&path)) {
+            let force_read = changed_paths.contains(&path);
+            match Self::probe_external_change(
+                &mut self.observed_file_stamps,
+                &mut self.pending_external_changes,
+                &self.tabs,
+                index,
+                &path,
+                now,
+                force_read,
+            ) {
                 ExternalProbe::Stable(bytes) => {
                     match apply_external_bytes(&mut self.tabs[index], bytes) {
                         Ok(ExternalChangeResult::Unchanged) => {}
@@ -1410,18 +1502,34 @@ impl MdEditorApp {
         }
     }
 
+    /// Tabs that hold content worth persisting as a draft, in tab order.
+    fn draft_candidates(&self) -> Vec<usize> {
+        self.tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, tab)| {
+                (tab.is_dirty() && (!tab.text.is_empty() || tab.path.is_some())).then_some(index)
+            })
+            .collect()
+    }
+
+    /// Identity of the current draft contents. Re-writing the session when this
+    /// is unchanged would serialize the same documents again for nothing.
+    fn draft_signature(&self, candidates: &[usize]) -> Vec<(u64, Revision, u64)> {
+        candidates
+            .iter()
+            .map(|&index| {
+                let tab = &self.tabs[index];
+                (tab.id, tab.document_revision, tab.snapshot_epoch)
+            })
+            .collect()
+    }
+
     fn draft_session(&self) -> Option<io::DraftSession> {
         let drafts = self
             .tabs
             .iter()
-            .filter(|tab| {
-                document_is_dirty(
-                    tab.path.as_ref(),
-                    &tab.text,
-                    &tab.disk_snapshot,
-                    &tab.status,
-                ) && (!tab.text.is_empty() || tab.path.is_some())
-            })
+            .filter(|tab| tab.is_dirty() && (!tab.text.is_empty() || tab.path.is_some()))
             .map(|tab| {
                 io::DraftTab::new(
                     tab.id,
@@ -1462,11 +1570,6 @@ impl MdEditorApp {
         if self.draft_window_id.is_some() {
             return;
         }
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        if self.benchmark_probe.is_some() {
-            return;
-        }
-
         let current = self.window_session();
         if self.window_session_initialized && current == self.persisted_window_session {
             return;
@@ -1487,54 +1590,61 @@ impl MdEditorApp {
         }
     }
 
-    fn persist_draft_session(&self) -> std::io::Result<()> {
-        if let Some(session) = self.draft_session() {
+    fn persist_draft_session(&mut self) -> std::io::Result<()> {
+        let signature = self.draft_signature(&self.draft_candidates());
+        let result = if let Some(session) = self.draft_session() {
             io::save_draft_for_window(self.draft_window_id, &session)
         } else {
             io::clear_draft_for_window(self.draft_window_id);
             Ok(())
+        };
+        if result.is_ok() {
+            self.last_draft_signature = Some(signature);
         }
+        result
     }
 
-    fn autosave_draft(&mut self, now: f64) {
-        let dirty_indices = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, tab)| {
-                (document_is_dirty(
-                    tab.path.as_ref(),
-                    &tab.text,
-                    &tab.disk_snapshot,
-                    &tab.status,
-                ) && (!tab.text.is_empty() || tab.path.is_some()))
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
-        if dirty_indices.is_empty() {
+    fn autosave_draft(&mut self, ctx: &egui::Context, now: f64) {
+        let candidates = self.draft_candidates();
+        if candidates.is_empty() {
+            self.last_draft_signature = None;
             return;
         }
-        let all_idle = dirty_indices.iter().all(|&index| {
-            let edited = self.tabs[index].last_edit_time;
-            edited == f64::NEG_INFINITY || (edited.is_finite() && now - edited > 30.0)
-        });
-        let write_due = dirty_indices
+        let signature = self.draft_signature(&candidates);
+        if self.last_draft_signature.as_ref() == Some(&signature) {
+            // Nothing changed since the last successful write, so rewriting the
+            // session would serialize the same documents again and no timer has
+            // to be scheduled to keep doing it.
+            return;
+        }
+        let idle_at = candidates
             .iter()
-            .any(|&index| now - self.tabs[index].draft_last_write > 30.0);
-        if all_idle
-            && write_due
+            .map(|&index| self.tabs[index].last_edit_time + DRAFT_AUTOSAVE_INTERVAL)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let write_at = candidates
+            .iter()
+            .map(|&index| self.tabs[index].draft_last_write + DRAFT_AUTOSAVE_INTERVAL)
+            .fold(f64::INFINITY, f64::min);
+        let mut next_save_at = idle_at.max(write_at);
+        if now >= next_save_at
             && let Some(session) = self.draft_session()
         {
             match io::save_draft_for_window(self.draft_window_id, &session) {
                 Ok(()) => {
-                    for index in dirty_indices {
+                    self.last_draft_signature = Some(signature);
+                    for index in candidates {
                         self.tabs[index].draft_last_write = now;
                     }
+                    next_save_at = now + DRAFT_AUTOSAVE_INTERVAL;
                 }
                 Err(error) => {
                     self.status_note = format!("草稿会话保存失败：{error}");
+                    next_save_at = now + DRAFT_AUTOSAVE_RETRY_INTERVAL;
                 }
             }
+        }
+        if next_save_at.is_finite() {
+            ctx.request_repaint_after(Duration::from_secs_f64((next_save_at - now).max(0.01)));
         }
     }
 
@@ -1568,6 +1678,12 @@ impl MdEditorApp {
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             self.close_search();
+        } else if self.active_edit_block.is_some()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.active_edit_block = None;
+            self.active_edit_range = None;
+            self.edit_focus_requested = false;
         }
         if has_open_document && ctx.input_mut(|i| i.consume_shortcut(&save)) {
             self.save();
@@ -1592,25 +1708,73 @@ impl MdEditorApp {
         {
             self.switch_tab((self.active_tab + 1) % self.tabs.len());
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Slash)) {
-            self.view_mode = if self.view_mode == ViewMode::Preview {
-                ViewMode::Write
-            } else {
-                ViewMode::Preview
-            };
+        // `COMMAND` is the cross-platform Ctrl/Cmd alias. Keep an explicit
+        // Ctrl fallback as well: some Windows input backends expose only the
+        // physical `ctrl` modifier, which otherwise makes the advertised
+        // Ctrl+E shortcut appear to do nothing.
+        let edit_shortcut = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::E)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::E)
+        });
+        if has_open_document && edit_shortcut {
+            self.active_edit_block = Some(self.active_edit_block.unwrap_or(0));
+            self.edit_focus_requested = true;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F8)) {
             self.focus_mode = !self.focus_mode;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num1)) {
-            self.view_mode = ViewMode::Write;
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F9)) {
+            self.typewriter_mode = !self.typewriter_mode;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num2)) {
-            self.view_mode = ViewMode::Preview;
+        // Font-size zoom mirrors the browser convention: Ctrl/Cmd +"-" grows
+        // or shrinks the body text and Ctrl/Cmd+0 restores the theme default.
+        // Numpad Plus and the shifted `+`/`_` glyphs are accepted too so the
+        // shortcut works without hunting for a specific physical key.
+        let zoom_in = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Plus)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Equals)
+        });
+        let zoom_out = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Minus)
+        });
+        let zoom_reset = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::Num0)
+        });
+        if zoom_in {
+            self.body_font_size = (self.body_font_size + 0.5).min(22.0);
+        } else if zoom_out {
+            self.body_font_size = (self.body_font_size - 0.5).max(12.0);
+        } else if zoom_reset {
+            self.body_font_size = self.default_body_font_size();
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num3)) {
-            self.view_mode = ViewMode::Split;
+        // Browser/Typora convention: Ctrl+滚轮 also zooms the body text. The
+        // wheel delta is consumed so the document does not scroll while
+        // zooming.
+        let wheel_zoom = ctx.input_mut(|input| {
+            let delta = input.smooth_scroll_delta.y;
+            if input.modifiers.command && delta != 0.0 {
+                input.smooth_scroll_delta = egui::Vec2::ZERO;
+                Some((delta / 24.0).clamp(-1.0, 1.0))
+            } else {
+                None
+            }
+        });
+        if let Some(delta) = wheel_zoom {
+            self.body_font_size = (self.body_font_size + delta * 1.0).clamp(12.0, 22.0);
         }
+    }
+
+    /// The body font size the current theme recommends, used as the zoom
+    /// baseline and by “reset default size”.
+    fn default_body_font_size(&self) -> f32 {
+        self.theme_package.as_ref().map_or_else(
+            || ThemePackage::built_in_focused().recommended_body_font_size(),
+            |package| package.recommended_body_font_size(),
+        )
     }
 
     fn open_new_window(&mut self) {
@@ -1646,8 +1810,7 @@ impl MdEditorApp {
         let mut opened = 0usize;
         let mut ignored = 0usize;
         for path in paths {
-            if path.is_file() && has_supported_text_extension(&path) {
-                self.open_path(&path);
+            if path.is_file() && has_supported_text_extension(&path) && self.open_path(&path) {
                 opened += 1;
             } else {
                 ignored += 1;
@@ -1686,19 +1849,20 @@ impl MdEditorApp {
         }
     }
 
-    fn open_path(&mut self, path: &PathBuf) {
+    fn open_path(&mut self, path: &PathBuf) -> bool {
         if let Some(index) = self
             .tabs
             .iter()
             .position(|tab| tab.path.as_ref() == Some(path))
         {
             self.activate_tab(index);
+            self.active_edit_block = Some(0);
+            self.edit_focus_requested = true;
             self.status_note = format!("已切换到 {}", path.display());
-            return;
+            return true;
         }
-        match io::read_markdown(path) {
-            Ok(text) => {
-                let snapshot = io::read_snapshot(path).unwrap_or_default();
+        match io::read_markdown_snapshot(path) {
+            Ok((text, snapshot)) => {
                 let replace_blank = self.tabs.len() == 1
                     && self.tabs[0].path.is_none()
                     && self.tabs[0].text.is_empty()
@@ -1715,11 +1879,18 @@ impl MdEditorApp {
                     self.push_tab(DocumentTab::from_file(id, path.clone(), text, snapshot));
                 }
                 self.workspace_empty = false;
+                self.active_edit_block = Some(0);
+                self.active_edit_range = None;
+                self.pending_edit_cursor = None;
+                self.edit_focus_requested = true;
                 self.status_note = format!("已打开 {}", path.display());
+                true
             }
             Err(e) => {
-                self.status =
-                    DocStatus::SaveFailed(format!("无法读取文件：{}", describe_read_error(&e)));
+                // A failed open must not rewrite the active document's save
+                // status; it is informational only.
+                self.status_note = format!("无法读取文件：{}", describe_read_error(&e));
+                false
             }
         }
     }
@@ -1732,7 +1903,7 @@ impl MdEditorApp {
         let path = self.path.clone().expect("已检查文档路径");
         match io::save_with_conflict_check(&path, &self.text, &self.disk_snapshot) {
             Ok(bytes) => {
-                self.disk_snapshot = bytes;
+                self.replace_disk_snapshot(bytes);
                 self.path = Some(path);
                 self.status = DocStatus::Saved;
                 self.status_note = format!("已保存 {}", clock_time());
@@ -1744,6 +1915,11 @@ impl MdEditorApp {
                 self.conflict = Some(path);
                 self.status = DocStatus::Conflict;
             }
+            Err(io::SaveError::TooLarge { size, limit }) => {
+                self.status = DocStatus::SaveFailed(format!(
+                    "保存失败：文件大小 {size} 字节，超过 {limit} 字节限制"
+                ));
+            }
             Err(io::SaveError::Io(e)) => {
                 self.status = DocStatus::SaveFailed(format!("保存失败：{}", e));
             }
@@ -1754,11 +1930,19 @@ impl MdEditorApp {
         let Some(path) = pick_save_path() else {
             return false;
         };
-        match io::save_overwrite(&path, &self.text) {
+        match io::save_overwrite(&path, &self.text, None) {
             Ok(bytes) => {
-                self.disk_snapshot = bytes;
+                // Moving to a new file: stop watching (and stop polling) the
+                // previous location so stale stamps cannot fire later.
+                let previous = self.path.clone();
+                self.replace_disk_snapshot(bytes);
                 self.path = Some(path.clone());
                 self.watch_external_path(&path);
+                if let Some(previous) = previous.filter(|previous| *previous != path) {
+                    self.unwatch_external_path(&previous);
+                    self.observed_file_stamps.remove(&previous);
+                    self.pending_external_changes.remove(&previous);
+                }
                 self.status = DocStatus::Saved;
                 self.conflict = None;
                 self.status_note = format!("已保存 {}", clock_time());
@@ -1776,9 +1960,9 @@ impl MdEditorApp {
 
     fn resolve_overwrite(&mut self) {
         if let Some(path) = self.conflict.take() {
-            match io::save_overwrite(&path, &self.text) {
+            match io::save_overwrite(&path, &self.text, Some(&self.disk_snapshot)) {
                 Ok(bytes) => {
-                    self.disk_snapshot = bytes;
+                    self.replace_disk_snapshot(bytes);
                     self.path = Some(path);
                     self.status = DocStatus::Saved;
                     self.status_note = "已覆盖保存".to_string();
@@ -1801,13 +1985,16 @@ impl MdEditorApp {
 
     fn resolve_reload(&mut self) {
         if let Some(path) = self.conflict.take() {
-            match io::read_markdown(&path) {
-                Ok(text) => {
-                    self.text = text;
+            match io::read_markdown_snapshot(&path) {
+                Ok((text, snapshot)) => {
+                    self.core.set_source(text);
                     self.path = Some(path.clone());
-                    self.disk_snapshot = io::read_snapshot(&path).unwrap_or_default();
-                    self.document = markdown::parse_document(&self.text);
-                    self.document_revision = self.document_revision.wrapping_add(1);
+                    self.replace_disk_snapshot(snapshot);
+                    self.core.reparse_current_source();
+                    self.parse_requested_revision = None;
+                    self.active_edit_block = None;
+                    self.active_edit_range = None;
+                    self.edit_focus_requested = false;
                     self.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
                     if let Err(error) = self.persist_draft_session() {
@@ -1816,14 +2003,21 @@ impl MdEditorApp {
                     self.finish_pending_close_if_saved();
                 }
                 Err(e) => {
-                    self.status =
-                        DocStatus::SaveFailed(format!("无法读取文件：{}", describe_read_error(&e)));
+                    self.status_note = format!("无法读取文件：{}", describe_read_error(&e));
                 }
             }
         }
     }
 
     fn export_html(&mut self) {
+        let Some(document) = self
+            .core
+            .snapshot(self.id)
+            .map(|snapshot| snapshot.document)
+        else {
+            self.status_note = "正在解析，完成后才能导出".to_string();
+            return;
+        };
         let Some(path) = rfd::FileDialog::new()
             .add_filter("HTML", &["html"])
             .set_file_name("导出.html")
@@ -1833,13 +2027,21 @@ impl MdEditorApp {
         };
         let title = self.export_title();
         let options = self.export_options(&title);
-        match export::export_html(&path, &self.document, options) {
+        match export::export_html(&path, &document, options) {
             Ok(()) => self.status_note = format!("已导出 HTML：{}", path.display()),
             Err(e) => self.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
         }
     }
 
     fn export_pdf(&mut self) {
+        let Some(document) = self
+            .core
+            .snapshot(self.id)
+            .map(|snapshot| snapshot.document)
+        else {
+            self.status_note = "正在解析，完成后才能导出".to_string();
+            return;
+        };
         let Some(path) = rfd::FileDialog::new()
             .add_filter("PDF", &["pdf"])
             .set_file_name("导出.pdf")
@@ -1849,7 +2051,7 @@ impl MdEditorApp {
         };
         let title = self.export_title();
         let options = self.export_options(&title);
-        match export::export_pdf(&path, &self.document, options) {
+        match export::export_pdf(&path, &document, options) {
             Ok(()) => self.status_note = format!("已导出 PDF：{}", path.display()),
             Err(e) => self.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
         }
@@ -1869,10 +2071,10 @@ impl MdEditorApp {
         let package = self.theme_package.as_ref();
         let theme_css = package
             .and_then(ThemePackage::browser_css)
-            .unwrap_or(theme::BUILT_IN_SSPAI_CSS);
+            .unwrap_or(theme::BUILT_IN_FOCUS_CSS);
         let default_size = package
             .map(ThemePackage::recommended_body_font_size)
-            .unwrap_or_else(|| ThemePackage::built_in_sspai().recommended_body_font_size());
+            .unwrap_or_else(|| ThemePackage::built_in_focused().recommended_body_font_size());
         export::ExportOptions {
             title,
             theme_css,
@@ -1882,136 +2084,14 @@ impl MdEditorApp {
         }
     }
 
-    #[allow(dead_code)]
-    fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("文件", |ui| {
-                if ui
-                    .button(format!("打开…    {PRIMARY_SHORTCUT}+O"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.open_file();
-                }
-                if ui.button(format!("保存    {PRIMARY_SHORTCUT}+S")).clicked() {
-                    ui.close();
-                    self.save();
-                }
-                if ui
-                    .button(format!("另存为…    {PRIMARY_SHORTCUT}+Shift+S"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.save_as();
-                }
-                ui.separator();
-                if ui.button("导出 HTML…").clicked() {
-                    ui.close();
-                    self.export_html();
-                }
-                if ui.button("导出 PDF…").clicked() {
-                    ui.close();
-                    self.export_pdf();
-                }
-                ui.separator();
-                if ui.button("退出").clicked() {
-                    ui.close();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-            ui.menu_button("编辑", |ui| {
-                if ui.button("复制渲染内容").clicked() {
-                    ctx.copy_text(markdown::plain_text(self.document.blocks()));
-                    self.status_note = "已复制渲染内容".to_string();
-                    ui.close();
-                }
-                if ui.button("复制 HTML").clicked() {
-                    ctx.copy_text(export::render_html(&self.document));
-                    self.status_note = "已复制 HTML".to_string();
-                    ui.close();
-                }
-            });
-            ui.menu_button("视图", |ui| {
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Write,
-                    format!("写作模式     {PRIMARY_SHORTCUT}+1"),
-                );
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Preview,
-                    format!("阅读模式     {PRIMARY_SHORTCUT}+2"),
-                );
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Split,
-                    format!("分栏模式     {PRIMARY_SHORTCUT}+3"),
-                );
-                ui.separator();
-                ui.label(egui::RichText::new("编辑与正文字号").weak().size(12.0));
-                ui.add(
-                    egui::Slider::new(&mut self.body_font_size, 12.0..=22.0)
-                        .step_by(0.5)
-                        .suffix(" px"),
-                );
-                if ui.small_button("恢复默认 15.5 px").clicked() {
-                    self.body_font_size = 15.5;
-                }
-                ui.separator();
-                ui.checkbox(&mut self.show_status, "显示状态栏");
-                let theme = if self.dark {
-                    "浅色外观"
-                } else {
-                    "深色外观"
-                };
-                if ui.button(theme).clicked() {
-                    self.dark = !self.dark;
-                    self.apply_current_theme(ui.ctx());
-                    ui.close();
-                }
-            });
-            ui.menu_button("视图", |ui| {
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Write,
-                    format!("写作模式    {PRIMARY_SHORTCUT}+1"),
-                );
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Preview,
-                    format!("阅读模式    {PRIMARY_SHORTCUT}+2"),
-                );
-                ui.selectable_value(
-                    &mut self.view_mode,
-                    ViewMode::Split,
-                    format!("分栏模式    {PRIMARY_SHORTCUT}+3"),
-                );
-                ui.separator();
-                ui.checkbox(&mut self.focus_mode, "专注模式    F8");
-                ui.checkbox(&mut self.show_status, "显示状态栏");
-                ui.separator();
-                let label = if self.dark {
-                    "切换到亮色主题"
-                } else {
-                    "切换到暗色主题"
-                };
-                if ui.button(label).clicked() {
-                    self.dark = !self.dark;
-                    self.apply_current_theme(ctx);
-                    ui.close();
-                }
-            });
-        });
-    }
-
     fn title_bar(&mut self, ui: &mut egui::Ui) {
         let has_open_document = self.has_open_document();
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), CHROME_BAR_HEIGHT),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.spacing_mut().button_padding = egui::vec2(7.0, 4.0);
+                ui.spacing_mut().item_spacing.x = 5.0;
+                ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
                 ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
                 ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                 ui.menu_button(egui::RichText::new("文件").size(CHROME_FONT_SIZE), |ui| {
@@ -2111,49 +2191,31 @@ impl MdEditorApp {
                         self.open_search();
                     }
                     ui.separator();
+                    let has_current_snapshot = has_open_document && self.is_parsed_current();
                     if ui
-                        .add_enabled(has_open_document, egui::Button::new("复制渲染内容"))
+                        .add_enabled(has_current_snapshot, egui::Button::new("复制渲染内容"))
                         .clicked()
                     {
                         ui.close();
-                        ui.ctx()
-                            .copy_text(markdown::plain_text(self.document.blocks()));
+                        if let Some(snapshot) = self.core.snapshot(self.id) {
+                            ui.ctx()
+                                .copy_text(markdown::plain_text(snapshot.document.blocks()));
+                        }
                     }
                     if ui
-                        .add_enabled(has_open_document, egui::Button::new("复制 HTML"))
+                        .add_enabled(has_current_snapshot, egui::Button::new("复制 HTML"))
                         .clicked()
                     {
                         ui.close();
-                        ui.ctx().copy_text(export::render_html(&self.document));
+                        if let Some(snapshot) = self.core.snapshot(self.id) {
+                            ui.ctx().copy_text(export::render_html(&snapshot.document));
+                        }
                     }
                 });
                 ui.menu_button(egui::RichText::new("视图").size(CHROME_FONT_SIZE), |ui| {
                     ui.set_min_width(230.0);
-                    ui.label(egui::RichText::new("文档主题").weak().size(12.0));
-                    if let Some(package) = &self.theme_package {
-                        let author = if package.author.trim().is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {}", package.author)
-                        };
-                        ui.label(
-                            egui::RichText::new(format!("{}{}", package.name, author))
-                                .strong()
-                                .size(13.0),
-                        );
-                    } else {
-                        ui.label(egui::RichText::new("少数派经典 · 内置").strong().size(13.0));
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("导入主题包…").clicked() {
-                            self.import_theme(ui.ctx());
-                        }
-                        if self.theme_package.is_some() && ui.small_button("移除").clicked() {
-                            self.remove_theme(ui.ctx());
-                        }
-                    });
-                    ui.separator();
-                    ui.label(egui::RichText::new("编辑与正文字号").weak().size(12.0));
+                    ui.label(egui::RichText::new("编辑与正文字号").weak().size(12.0))
+                        .on_hover_text("快捷键 Ctrl+= 放大 · Ctrl+- 缩小 · Ctrl+0 重置");
                     ui.horizontal(|ui| {
                         if ui.small_button("−").clicked() {
                             self.body_font_size = (self.body_font_size - 0.5).max(12.0);
@@ -2169,7 +2231,7 @@ impl MdEditorApp {
                         ui.label(format!("{:.1}", self.body_font_size));
                     });
                     if ui.small_button("恢复默认字号").clicked() {
-                        self.body_font_size = 15.5;
+                        self.body_font_size = self.default_body_font_size();
                     }
                     ui.separator();
                     let watch_changed = ui
@@ -2193,11 +2255,11 @@ impl MdEditorApp {
                         ui.close();
                     }
                 });
-                ui.separator();
+                ui.add_space(8.0);
                 let mut switch_to = None;
                 let mut close_tab = None;
                 let mut create_tab = false;
-                let tabs_width = (ui.available_width() - 235.0).max(150.0);
+                let tabs_width = ui.available_width();
                 ui.allocate_ui_with_layout(
                     egui::vec2(tabs_width, CHROME_CONTROL_HEIGHT),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -2247,59 +2309,37 @@ impl MdEditorApp {
                 } else if create_tab {
                     self.new_tab();
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled_ui(has_open_document, |ui| {
-                        if chrome_nav_button(ui, "专注", has_open_document && self.focus_mode)
-                            .on_hover_text("专注模式 · F8")
-                            .clicked()
-                        {
-                            self.focus_mode = !self.focus_mode;
-                        }
-                        ui.add_space(4.0);
-                        if chrome_nav_button(
-                            ui,
-                            "分栏",
-                            has_open_document && self.view_mode == ViewMode::Split,
-                        )
-                        .clicked()
-                        {
-                            self.view_mode = ViewMode::Split;
-                        }
-                        if chrome_nav_button(
-                            ui,
-                            "阅读",
-                            has_open_document && self.view_mode == ViewMode::Preview,
-                        )
-                        .clicked()
-                        {
-                            self.view_mode = ViewMode::Preview;
-                        }
-                        if chrome_nav_button(
-                            ui,
-                            "写作",
-                            has_open_document && self.view_mode == ViewMode::Write,
-                        )
-                        .clicked()
-                        {
-                            self.view_mode = ViewMode::Write;
-                        }
-                    });
-                });
             },
         );
     }
 
-    fn status_bar(&self, ui: &mut egui::Ui) {
+    fn text_stats(&mut self) -> (usize, usize) {
+        let tab_id = self.id;
+        let revision = self.document_revision;
+        if let Some((cached_tab, cached_revision, chars, lines)) = self.text_stats_cache
+            && cached_tab == tab_id
+            && cached_revision == revision
+        {
+            return (chars, lines);
+        }
+        let chars = self.text.chars().count();
+        let lines = self.text.lines().count();
+        self.text_stats_cache = Some((tab_id, revision, chars, lines));
+        (chars, lines)
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
             if self.workspace_empty {
                 ui.label(egui::RichText::new("没有打开的文档").weak());
-                ui.separator();
+                ui.add_space(10.0);
                 ui.label(egui::RichText::new("可新建、打开或拖入 Markdown 文件").weak());
                 if !self.status_note.is_empty() {
-                    ui.separator();
+                    ui.add_space(10.0);
                     ui.label(&self.status_note);
                 } else if let DocStatus::SaveFailed(message) = &self.status {
-                    ui.separator();
+                    ui.add_space(10.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
                         format!("出错：{message}"),
@@ -2327,26 +2367,36 @@ impl MdEditorApp {
                 ),
             };
             ui.colored_label(color, label);
-            ui.separator();
-            if let Some(p) = &self.path {
-                ui.label(p.display().to_string());
-            } else {
-                ui.label("未命名");
-            }
-            ui.separator();
-            ui.label(format!(
-                "{} 字符 / {} 行",
-                self.text.chars().count(),
-                self.text.lines().count()
-            ));
-            if (self.text.len() as u64) > markdown::MAX_FILE_SIZE {
-                ui.separator();
+            ui.add_space(10.0);
+            let (chars, lines) = self.text_stats();
+            ui.label(format!("{chars} 字符 / {lines} 行"));
+            if (self.text.len() as u64) > io::MAX_FILE_SIZE {
+                ui.add_space(10.0);
                 ui.colored_label(egui::Color32::from_rgb(0xc0, 0x39, 0x2b), "超过 10 MB 限制");
             }
             if !self.status_note.is_empty() {
-                ui.separator();
+                ui.add_space(10.0);
                 ui.label(&self.status_note);
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hint = if !self.document.blocks().is_empty()
+                    && self.document.block_ranges().len() != self.document.blocks().len()
+                {
+                    "全文编辑 · 当前 Markdown 结构暂不支持逐块编辑 · F8 专注 · F9 打字机"
+                        .to_string()
+                } else {
+                    match self.active_edit_block {
+                        Some(index) => {
+                            format!(
+                                "正在编辑第 {} 段 · Esc 收起 · F8 专注 · F9 打字机",
+                                index + 1
+                            )
+                        }
+                        None => "点击段落开始编辑 · F8 专注 · F9 打字机".to_string(),
+                    }
+                };
+                ui.label(egui::RichText::new(hint).weak().size(11.0));
+            });
         });
     }
 
@@ -2370,17 +2420,10 @@ impl MdEditorApp {
                         .on_hover_text("上一项 · Shift+Enter")
                         .clicked();
                 });
-                let preview_has_match =
-                    !matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
-                        || self.preview_search_has_match();
-                let count = if !preview_has_match {
-                    "预览无结果".to_string()
-                } else {
-                    self.search_results.position().map_or_else(
-                        || "无结果".to_string(),
-                        |(current, total)| format!("{current} / {total}"),
-                    )
-                };
+                let count = self.search_results.position().map_or_else(
+                    || "无结果".to_string(),
+                    |(current, total)| format!("{current} / {total}"),
+                );
                 ui.label(egui::RichText::new(count).weak().size(12.0));
                 let response = ui.add_sized(
                     [260.0, 26.0],
@@ -2396,6 +2439,7 @@ impl MdEditorApp {
                     response.request_focus();
                     self.search_focus_requested = false;
                 }
+                self.search_input_has_focus = response.has_focus();
                 query_changed = response.changed();
                 if response.has_focus() {
                     go_previous |= ui.input_mut(|input| {
@@ -2468,122 +2512,6 @@ impl MdEditorApp {
         });
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    fn sync_scrolls(
-        &mut self,
-        ctx: &egui::Context,
-        editor: &ScrollAreaOutput<EditorWidgetOutput>,
-        preview: &ScrollAreaOutput<()>,
-    ) {
-        let max_e = (editor.content_size.y - editor.inner_rect.height()).max(0.0);
-        let max_p = (preview.content_size.y - preview.inner_rect.height()).max(0.0);
-        let ratio_e = if max_e > 0.0 {
-            editor.state.offset.y / max_e
-        } else {
-            0.0
-        };
-        let ratio_p = if max_p > 0.0 {
-            preview.state.offset.y / max_p
-        } else {
-            0.0
-        };
-        let e_changed = scroll_position_changed(self.prev_editor_ratio, ratio_e, max_e);
-        let p_changed = scroll_position_changed(self.prev_preview_ratio, ratio_p, max_p);
-
-        if e_changed && !p_changed {
-            let mut st = preview.state;
-            st.offset.y = ratio_e * max_p;
-            st.store(ctx, preview.id);
-        } else if p_changed && !e_changed {
-            let mut st = editor.state;
-            st.offset.y = ratio_p * max_e;
-            st.store(ctx, editor.id);
-        }
-        self.prev_editor_ratio = ratio_e;
-        self.prev_preview_ratio = ratio_p;
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    fn sync_caret(
-        &mut self,
-        ctx: &egui::Context,
-        editor: &ScrollAreaOutput<EditorWidgetOutput>,
-        preview: &ScrollAreaOutput<()>,
-    ) {
-        if !self.editor_focused {
-            return;
-        }
-        let te_id = editor.inner.id;
-        if let Some(state) = egui::TextEdit::load_state(ctx, te_id) {
-            if let Some(cursor) = state.cursor.char_range() {
-                let char_idx = cursor.primary.index.0;
-                let caret_line = self
-                    .text
-                    .chars()
-                    .take(char_idx)
-                    .filter(|&c| c == '\n')
-                    .count();
-                if caret_line != self.last_caret_line {
-                    self.last_caret_line = caret_line;
-                    let total = self.text.chars().filter(|&c| c == '\n').count().max(1);
-                    let ratio = caret_line as f32 / total as f32;
-                    let max_p = (preview.content_size.y - preview.inner_rect.height()).max(0.0);
-                    let mut st = preview.state;
-                    st.offset.y = ratio * max_p;
-                    st.store(ctx, preview.id);
-                }
-            }
-        }
-    }
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    fn sync_browser_scrolls(
-        &mut self,
-        ctx: &egui::Context,
-        editor: &ScrollAreaOutput<EditorWidgetOutput>,
-        force_preview: bool,
-    ) -> Result<(), String> {
-        let max_editor = (editor.content_size.y - editor.inner_rect.height()).max(0.0);
-        let editor_ratio = if max_editor > 0.0 {
-            (editor.state.offset.y / max_editor).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        // Only a user-originated WebView scroll is allowed to drive the editor.
-        // Page reloads and scrollTo calls also emit browser scroll events; treating
-        // those as input would make both panes repeatedly pull each other around.
-        if let Some(source_position) = self.browser_preview.take_user_source_position() {
-            self.preview_source_position = source_position;
-            let mut state = editor.state;
-            state.offset.y = editor_offset_for_source_position(editor, &self.text, source_position);
-            state.store(ctx, editor.id);
-            self.prev_editor_ratio = if max_editor > 0.0 {
-                state.offset.y / max_editor
-            } else {
-                0.0
-            };
-            self.prev_preview_ratio = self.prev_editor_ratio;
-            return Ok(());
-        }
-
-        let source_position = editor_source_position(editor, &self.text);
-        let editor_changed =
-            scroll_position_changed(self.prev_editor_ratio, editor_ratio, max_editor);
-        let preview_out_of_sync = self
-            .browser_preview
-            .source_position()
-            .is_none_or(|preview_position| (preview_position - source_position).abs() > 0.1);
-        if force_preview || editor_changed || preview_out_of_sync {
-            self.browser_preview
-                .scroll_to_source_position(source_position, !force_preview)?;
-        }
-        self.preview_source_position = source_position;
-        self.prev_editor_ratio = editor_ratio;
-        self.prev_preview_ratio = editor_ratio;
-        Ok(())
-    }
-
     fn conflict_window(&mut self, ctx: &egui::Context) {
         if self.conflict.is_none() {
             return;
@@ -2627,6 +2555,15 @@ impl MdEditorApp {
         {
             self.activate_tab(index);
         }
+        // `activate_tab` clears the transient editor state. Restore the
+        // live-preview editor after selecting the persisted active tab so a
+        // restored window is immediately ready for typing as well.
+        if !self.workspace_empty {
+            self.active_edit_block = Some(0);
+            self.active_edit_range = None;
+            self.pending_edit_cursor = None;
+            self.edit_focus_requested = true;
+        }
         let skipped = requested.saturating_sub(restored);
         self.status_note = if skipped == 0 {
             format!("已恢复上次窗口，共 {restored} 个文件")
@@ -2667,10 +2604,10 @@ impl MdEditorApp {
         }
         self.activate_tab(active_index);
         self.workspace_empty = false;
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        {
-            self.browser_document_cache = None;
-        }
+        self.active_edit_block = Some(0);
+        self.active_edit_range = None;
+        self.pending_edit_cursor = None;
+        self.edit_focus_requested = true;
         if let Err(error) = self.persist_draft_session() {
             self.status_note = format!("草稿已恢复；草稿会话更新失败：{error}");
         }
@@ -2813,20 +2750,30 @@ impl MdEditorApp {
             });
         });
     }
+    /// Reflect the active document in the OS window title (taskbar and
+    /// Alt+Tab), with a dot marking unsaved changes.
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let title = if self.workspace_empty {
+            "Markdown 编辑器".to_string()
+        } else {
+            let dirty = self.is_active_dirty();
+            let label = document_label(self.id, self.path.as_ref(), dirty);
+            format!("{label} - Markdown 编辑器")
+        };
+        if self.last_window_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
+        }
+    }
 }
 
 impl eframe::App for MdEditorApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let mut browser_rect = None;
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let mut split_editor_scroll = None;
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let mut preview_heading_target = None;
+        let mut heading_target = None;
 
-        let mut dropped_paths = ctx.input(|input| {
+        let dropped_paths = ctx.input(|input| {
             input
                 .raw
                 .dropped_files
@@ -2834,31 +2781,27 @@ impl eframe::App for MdEditorApp {
                 .filter_map(|file| file.path.clone())
                 .collect::<Vec<_>>()
         });
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        dropped_paths.extend(self.browser_preview.take_dropped_paths());
         self.handle_instance_requests(&ctx);
         self.open_dropped_paths(dropped_paths);
 
+        self.poll_parse_results(&ctx);
+        self.poll_search_results(&ctx);
         self.poll_external_changes(&ctx, now);
 
-        if self.text != self.document.source() {
-            self.document = markdown::parse_document(&self.text);
-            self.document_revision = self.document_revision.wrapping_add(1);
-            self.last_edit_time = now;
-            self.refresh_status();
-        }
-
-        self.autosave_draft(now);
+        self.autosave_draft(&ctx, now);
         self.handle_window_close_request(&ctx);
         self.handle_shortcuts(&ctx);
         self.refresh_search_if_needed();
+        self.sync_window_title(&ctx);
 
         if !self.focus_mode {
             egui::Panel::top("menu_panel")
+                .show_separator_line(false)
                 .frame(
                     egui::Frame::new()
                         .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(10, 2)),
+                        .inner_margin(egui::Margin::symmetric(12, 1))
+                        .stroke(egui::Stroke::NONE),
                 )
                 .show(ui, |ui| {
                     self.title_bar(ui);
@@ -2867,31 +2810,34 @@ impl eframe::App for MdEditorApp {
 
         if self.search_open {
             egui::Panel::top("search_panel")
+                .show_separator_line(false)
                 .frame(
                     egui::Frame::new()
                         .fill(ui.visuals().panel_fill)
                         .inner_margin(egui::Margin::symmetric(12, 3))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            ui.visuals().widgets.noninteractive.bg_stroke.color,
-                        )),
+                        .stroke(egui::Stroke::NONE),
                 )
                 .show(ui, |ui| self.search_bar(ui));
         }
 
-        if self.show_status && !self.focus_mode {
+        if self.show_status
+            && !self.focus_mode
+            && (!self.workspace_empty
+                || !self.status_note.is_empty()
+                || matches!(self.status, DocStatus::SaveFailed(_)))
+        {
             egui::Panel::bottom("status_panel")
+                .show_separator_line(false)
                 .frame(
                     egui::Frame::new()
                         .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(12, 5)),
+                        .inner_margin(egui::Margin::symmetric(14, 3))
+                        .stroke(egui::Stroke::NONE),
                 )
                 .show(ui, |ui| self.status_bar(ui));
         }
 
         if self.workspace_empty {
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            self.browser_preview.close();
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(ui.visuals().window_fill))
                 .show(ui, |ui| self.empty_workspace(ui));
@@ -2902,80 +2848,31 @@ impl eframe::App for MdEditorApp {
 
         let doc_theme = self.theme_spec();
         let editor_fill = doc_theme.editor_canvas;
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let modal_open = self.conflict.is_some()
-            || self.recovery.is_some()
-            || self.pending_close.is_some()
-            || self.window_close_guard.is_confirmation_open();
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        if modal_open {
-            // A native child WebView is always above egui's paint surface on Windows.
-            // Drop it before painting a modal instead of relying on an asynchronous
-            // visibility change, otherwise the preview can cover the dialog.
-            self.browser_preview.close();
-        }
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let browser_can_show = {
-            #[cfg(target_os = "windows")]
-            {
-                !modal_open
-            }
-            #[cfg(target_os = "macos")]
-            {
-                !modal_open && !ctx.any_popup_open()
-            }
-        };
-        let search_range = self
-            .search_open
-            .then(|| self.search_results.current_range())
-            .flatten();
+        let search_byte_range = self.search_open.then(|| self.search_byte_range()).flatten();
         let scroll_to_search = std::mem::take(&mut self.search_scroll_requested);
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let mut search_preview_target =
-            (matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
-                && scroll_to_search
-                && self.preview_search_has_match())
-            .then(|| {
-                search_range
-                    .as_ref()
-                    .map(|range| source_position_from_char(&self.text, range.start))
-            })
-            .flatten();
-        let search_preview_clear = matches!(self.view_mode, ViewMode::Preview | ViewMode::Split)
-            && scroll_to_search
-            && search_range.is_none();
 
-        match self.view_mode {
-            ViewMode::Write => {
-                let active_index = self.active_tab;
-                let active_tab_id = self.tabs[active_index].id;
-                let body_font_size = self.body_font_size;
-                let (tabs, editor_focused) = (&mut self.tabs, &mut self.editor_focused);
-                egui::CentralPanel::default()
-                    .frame(
-                        egui::Frame::new()
-                            .fill(editor_fill)
-                            .inner_margin(egui::Margin::symmetric(22, 0)),
-                    )
-                    .show(ui, |ui| {
-                        show_centered_editor(
-                            ui,
-                            active_tab_id,
-                            &mut tabs[active_index].text,
-                            editor_focused,
-                            body_font_size,
-                            &doc_theme,
-                            EditorSearchTarget {
-                                range: search_range.as_ref(),
-                                scroll_to_search,
-                            },
-                        );
-                    });
-            }
-            ViewMode::Preview => {
-                let active_tab_id = self.id;
+        {
+            let active_index = self.active_tab;
+            let active_tab_id = self.tabs[active_index].id;
+            let body_font_size = self.body_font_size;
+            // A frame takes at most one immutable snapshot per tab: it is `Some`
+            // only while the parse still matches the source. Either way the last
+            // completed parse is what gets rendered, and only the block owned by
+            // the editor can differ from it.
+            let current_snapshot = self.tabs[active_index].core.snapshot(active_tab_id);
+            let parsed_current = current_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.tab_id == active_tab_id
+                    && snapshot.revision == self.tabs[active_index].document_revision
+            });
+            let parsed_document: Arc<markdown::ParsedDocument> = match current_snapshot {
+                Some(snapshot) => snapshot.document,
+                None => self.tabs[active_index].core.document(),
+            };
+            let headings = parsed_document.headings();
+            if !self.focus_mode {
                 egui::Panel::left("reading_toc_panel")
                     .resizable(false)
+                    .show_separator_line(false)
                     .exact_size(228.0)
                     .frame(
                         egui::Frame::new()
@@ -2983,201 +2880,129 @@ impl eframe::App for MdEditorApp {
                             .inner_margin(egui::Margin::symmetric(14, 0)),
                     )
                     .show(ui, |ui| {
-                        let target = reading_toc(ui, self.document.blocks());
-                        #[cfg(any(target_os = "windows", target_os = "macos"))]
-                        if target.is_some() {
-                            preview_heading_target = target;
-                        }
+                        heading_target = reading_toc(ui, headings);
                     });
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(ui.visuals().window_fill))
-                    .show(ui, |ui| {
-                        #[cfg(any(target_os = "windows", target_os = "macos"))]
-                        {
-                            if browser_can_show {
-                                let rect = ui.available_rect_before_wrap();
-                                ui.allocate_rect(rect, egui::Sense::hover());
-                                browser_rect = Some(rect);
-                            } else {
-                                show_centered_preview(
-                                    ui,
-                                    active_tab_id,
-                                    self.document.blocks(),
-                                    self.body_font_size,
-                                    &doc_theme,
-                                );
-                            }
-                        }
-                        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                        show_centered_preview(
-                            ui,
-                            active_tab_id,
-                            self.document.blocks(),
-                            self.body_font_size,
-                            &doc_theme,
+            }
+            // Search hits address the document by block, and block indices come
+            // from the parse: do not move the editor while one is pending.
+            let effective_search_range = parsed_current
+                .then_some(search_byte_range.clone())
+                .flatten();
+            if let Some(search) = effective_search_range.as_ref()
+                && let Some(index) =
+                    preview::block_index_for_search(parsed_document.block_ranges(), search)
+                && self.active_edit_block != Some(index)
+                && !self.search_input_has_focus
+            {
+                // 搜索输入框获得焦点的帧不抢焦点：egui 的 request_focus 是
+                // 后写覆盖，正文编辑器抢焦点会把查询按键打进文档。
+                self.active_edit_block = Some(index);
+                self.active_edit_range = None;
+                self.edit_focus_requested = true;
+            }
+            let active_edit_block = self.active_edit_block;
+            let active_edit_range = self.active_edit_range.clone();
+            let pending_edit_cursor = self.pending_edit_cursor.take();
+            let edit_focus_requested = self.edit_focus_requested;
+            let mut editor_output = preview::BlockEditorOutput::default();
+            let mut had_blocks = false;
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(editor_fill)
+                        .inner_margin(egui::Margin {
+                            left: 22,
+                            right: 0,
+                            top: 0,
+                            bottom: 0,
+                        }),
+                )
+                .show(ui, |ui| {
+                    let active_tab = &mut self.tabs[active_index];
+                    // `text` lives behind `Deref` to the core state, so borrow
+                    // the concrete fields at the destructuring level to keep
+                    // disjoint-field borrows disjoint for the borrow checker.
+                    let DocumentTab {
+                        core,
+                        path,
+                        preview_heights,
+                        preview_height_epoch,
+                        ..
+                    } = active_tab;
+                    let text = &mut core.text;
+                    let blocks: &[Block] = parsed_document.blocks();
+                    had_blocks = !blocks.is_empty();
+                    let block_ranges: &[Range<usize>] = parsed_document.block_ranges();
+                    let image_base_directory = path
+                        .clone()
+                        .and_then(|path| path.parent().map(Path::to_path_buf));
+                    if !parsed_current {
+                        ui.colored_label(ui.visuals().weak_text_color(), "正在解析…");
+                    }
+                    // Reset the culling layout cache whenever the column
+                    // width (rounded) or the body zoom changed; measured
+                    // heights from another geometry would misplace spacers.
+                    let virtualize = blocks.len() >= preview::VIRTUALIZE_MIN_BLOCKS;
+                    if virtualize {
+                        let epoch = (
+                            (ui.available_width().min(doc_theme.content_width) / 4.0).round()
+                                as u32,
+                            (body_font_size * 10.0) as u32,
                         );
-                    });
+                        if *preview_height_epoch != Some(epoch) {
+                            preview_heights.clear();
+                            *preview_height_epoch = Some(epoch);
+                        }
+                        preview_heights.resize(blocks.len(), 0.0);
+                    }
+                    editor_output = show_hybrid_editor(
+                        ui,
+                        active_tab_id,
+                        blocks,
+                        block_ranges,
+                        text,
+                        body_font_size,
+                        &doc_theme,
+                        active_edit_block,
+                        active_edit_range,
+                        pending_edit_cursor,
+                        edit_focus_requested,
+                        effective_search_range.clone(),
+                        scroll_to_search,
+                        self.typewriter_mode,
+                        self.focus_mode && active_edit_block.is_some(),
+                        !parsed_current,
+                        heading_target,
+                        &mut preview::PreviewImages {
+                            base_directory: image_base_directory.as_deref(),
+                            cache: &mut self.image_cache,
+                        },
+                        virtualize.then_some(preview_heights),
+                    );
+                });
+            if editor_output.changed {
+                self.mark_tab_source_changed(active_index, now);
             }
-            ViewMode::Split => {
-                let active_index = self.active_tab;
-                let active_tab_id = self.tabs[active_index].id;
-                let body_font_size = self.body_font_size;
-                let (tabs, editor_focused) = (&mut self.tabs, &mut self.editor_focused);
-                let editor_out = egui::Panel::left("editor_panel")
-                    .resizable(true)
-                    .default_size(600.0)
-                    .min_size(280.0)
-                    .frame(
-                        egui::Frame::new()
-                            .fill(editor_fill)
-                            .inner_margin(egui::Margin {
-                                left: (doc_theme.preview_padding / 2).max(20),
-                                right: (doc_theme.preview_padding / 2).max(20),
-                                top: 0,
-                                bottom: 0,
-                            }),
-                    )
-                    .show(ui, |ui| {
-                        show_editor_scroll(
-                            ui,
-                            active_tab_id,
-                            &mut tabs[active_index].text,
-                            editor_focused,
-                            body_font_size,
-                            search_range.as_ref(),
-                            scroll_to_search,
-                        )
-                    });
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(ui.visuals().window_fill))
-                    .show(ui, |ui| {
-                        if browser_can_show {
-                            let rect = ui.available_rect_before_wrap();
-                            ui.allocate_rect(rect, egui::Sense::hover());
-                            browser_rect = Some(rect);
-                        } else {
-                            let _ = show_preview_scroll(
-                                ui,
-                                active_tab_id,
-                                self.document.blocks(),
-                                self.body_font_size,
-                                &doc_theme,
-                            );
-                        }
-                    });
-                #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                {
-                    let preview_out = egui::CentralPanel::default()
-                        .frame(
-                            egui::Frame::new()
-                                .fill(ui.visuals().window_fill)
-                                .inner_margin(egui::Margin {
-                                    left: doc_theme.preview_padding,
-                                    right: doc_theme.preview_padding,
-                                    top: 0,
-                                    bottom: 0,
-                                }),
-                        )
-                        .show(ui, |ui| {
-                            show_preview_scroll(
-                                ui,
-                                active_tab_id,
-                                self.document.blocks(),
-                                self.body_font_size,
-                                &doc_theme,
-                            )
-                        });
-                    self.sync_scrolls(&ctx, &editor_out.inner, &preview_out.inner);
-                    self.sync_caret(&ctx, &editor_out.inner, &preview_out.inner);
-                }
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                {
-                    split_editor_scroll = Some(editor_out.inner);
-                }
+            if editor_output.viewport_unsettled {
+                // A skipped block's measured height differed from its estimate;
+                // repaint once so the spacers settle and the scrollbar is exact.
+                ctx.request_repaint();
             }
-        }
-
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        {
-            let popup_open = ctx.any_popup_open();
-            if popup_open && let Some(browser_rect) = browser_rect {
-                self.browser_preview.freeze_for_overlay(
-                    frame,
-                    &ctx,
-                    browser_rect,
-                    ctx.pixels_per_point(),
-                );
-            } else if browser_rect.is_none() {
-                self.browser_preview.close();
-            } else if let Some(rect) = browser_rect {
-                self.browser_preview.discard_frozen_frame();
-                let document = self.browser_document();
-                if let Err(error) =
-                    self.browser_preview
-                        .show(frame, &ctx, rect, ctx.pixels_per_point(), &document)
-                {
-                    self.status_note = error;
-                } else {
-                    let document_changed = self.browser_preview.take_document_changed();
-                    if let Some(editor) = split_editor_scroll.as_ref()
-                        && let Err(error) =
-                            self.sync_browser_scrolls(&ctx, editor, document_changed)
-                    {
-                        self.status_note = error;
-                    }
-                    if document_changed {
-                        self.pending_preview_restore =
-                            Some((self.id, self.preview_source_position));
-                    }
-                    if self.view_mode == ViewMode::Preview
-                        && let Some(source_position) =
-                            self.browser_preview.take_user_source_position()
-                    {
-                        self.preview_source_position = source_position;
-                        self.pending_preview_restore = None;
-                    }
-                    if let Some(index) = preview_heading_target.take() {
-                        match self.browser_preview.scroll_to_heading(index) {
-                            Ok(()) => self.pending_preview_restore = None,
-                            Err(error) => self.status_note = error,
-                        }
-                    }
-                    if let Some(source_position) = search_preview_target.take() {
-                        match self.browser_preview.find_text(
-                            &self.search_query,
-                            source_position,
-                            self.search_backwards,
-                        ) {
-                            Ok(()) => {
-                                self.preview_source_position = source_position;
-                                self.pending_preview_restore = None;
-                            }
-                            Err(error) => self.status_note = error,
-                        }
-                    } else if search_preview_clear
-                        && let Err(error) = self.browser_preview.find_text("", 0.0, false)
-                    {
-                        self.status_note = error;
-                    }
-                    if let Some(ready) = self.browser_preview.take_ready() {
-                        if let Some((tab_id, source_position)) = self.pending_preview_restore
-                            && tab_id == self.id
-                        {
-                            match self
-                                .browser_preview
-                                .scroll_to_source_position(source_position, false)
-                            {
-                                Ok(()) => self.pending_preview_restore = None,
-                                Err(error) => self.status_note = error,
-                            }
-                        }
-                        self.finish_benchmark_probe(ready);
-                    }
-                }
-                if self.editor_focused {
-                    self.browser_preview.focus_parent();
-                }
+            self.edit_focus_requested = false;
+            self.active_edit_range = editor_output.edited_range;
+            if editor_output.changed && !had_blocks {
+                self.active_edit_block = Some(0);
+                self.edit_focus_requested = true;
+            }
+            // Block indices belong to the last completed parse; while a newer
+            // one is pending they must not move the editor or its caret.
+            if let Some(clicked) =
+                clicked_block_accepted(parsed_current, editor_output.clicked_block)
+            {
+                self.active_edit_block = Some(clicked);
+                self.active_edit_range = None;
+                self.pending_edit_cursor = editor_output.clicked_cursor;
+                self.edit_focus_requested = true;
             }
         }
         self.conflict_window(&ctx);
@@ -3185,64 +3010,14 @@ impl eframe::App for MdEditorApp {
         self.close_tab_window(&ctx);
         self.window_close_window(&ctx);
         self.persist_window_session_if_changed();
-    }
-}
-
-struct EditorWidgetOutput {
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    id: egui::Id,
-    galley: Arc<egui::Galley>,
-    galley_pos: egui::Pos2,
-}
-
-fn editor_widget(
-    ui: &mut egui::Ui,
-    text: &mut String,
-    focused: &mut bool,
-    font_size: f32,
-    search_range: Option<&Range<usize>>,
-) -> EditorWidgetOutput {
-    let id = ui.id().with("md_text");
-    let font_id = egui::FontId::new(font_size, egui::FontFamily::Monospace);
-    let edit = egui::TextEdit::multiline(text)
-        .id(id)
-        .font(font_id.clone())
-        .frame(egui::Frame::NONE)
-        .margin(egui::Margin::same(0))
-        .desired_width(f32::INFINITY)
-        .desired_rows(40);
-    let output = if let Some(range) = search_range {
-        let range = range.clone();
-        let mut layouter = move |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
-            let mut job = egui::text::LayoutJob::simple(
-                buffer.as_str().to_owned(),
-                font_id.clone(),
-                ui.visuals().widgets.inactive.text_color(),
-                wrap_width,
-            );
-            job.keep_trailing_whitespace = true;
-            let mut galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
-            egui::text_selection::visuals::paint_text_selection(
-                &mut galley,
-                ui.visuals(),
-                &egui::text::CCursorRange::two(
-                    egui::text::CCursor::new(range.start),
-                    egui::text::CCursor::new(range.end),
-                ),
-                None,
-            );
-            galley
-        };
-        edit.layouter(&mut layouter).show(ui)
-    } else {
-        edit.show(ui)
-    };
-    *focused = output.response.has_focus();
-    EditorWidgetOutput {
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        id,
-        galley: output.galley,
-        galley_pos: output.galley_pos,
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.parse_requested_revision.is_some())
+            || self.search_pending.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 }
 
@@ -3250,124 +3025,93 @@ fn document_scroll_id(scope: &'static str, tab_id: u64) -> egui::Id {
     egui::Id::new((scope, tab_id))
 }
 
-fn show_editor_scroll(
-    ui: &mut egui::Ui,
-    tab_id: u64,
-    text: &mut String,
-    focused: &mut bool,
-    font_size: f32,
-    search_range: Option<&Range<usize>>,
-    scroll_to_search: bool,
-) -> ScrollAreaOutput<EditorWidgetOutput> {
-    egui::ScrollArea::vertical()
-        .id_salt(document_scroll_id("editor_scroll", tab_id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.add_space(28.0);
-            let output = editor_widget(ui, text, focused, font_size, search_range);
-            if scroll_to_search && let Some(range) = search_range {
-                scroll_editor_to_search(ui, &output, range);
-            }
-            output
-        })
+/// Accept a preview click only while the parse still matches the source.
+///
+/// While a newer parse is pending, block indices belong to the previous parse
+/// and must not move the editor or its caret. `preview.rs` keeps reporting the
+/// click so the frame-level harness can assert on it; this gate is where the
+/// stale index is dropped.
+fn clicked_block_accepted(parsed_current: bool, clicked_block: Option<usize>) -> Option<usize> {
+    clicked_block.filter(|_| parsed_current)
 }
 
-fn scroll_editor_to_search(ui: &egui::Ui, output: &EditorWidgetOutput, range: &Range<usize>) {
-    let local = output
-        .galley
-        .pos_from_cursor(egui::text::CCursor::new(range.start));
-    let screen =
-        local.translate(output.galley_pos.to_vec2() - egui::vec2(output.galley.rect.left(), 0.0));
-    ui.scroll_to_rect(
-        screen.expand2(egui::vec2(24.0, 16.0)),
-        Some(egui::Align::Center),
-    );
-}
-
-fn show_preview_scroll(
+#[allow(clippy::too_many_arguments)]
+fn show_hybrid_editor(
     ui: &mut egui::Ui,
     tab_id: u64,
     blocks: &[Block],
+    block_ranges: &[Range<usize>],
+    text: &mut String,
     body_font_size: f32,
     theme: &ThemeSpec,
-) -> ScrollAreaOutput<()> {
-    egui::ScrollArea::vertical()
-        .id_salt(document_scroll_id("preview_scroll", tab_id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            ui.add_space(28.0);
-            preview::show_preview_with_theme(ui, blocks, body_font_size, theme);
-        })
-}
-
-struct EditorSearchTarget<'a> {
-    range: Option<&'a Range<usize>>,
+    active_block: Option<usize>,
+    active_range: Option<Range<usize>>,
+    initial_cursor: Option<usize>,
+    request_focus: bool,
+    search_range: Option<Range<usize>>,
     scroll_to_search: bool,
-}
-
-fn show_centered_editor(
-    ui: &mut egui::Ui,
-    tab_id: u64,
-    text: &mut String,
-    focused: &mut bool,
-    font_size: f32,
-    theme: &ThemeSpec,
-    search: EditorSearchTarget<'_>,
-) {
+    typewriter_mode: bool,
+    dim_inactive: bool,
+    stale_blocks: bool,
+    heading_target: Option<usize>,
+    images: &mut preview::PreviewImages<'_>,
+    heights: Option<&mut Vec<f32>>,
+) -> preview::BlockEditorOutput {
     egui::ScrollArea::vertical()
-        .id_salt(document_scroll_id("editor_scroll_solo", tab_id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .id_salt(document_scroll_id("editor_scroll_hybrid", tab_id))
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let width = ui.available_width().min(theme.content_width);
+        .show_viewport(ui, |ui, visible| {
+            // Long documents render only the band around the visible slice.
+            // `content_origin` maps egui's content-relative viewport band into
+            // the same global coordinates the block walk uses for its cursor.
+            let content_origin = ui.cursor().min.y;
+            let mut viewport = heights.map(|heights| preview::PreviewViewport {
+                band: (content_origin + visible.min.y)..(content_origin + visible.max.y),
+                heights,
+                margin: ((visible.max.y - visible.min.y) * 1.5).max(600.0),
+            });
+            // Keep the document column centered and stable. The active block
+            // supplies the editing affordance while the rest stays rendered.
+            let available_width = ui.available_width();
+            let width = available_width.min(theme.content_width);
             ui.horizontal(|ui| {
-                ui.add_space(((ui.available_width() - width) / 2.0).max(20.0));
+                ui.add_space(((available_width - width) / 2.0).max(24.0));
                 ui.allocate_ui_with_layout(
                     egui::vec2(width, ui.available_height()),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.add_space(54.0);
-                        let output = editor_widget(ui, text, focused, font_size, search.range);
-                        if search.scroll_to_search
-                            && let Some(range) = search.range
-                        {
-                            scroll_editor_to_search(ui, &output, range);
-                        }
-                        ui.add_space(160.0);
+                        ui.push_id(("hybrid_document", tab_id), |ui| {
+                            preview::show_preview_with_block_editor_and_search(
+                                ui,
+                                blocks,
+                                block_ranges,
+                                text,
+                                body_font_size,
+                                theme,
+                                active_block,
+                                active_range,
+                                initial_cursor,
+                                request_focus,
+                                search_range,
+                                scroll_to_search,
+                                typewriter_mode,
+                                dim_inactive,
+                                stale_blocks,
+                                heading_target,
+                                images,
+                                viewport.as_mut(),
+                            )
+                        })
+                        .inner
                     },
-                );
-            });
-        });
-}
-
-fn show_centered_preview(
-    ui: &mut egui::Ui,
-    tab_id: u64,
-    blocks: &[Block],
-    body_font_size: f32,
-    theme: &ThemeSpec,
-) {
-    egui::ScrollArea::vertical()
-        .id_salt(document_scroll_id("preview_scroll_solo", tab_id))
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let width = ui.available_width().min(theme.content_width);
-            ui.horizontal(|ui| {
-                ui.add_space(((ui.available_width() - width) / 2.0).max(20.0));
-                ui.allocate_ui_with_layout(
-                    egui::vec2(width, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        ui.add_space(54.0);
-                        preview::show_preview_with_theme(ui, blocks, body_font_size, theme);
-                        ui.add_space(160.0);
-                    },
-                );
-            });
-        });
+                )
+            })
+            .inner
+        })
+        .inner
+        .inner
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -3385,8 +3129,8 @@ fn setup_fonts(ctx: &egui::Context) {
             egui::TextStyle::Small,
             egui::FontId::new(12.0, egui::FontFamily::Proportional),
         );
-        style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-        style.spacing.button_padding = egui::vec2(9.0, 5.0);
+        style.spacing.item_spacing = egui::vec2(6.0, 5.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
         style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(5);
         style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(5);
         style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(5);
@@ -3402,11 +3146,19 @@ fn apply_visuals(ctx: &egui::Context, dark: bool, spec: &ThemeSpec) {
     };
     visuals.window_fill = spec.canvas;
     visuals.panel_fill = spec.panel;
+    // Keep the chrome quiet: panels and centered document frames use the
+    // window stroke by default, which creates hairlines around otherwise
+    // flat surfaces. Typora's canvas relies on whitespace and tone changes
+    // instead of boxed regions, so remove those global frame strokes.
+    visuals.window_stroke = egui::Stroke::NONE;
     visuals.extreme_bg_color = spec.code_bg;
     visuals.faint_bg_color = spec.quote_bg;
     visuals.hyperlink_color = spec.accent;
     visuals.override_text_color = Some(spec.text);
-    visuals.widgets.noninteractive.bg_stroke.color = spec.border;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
     visuals.selection.bg_fill = spec.accent.gamma_multiply(if dark { 0.42 } else { 0.20 });
     if !dark {
         visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
@@ -3445,77 +3197,30 @@ fn describe_read_error(e: &io::ReadError) -> String {
 }
 
 fn clock_time() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-    format!("{:02}:{:02}:{:02}", h, m, s)
-}
-
-/// Compare scroll progress in physical content pixels instead of a fixed ratio.
-/// A ratio threshold makes long documents update in large visible chunks.
-fn scroll_position_changed(previous_ratio: f32, current_ratio: f32, max_scroll: f32) -> bool {
-    (current_ratio - previous_ratio).abs() * max_scroll > 0.5
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn editor_source_position(editor: &ScrollAreaOutput<EditorWidgetOutput>, text: &str) -> f32 {
-    let galley_y = (editor.inner_rect.top() - editor.inner.galley_pos.y).max(0.0);
-    let cursor = editor
-        .inner
-        .galley
-        .cursor_from_pos(egui::vec2(editor.inner.galley.rect.left(), galley_y));
-    source_position_from_char(text, cursor.index.0)
-}
-
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn editor_offset_for_source_position(
-    editor: &ScrollAreaOutput<EditorWidgetOutput>,
-    text: &str,
-    source_position: f32,
-) -> f32 {
-    let char_index = char_index_from_source_position(text, source_position);
-    let cursor_rect = editor
-        .inner
-        .galley
-        .pos_from_cursor(egui::text::CCursor::new(char_index));
-    let cursor_screen_y = editor.inner.galley_pos.y + cursor_rect.top();
-    let max_scroll = (editor.content_size.y - editor.inner_rect.height()).max(0.0);
-    (editor.state.offset.y + cursor_screen_y - editor.inner_rect.top()).clamp(0.0, max_scroll)
-}
-
-fn source_position_from_char(text: &str, char_index: usize) -> f32 {
-    let mut line = 0usize;
-    let mut line_start = 0usize;
-    let bounded_index = char_index.min(text.chars().count());
-    for (index, ch) in text.chars().take(bounded_index).enumerate() {
-        if ch == '\n' {
-            line += 1;
-            line_start = index + 1;
-        }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut local = SYSTEMTIME::default();
+        // SAFETY: GetLocalTime only writes through the provided pointer and
+        // fills every field of the SYSTEMTIME structure.
+        unsafe { GetLocalTime(&mut local) };
+        format!(
+            "{:02}:{:02}:{:02}",
+            local.wHour, local.wMinute, local.wSecond
+        )
     }
-    let line_length = text
-        .chars()
-        .skip(line_start)
-        .take_while(|ch| *ch != '\n')
-        .count();
-    let column = bounded_index.saturating_sub(line_start).min(line_length);
-    line as f32 + column as f32 / line_length.max(1) as f32
-}
-
-fn char_index_from_source_position(text: &str, source_position: f32) -> usize {
-    let target_line = source_position.max(0.0).floor() as usize;
-    let fraction = source_position.max(0.0).fract();
-    let mut char_index = 0usize;
-    for (line_index, line) in text.split('\n').enumerate() {
-        let line_length = line.chars().count();
-        if line_index == target_line {
-            return char_index + (fraction * line_length as f32).round() as usize;
-        }
-        char_index += line_length + 1;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Time-zone lookup without extra dependencies is only wired up for
+        // Windows; other platforms keep the previous UTC display.
+        let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+        format!("{:02}:{:02}:{:02}", h, m, s)
     }
-    text.chars().count()
 }
 
 #[cfg(test)]
@@ -3532,30 +3237,6 @@ mod app_tests {
             document_scroll_id("preview_scroll", 1),
             document_scroll_id("preview_scroll", 2)
         );
-    }
-
-    #[test]
-    fn switching_tabs_queues_each_documents_own_preview_position() {
-        let mut app = app_with_two_tabs();
-        app.tabs[0].preview_source_position = 12.5;
-        app.tabs[1].preview_source_position = 84.25;
-
-        app.activate_tab(1);
-        assert_eq!(app.pending_preview_restore, Some((2, 84.25)));
-
-        app.activate_tab(0);
-        assert_eq!(app.pending_preview_restore, Some((1, 12.5)));
-    }
-
-    #[test]
-    fn closing_active_tab_restores_the_next_documents_position() {
-        let mut app = app_with_two_tabs();
-        app.tabs[1].preview_source_position = 42.0;
-
-        app.close_tab_now(0);
-
-        assert_eq!(app.id, 2);
-        assert_eq!(app.pending_preview_restore, Some((2, 42.0)));
     }
 
     #[test]
@@ -3593,20 +3274,25 @@ mod app_tests {
             search_results: search::SearchResults::default(),
             search_tab_id: None,
             search_document_revision: 0,
+            search_generation: 0,
+            search_pending: None,
             search_focus_requested: false,
             search_scroll_requested: false,
             search_backwards: false,
+            search_input_has_focus: false,
             pending_close: None,
             window_close_guard: window_close::CloseGuard::default(),
             recovery: None,
             dark: false,
-            editor_focused: false,
-            view_mode: ViewMode::Write,
             focus_mode: false,
+            typewriter_mode: false,
+            active_edit_block: None,
+            active_edit_range: None,
+            pending_edit_cursor: None,
+            edit_focus_requested: false,
             show_status: true,
             body_font_size: 15.0,
             theme_package: None,
-            theme_revision: 1,
             auto_reload_external: true,
             last_external_poll: f64::NEG_INFINITY,
             external_watcher: None,
@@ -3616,14 +3302,159 @@ mod app_tests {
             draft_window_id: None,
             persisted_window_session: None,
             window_session_initialized: false,
-            pending_preview_restore: None,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            browser_preview: web_preview::BrowserPreview::default(),
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            benchmark_probe: None,
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            browser_document_cache: None,
+            image_cache: preview::ImageCache::default(),
+            parse_worker: ParseWorker::new(),
+            search_worker: SearchWorker::new(),
+            text_stats_cache: None,
+            last_draft_signature: None,
+            search_byte_cache: None,
+            last_window_title: None,
         }
+    }
+
+    #[test]
+    fn 脏状态缓存随源码版本与磁盘快照失效() {
+        let mut tab = DocumentTab::from_file(
+            1,
+            PathBuf::from("cached.md"),
+            "原文".to_string(),
+            "原文".as_bytes().to_vec(),
+        );
+        assert!(!tab.is_dirty());
+
+        // 长度相同的磁盘快照同样要让缓存失效，否则保存后仍显示未保存。
+        tab.replace_disk_snapshot("新文".as_bytes().to_vec());
+        assert!(tab.is_dirty());
+
+        tab.core.set_source("新文".to_string());
+        assert!(!tab.is_dirty());
+    }
+
+    #[test]
+    fn 草稿签名随编辑与磁盘快照变化() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].text = "草稿".to_string();
+        app.tabs[0].core.mark_source_changed();
+        let first = app.draft_signature(&app.draft_candidates());
+        assert_eq!(first.len(), 1);
+
+        // 未再编辑时签名不变：自动保存不会再重写同一份草稿。
+        assert_eq!(app.draft_signature(&app.draft_candidates()), first);
+
+        app.tabs[0].core.mark_source_changed();
+        assert_ne!(app.draft_signature(&app.draft_candidates()), first);
+    }
+
+    #[test]
+    fn 过期解析结果不能覆盖当前文档快照() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].text = "# newest".to_string();
+        let current_revision = app.tabs[0].core.mark_source_changed();
+        app.tabs[0].parse_requested_revision = Some(current_revision);
+
+        let stale = ParseResult {
+            tab_id: 1,
+            revision: current_revision - 1,
+            document: Arc::new(markdown::parse_document("# stale")),
+        };
+        assert!(!app.apply_parse_result(stale));
+        assert_eq!(app.tabs[0].document.source(), "");
+        assert!(!app.tabs[0].is_parsed_current());
+
+        let current = ParseResult {
+            tab_id: 1,
+            revision: current_revision,
+            document: Arc::new(markdown::parse_document("# newest")),
+        };
+        assert!(app.apply_parse_result(current));
+        assert_eq!(app.tabs[0].document.source(), "# newest");
+        assert!(app.tabs[0].is_parsed_current());
+        assert_eq!(app.tabs[0].parse_requested_revision, None);
+    }
+
+    #[test]
+    fn 已关闭标签的迟到解析结果会被忽略() {
+        let mut app = app_with_two_tabs();
+        let result = ParseResult {
+            tab_id: 99,
+            revision: 1,
+            document: Arc::new(markdown::parse_document("orphan")),
+        };
+
+        assert!(!app.apply_parse_result(result));
+        assert_eq!(app.tabs.len(), 2);
+    }
+
+    #[test]
+    fn 编辑后由后台解析结果恢复一致快照() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].text = "# 后台解析".to_string();
+        app.mark_tab_source_changed(0, 1.0);
+
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !app.tabs[0].is_parsed_current() {
+            app.poll_parse_results(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "后台解析结果未在期限内返回"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(app.tabs[0].document.source(), "# 后台解析");
+    }
+
+    #[test]
+    fn 过期搜索结果不能覆盖当前查询() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].text = "new new".to_string();
+        app.tabs[0].core.mark_source_changed();
+        app.search_open = true;
+        app.search_generation = 2;
+        app.search_tab_id = Some(1);
+        app.search_document_revision = app.tabs[0].document_revision;
+        app.search_pending = Some((1, app.tabs[0].document_revision, 2));
+
+        let stale = SearchResult {
+            tab_id: 1,
+            revision: app.tabs[0].document_revision,
+            generation: 1,
+            results: search::SearchResults::new("old old", "old"),
+        };
+        assert!(!app.apply_search_result(stale));
+        assert!(app.search_results.ranges().is_empty());
+
+        let current = SearchResult {
+            tab_id: 1,
+            revision: app.tabs[0].document_revision,
+            generation: 2,
+            results: search::SearchResults::new("new new", "new"),
+        };
+        assert!(app.apply_search_result(current));
+        assert_eq!(app.search_results.ranges(), &[0..3, 4..7]);
+        assert_eq!(app.search_pending, None);
+    }
+
+    #[test]
+    fn 搜索请求由后台任务返回并带有当前版本() {
+        let mut app = app_with_two_tabs();
+        app.tabs[0].text = "alpha beta alpha".to_string();
+        app.tabs[0].core.mark_source_changed();
+        app.search_open = true;
+        app.search_query = "alpha".to_string();
+        app.refresh_search();
+
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.search_pending.is_some() {
+            app.poll_search_results(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "后台搜索结果未在期限内返回"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(app.search_results.ranges(), &[0..5, 11..16]);
     }
 
     #[test]
@@ -3909,6 +3740,8 @@ mod app_tests {
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.path.as_ref(), Some(&path));
         assert_eq!(app.text, "启动文件内容");
+        assert_eq!(app.active_edit_block, Some(0));
+        assert!(app.edit_focus_requested);
         let _ = std::fs::remove_file(path);
     }
 
@@ -3939,6 +3772,8 @@ mod app_tests {
         assert_eq!(app.tabs[1].path.as_ref(), Some(&second));
         assert_eq!(app.active_tab, 1);
         assert!(app.tabs.iter().all(|tab| tab.path.is_some()));
+        assert_eq!(app.active_edit_block, Some(0));
+        assert!(app.edit_focus_requested);
         let _ = std::fs::remove_dir_all(directory);
     }
 
@@ -3968,34 +3803,6 @@ mod app_tests {
         assert_eq!(
             reading_headings(&blocks),
             vec![(1, "总览 v1".to_string()), (3, "细节".to_string())]
-        );
-    }
-
-    #[test]
-    fn 长文档的小幅滚动也会立即触发同步() {
-        let max_scroll = 50_000.0;
-        let one_pixel = 1.0 / max_scroll;
-        assert!(scroll_position_changed(0.4, 0.4 + one_pixel, max_scroll));
-        assert!(!scroll_position_changed(
-            0.4,
-            0.4 + 0.25 / max_scroll,
-            max_scroll
-        ));
-    }
-
-    #[test]
-    fn 源码字符位置与行内进度可以双向转换() {
-        let text = "第一行\n第二行较长\n第三行";
-        let second_line_middle = "第一行\n第二".chars().count();
-        let position = source_position_from_char(text, second_line_middle);
-        assert!((position - 1.4).abs() < 0.001);
-        assert_eq!(
-            char_index_from_source_position(text, position),
-            second_line_middle
-        );
-        assert_eq!(
-            char_index_from_source_position(text, 99.0),
-            text.chars().count()
         );
     }
 
@@ -4062,11 +3869,27 @@ mod app_tests {
         std::fs::write(&path, "next").unwrap();
 
         assert!(matches!(
-            app.probe_external_change(&path, b"base", 0.0, true),
+            MdEditorApp::probe_external_change(
+                &mut app.observed_file_stamps,
+                &mut app.pending_external_changes,
+                &app.tabs,
+                0,
+                &path,
+                0.0,
+                true,
+            ),
             ExternalProbe::Waiting
         ));
         assert!(matches!(
-            app.probe_external_change(&path, b"base", EXTERNAL_STABLE_DELAY, false),
+            MdEditorApp::probe_external_change(
+                &mut app.observed_file_stamps,
+                &mut app.pending_external_changes,
+                &app.tabs,
+                0,
+                &path,
+                EXTERNAL_STABLE_DELAY,
+                false,
+            ),
             ExternalProbe::Stable(bytes) if bytes == b"next"
         ));
         let _ = std::fs::remove_dir_all(directory);
@@ -4082,7 +3905,7 @@ mod app_tests {
         let path = directory.join("restored.md");
         std::fs::write(&path, "磁盘内容").unwrap();
         let mut app = app_with_two_tabs();
-        app.external_watcher = ExternalFileWatcher::new();
+        app.external_watcher = ExternalFileWatcher::new(egui::Context::default());
         let session = io::DraftSession::new(
             7,
             vec![io::DraftTab::new(
@@ -4104,16 +3927,6 @@ mod app_tests {
     }
 
     #[test]
-    fn 预览搜索只把渲染后的可见文字视为匹配() {
-        let mut app = app_with_two_tabs();
-        app.tabs[0].document = markdown::parse_document("**可见文字** [链接](https://example.com)");
-        app.search_query = "可见文字".to_string();
-        assert!(app.preview_search_has_match());
-        app.search_query = "https://example.com".to_string();
-        assert!(!app.preview_search_has_match());
-    }
-
-    #[test]
     fn 带bom的磁盘快照不会被误判为本地修改() {
         let snapshot = [b"\xef\xbb\xbf".as_slice(), "正文".as_bytes()].concat();
         assert!(snapshot_matches_text(&snapshot, "正文"));
@@ -4132,5 +3945,16 @@ mod app_tests {
         assert!(has_supported_text_extension(Path::new("草稿.TXT")));
         assert!(!has_supported_text_extension(Path::new("图片.png")));
         assert!(!has_supported_text_extension(Path::new("无扩展名")));
+    }
+
+    #[test]
+    fn 解析落后时丢弃块点击() {
+        // Regression for the stale-parse contract (ADR-0004 decision 3): a
+        // click captured against the previous parse's block indices must not
+        // move the editor or its caret. `preview.rs` has the frame-level
+        // counterpart that feeds a real click through the egui harness.
+        assert_eq!(clicked_block_accepted(false, Some(2)), None);
+        assert_eq!(clicked_block_accepted(false, None), None);
+        assert_eq!(clicked_block_accepted(true, Some(2)), Some(2));
     }
 }

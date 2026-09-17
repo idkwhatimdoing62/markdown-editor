@@ -1,6 +1,6 @@
 //! 导出渲染结果：HTML 与 PDF。
 //!
-//! 导出与浏览器预览共享主题 CSS、Markdown 解析规则、字号覆盖和应用字体。
+//! 导出与编辑器共享 Markdown 解析规则、字号覆盖和应用字体。
 //! HTML 会内嵌本地图片与字体；PDF 从同一份主题化 DOM 生成。
 
 use std::collections::BTreeMap;
@@ -10,7 +10,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use pulldown_cmark::{CowStr, Event, Tag, html};
 
-use crate::markdown::ParsedDocument;
+use crate::markdown::{self, ParsedDocument};
 
 /// 一次导出所需的预览状态。调用方必须传入当前主题，而非使用导出模块默认样式。
 #[derive(Clone, Copy)]
@@ -31,7 +31,10 @@ pub fn render_html(document: &ParsedDocument) -> String {
     let mut out = String::new();
     html::push_html(
         &mut out,
-        document.events().iter().map(|item| item.event.clone()),
+        document
+            .events()
+            .iter()
+            .map(|item| sanitize_export_event(item.event.clone())),
     );
     out
 }
@@ -42,7 +45,7 @@ pub fn export_html(
     options: ExportOptions<'_>,
 ) -> Result<(), String> {
     let doc = render_styled_html(document, options);
-    std::fs::write(path, doc).map_err(|e| e.to_string())
+    crate::storage::write_atomic(path, doc.as_bytes()).map_err(|e| e.to_string())
 }
 
 pub fn render_styled_html(document: &ParsedDocument, options: ExportOptions<'_>) -> String {
@@ -89,13 +92,16 @@ pub fn export_pdf(
     let doc =
         printpdf::PdfDocument::from_html(&html_doc, &images, &fonts, &options, &mut warnings)?;
     let bytes = doc.save(&printpdf::PdfSaveOptions::default(), &mut warnings);
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    crate::storage::write_atomic(path, &bytes).map_err(|e| e.to_string())
 }
 
 fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool) -> String {
+    // Theme packages are user-provided CSS. Keep a less-than sign from being
+    // interpreted as an HTML end tag inside the surrounding <style> element.
+    let theme_css = sanitize_style_text(options.theme_css);
     let font_size = options
         .body_font_size
-        .map(|size| crate::theme::font_size_override_css(options.theme_css, size))
+        .map(|size| crate::theme::font_size_override_css(&theme_css, size))
         .unwrap_or_default();
     let mermaid = if include_mermaid && body.contains("language-mermaid") {
         format!(
@@ -107,17 +113,21 @@ fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool
         String::new()
     };
     let font_css = if include_mermaid {
-        embedded_font_css()
+        embedded_font_css(document_needs_cjk_font(body))
     } else {
         PDF_FONT_CSS.to_string()
     };
     format!(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{STRUCTURAL_FALLBACK}</style><style>{}</style><style>{}{}{font_size}</style>{mermaid}</head><body>{body}</body></html>",
         escape_html(options.title),
-        options.theme_css,
+        theme_css,
         font_css,
         MARKDOWN_DOM_COMPATIBILITY,
     )
+}
+
+fn sanitize_style_text(css: &str) -> String {
+    css.replace('<', "\\3c ")
 }
 
 fn render_export_body(
@@ -129,7 +139,7 @@ fn render_export_body(
     let mut image_index = 0usize;
     let events = document.events().iter().map(|item| {
         rewrite_export_image_event(
-            item.event.clone(),
+            sanitize_export_event(item.event.clone()),
             base_directory,
             image_mode,
             &mut images,
@@ -141,6 +151,61 @@ fn render_export_body(
     annotate_code_languages(&mut body);
     normalize_footnote_dom(&mut body);
     (body, images)
+}
+
+/// Prevent exported HTML from turning Markdown links into executable URLs.
+///
+/// Relative links and ordinary web/mail protocols remain intact. URL schemes
+/// that can execute script in a browser are replaced with a harmless fragment;
+/// this keeps the visible link text while matching the renderer's safe-by-
+/// default boundary.
+fn sanitize_link_event<'a>(event: Event<'a>) -> Event<'a> {
+    let Event::Start(Tag::Link {
+        link_type,
+        dest_url,
+        title,
+        id,
+    }) = event
+    else {
+        return event;
+    };
+
+    let destination = if markdown::is_safe_link_destination(dest_url.as_ref()) {
+        dest_url
+    } else {
+        CowStr::Borrowed("#")
+    };
+    Event::Start(Tag::Link {
+        link_type,
+        dest_url: destination,
+        title,
+        id,
+    })
+}
+
+fn sanitize_export_event<'a>(event: Event<'a>) -> Event<'a> {
+    match sanitize_link_event(event) {
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: if safe_export_image_url(dest_url.as_ref()) {
+                dest_url
+            } else {
+                CowStr::Borrowed("#")
+            },
+            title,
+            id,
+        }),
+        Event::Html(fragment) => Event::Html(sanitize_raw_html_fragment(fragment.as_ref()).into()),
+        Event::InlineHtml(fragment) => {
+            Event::InlineHtml(sanitize_raw_html_fragment(fragment.as_ref()).into())
+        }
+        event => event,
+    }
 }
 
 fn rewrite_export_image_event<'a>(
@@ -165,7 +230,10 @@ fn rewrite_export_image_event<'a>(
                 image_index,
             )
             .map(CowStr::from)
-            .unwrap_or(dest_url);
+            // Never fall back to an unvalidated Markdown image URL. In
+            // particular, `javascript:` and `data:` payloads must not survive
+            // an export just because the source file could not be embedded.
+            .unwrap_or_else(|| CowStr::Borrowed("#"));
             Event::Start(Tag::Image {
                 link_type,
                 dest_url: destination,
@@ -174,20 +242,31 @@ fn rewrite_export_image_event<'a>(
             })
         }
         Event::Html(fragment) => Event::Html(
-            crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
-                export_image_destination(destination, base_directory, mode, images, image_index)
-            })
+            sanitize_raw_html_fragment(&crate::html_image::rewrite_sources(
+                fragment.as_ref(),
+                |destination| {
+                    export_image_destination(destination, base_directory, mode, images, image_index)
+                },
+            ))
             .into(),
         ),
         Event::InlineHtml(fragment) => Event::InlineHtml(
-            crate::html_image::rewrite_sources(fragment.as_ref(), |destination| {
-                export_image_destination(destination, base_directory, mode, images, image_index)
-            })
+            sanitize_raw_html_fragment(&crate::html_image::rewrite_sources(
+                fragment.as_ref(),
+                |destination| {
+                    export_image_destination(destination, base_directory, mode, images, image_index)
+                },
+            ))
             .into(),
         ),
         event => event,
     }
 }
+
+/// Cap embedded image bytes at the same size the preview loader accepts, so
+/// one accidental multi-gigabyte file next to the document cannot exhaust
+/// memory during export.
+const MAX_EMBEDDED_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 fn export_image_destination(
     destination: &str,
@@ -198,6 +277,9 @@ fn export_image_destination(
 ) -> Option<String> {
     let path = local_image_path(destination, base_directory)?;
     let content_type = image_content_type(&path)?;
+    if std::fs::metadata(&path).ok()?.len() > MAX_EMBEDDED_IMAGE_BYTES {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     Some(match mode {
         ImageMode::StandaloneHtml => {
@@ -212,6 +294,326 @@ fn export_image_destination(
     })
 }
 
+/// Keep raw HTML useful for simple inline markup while making exported output
+/// inert. Markdown-generated HTML is unaffected; this only handles explicit
+/// `Html`/`InlineHtml` events from the source document.
+fn sanitize_raw_html_fragment(fragment: &str) -> String {
+    const ALLOWED: &[&str] = &[
+        "a",
+        "b",
+        "blockquote",
+        "br",
+        "code",
+        "del",
+        "div",
+        "em",
+        "hr",
+        "i",
+        "img",
+        "li",
+        "ol",
+        "p",
+        "pre",
+        "s",
+        "small",
+        "span",
+        "strong",
+        "sub",
+        "sup",
+        "table",
+        "tbody",
+        "td",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    ];
+    const BLOCKED: &[&str] = &[
+        "script", "style", "iframe", "object", "embed", "form", "meta", "link", "base", "template",
+    ];
+
+    let mut output = String::with_capacity(fragment.len());
+    let mut cursor = 0;
+    while let Some(relative) = fragment[cursor..].find('<') {
+        let start = cursor + relative;
+        output.push_str(&fragment[cursor..start]);
+        let Some(end_rel) = raw_tag_end(&fragment[start..]) else {
+            output.push_str("&lt;");
+            output.push_str(&fragment[start + 1..]);
+            cursor = fragment.len();
+            break;
+        };
+        let end = start + end_rel;
+        let token = &fragment[start..=end];
+        if token.starts_with("<!--") {
+            cursor = end + 1;
+            continue;
+        }
+        let bytes = token.as_bytes();
+        let mut name_start = 1usize;
+        let closing = bytes.get(name_start) == Some(&b'/');
+        if closing {
+            name_start += 1;
+        }
+        while name_start < bytes.len() && bytes[name_start].is_ascii_whitespace() {
+            name_start += 1;
+        }
+        let name_end = (name_start..bytes.len())
+            .find(|index| !bytes[*index].is_ascii_alphanumeric())
+            .unwrap_or(bytes.len());
+        let name = token[name_start..name_end].to_ascii_lowercase();
+        if name.is_empty() || name == "!doctype" || name == "![cdata[" {
+            output.push_str("&lt;");
+            output.push_str(&fragment[start + 1..=end]);
+            cursor = end + 1;
+            continue;
+        }
+        if BLOCKED.contains(&name.as_str()) {
+            if !closing {
+                let lower = fragment[end + 1..].to_ascii_lowercase();
+                if let Some(close_start) = lower.find(&format!("</{name}"))
+                    && let Some(close_end_rel) = raw_tag_end(&fragment[end + 1 + close_start..])
+                {
+                    cursor = end + 1 + close_start + close_end_rel + 1;
+                    continue;
+                }
+                cursor = end + 1;
+                continue;
+            }
+            cursor = end + 1;
+            continue;
+        }
+        if !ALLOWED.contains(&name.as_str()) {
+            output.push_str("&lt;");
+            output.push_str(&fragment[start + 1..=end]);
+            cursor = end + 1;
+            continue;
+        }
+        if closing {
+            output.push_str("</");
+            output.push_str(&name);
+            output.push('>');
+            cursor = end + 1;
+            continue;
+        }
+        output.push('<');
+        output.push_str(&name);
+        for (attr, value) in raw_attributes(&token[name_end..token.len() - 1]) {
+            let value = match attr.as_str() {
+                "href" if name == "a" => {
+                    if markdown::is_safe_link_destination(&value) {
+                        value
+                    } else {
+                        "#".to_string()
+                    }
+                }
+                "src" if name == "img" => {
+                    if safe_export_image_url(&value) {
+                        value
+                    } else {
+                        continue;
+                    }
+                }
+                "alt" | "title" | "loading" if name == "img" => value,
+                "title" if name == "a" => value,
+                "class" if name == "code" || name == "pre" || name == "span" => value,
+                "style" if name == "img" => {
+                    let Some(safe) = sanitize_img_style(&value) else {
+                        continue;
+                    };
+                    safe
+                }
+                "width" | "height"
+                    if name == "img" && value.chars().all(|ch| ch.is_ascii_digit()) =>
+                {
+                    value
+                }
+                _ => continue,
+            };
+            output.push(' ');
+            output.push_str(&attr);
+            output.push_str("=\"");
+            output.push_str(&escape_html(&value));
+            output.push('"');
+        }
+        if token[..token.len() - 1].trim_end().ends_with('/') {
+            output.push_str(" />");
+        } else {
+            output.push('>');
+        }
+        cursor = end + 1;
+    }
+    if cursor < fragment.len() {
+        output.push_str(&fragment[cursor..]);
+    }
+    output
+}
+
+/// Keep only the layout declarations `html_image` generates for `<img>`
+/// width mapping (`display:block`, `width:<px>`, `max-width:100%`). The
+/// sanitizer previously stripped every `style` attribute, which silently
+/// dropped the injected sizing; anything beyond this allowlist is rejected
+/// as a whole so no declaration can smuggle URLs or expressions.
+fn sanitize_img_style(value: &str) -> Option<String> {
+    let mut kept = Vec::new();
+    for declaration in value.split(';') {
+        let (property, size) = declaration.split_once(':')?;
+        let property = property.trim().to_ascii_lowercase();
+        let size = size.trim().to_ascii_lowercase();
+        let dimension_ok = size.ends_with("px") && size[..size.len() - 2].parse::<f64>().is_ok();
+        let allowed = match property.as_str() {
+            "display" => size == "block",
+            "width" => dimension_ok,
+            "max-width" => size == "100%",
+            _ => false,
+        };
+        if !allowed {
+            return None;
+        }
+        kept.push(format!("{property}:{size}"));
+    }
+    (!kept.is_empty()).then(|| kept.join(";"))
+}
+
+fn raw_tag_end(fragment: &str) -> Option<usize> {
+    let bytes = fragment.as_bytes();
+    let mut quote = None;
+    for (index, byte) in bytes.iter().copied().enumerate().skip(1) {
+        match (quote, byte) {
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (Some(open), current) if open == current => quote = None,
+            (None, b'>') => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn raw_attributes(input: &str) -> Vec<(String, String)> {
+    let bytes = input.as_bytes();
+    let mut attrs = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b'/')
+        {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < bytes.len()
+            && (bytes[cursor].is_ascii_alphanumeric()
+                || matches!(bytes[cursor], b'-' | b'_' | b':' | b'.'))
+        {
+            cursor += 1;
+        }
+        if cursor == start {
+            cursor += 1;
+            continue;
+        }
+        let name = input[start..cursor].to_ascii_lowercase();
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'=' {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+        let quote = matches!(bytes[cursor], b'\'' | b'"').then_some(bytes[cursor]);
+        if quote.is_some() {
+            cursor += 1;
+        }
+        let value_start = cursor;
+        if let Some(quote) = quote {
+            while cursor < bytes.len() && bytes[cursor] != quote {
+                cursor += 1;
+            }
+        } else {
+            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+        }
+        attrs.push((name, decode_raw_entities(&input[value_start..cursor])));
+        if quote.is_some() && cursor < bytes.len() {
+            cursor += 1;
+        }
+    }
+    attrs
+}
+
+fn decode_raw_entities(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(relative) = value[cursor..].find('&') {
+        let start = cursor + relative;
+        output.push_str(&value[cursor..start]);
+        let tail = &value[start + 1..];
+        if let Some(end) = tail.find(';') {
+            let entity = &tail[..end];
+            let decoded = match entity.to_ascii_lowercase().as_str() {
+                "amp" => Some('&'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                numeric if numeric.strip_prefix('#').is_some() => {
+                    let numeric = numeric.strip_prefix('#').unwrap();
+                    let value = numeric.strip_prefix('x').map_or_else(
+                        || numeric.parse::<u32>().ok(),
+                        |hex| u32::from_str_radix(hex, 16).ok(),
+                    );
+                    value.and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(decoded) = decoded {
+                output.push(decoded);
+                cursor = start + end + 2;
+                continue;
+            }
+        }
+        output.push('&');
+        cursor = start + 1;
+    }
+    output.push_str(&value[cursor..]);
+    output
+}
+
+fn safe_export_image_url(value: &str) -> bool {
+    if [
+        "data:image/png;",
+        "data:image/jpeg;",
+        "data:image/gif;",
+        "data:image/webp;",
+        "data:image/bmp;",
+    ]
+    .iter()
+    .any(|prefix| value.to_ascii_lowercase().starts_with(prefix))
+    {
+        return true;
+    }
+    // SVG can carry scripts and external references. Export only the raster
+    // formats that the image loader can safely decode.
+    let path_part = value.split(['?', '#']).next().unwrap_or(value);
+    if path_part
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("svg"))
+    {
+        return false;
+    }
+    let path = Path::new(value);
+    !path.is_absolute()
+        && !value.starts_with("//")
+        && url::Url::parse(value).is_err()
+        && !path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+}
+
 fn local_image_path(
     destination: &str,
     base_directory: Option<&Path>,
@@ -219,16 +621,18 @@ fn local_image_path(
     if destination.is_empty() || destination.starts_with('#') {
         return None;
     }
-    let path = Path::new(destination);
-    if path.is_absolute() {
-        return Some(path.to_path_buf());
+    let base = base_directory?;
+    // Export only images below the document directory. Absolute paths, file://
+    // URLs, and network URLs are intentionally excluded from the embedding path.
+    if Path::new(destination).is_absolute() || url::Url::parse(destination).is_ok() {
+        return None;
     }
-    if let Ok(url) = url::Url::parse(destination) {
-        return (url.scheme() == "file")
-            .then(|| url.to_file_path().ok())
-            .flatten();
-    }
-    Some(base_directory?.join(path))
+    let candidate = base.join(Path::new(destination));
+    let canonical_base = std::fs::canonicalize(base).ok()?;
+    let canonical_candidate = std::fs::canonicalize(candidate).ok()?;
+    canonical_candidate
+        .starts_with(&canonical_base)
+        .then_some(canonical_candidate)
 }
 
 fn image_content_type(path: &Path) -> Option<&'static str> {
@@ -243,29 +647,46 @@ fn image_content_type(path: &Path) -> Option<&'static str> {
         "gif" => Some("image/gif"),
         "webp" => Some("image/webp"),
         "bmp" => Some("image/bmp"),
-        "svg" => Some("image/svg+xml"),
         _ => None,
     }
 }
 
-fn embedded_font_css() -> String {
+/// Both embedded font families are kept for any document containing
+/// non-ASCII content (CJK text, typographic punctuation). For a pure-ASCII
+/// document the ~26 MB LXGW WenKai payload contributes no glyphs, so it is
+/// skipped and the exported file stays browser-sized.
+fn document_needs_cjk_font(body: &str) -> bool {
+    !body.is_ascii()
+}
+
+fn embedded_font_css(include_cjk: bool) -> String {
     let face = |family: &str, weight: u16, bytes: &[u8]| {
         format!(
             "@font-face{{font-family:'{family}';src:url('data:font/ttf;base64,{}') format('truetype');font-style:normal;font-weight:{weight};font-display:block;}}",
             BASE64.encode(bytes)
         )
     };
-    format!(
-        "{}{}{}{}body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono','LXGW WenKai Lite',monospace!important;font-synthesis:weight;}}strong,b{{font-family:'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',monospace!important;font-weight:700!important;}}",
+    let mono = format!(
+        // No `font-synthesis` restriction: the default `style weight` lets the
+        // browser oblique the mono face for `*emphasis*` while `strong` still
+        // resolves to the real bold face through the `!important` rules below.
+        "{}{}body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono',monospace!important;}}strong,b{{font-family:'Markdown Editor Mono Bold',monospace!important;font-weight:700!important;}}",
         face("Markdown Editor Mono", 400, jetbrains_mono_regular_bytes()),
         face(
             "Markdown Editor Mono Bold",
             700,
             jetbrains_mono_bold_bytes()
-        ),
+        )
+    );
+    if !include_cjk {
+        return mono;
+    }
+    let cjk = format!(
+        "{}{}body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono','LXGW WenKai Lite',monospace!important;}}strong,b{{font-family:'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',monospace!important;font-weight:700!important;}}",
         face("LXGW WenKai Lite", 400, lxgw_wenkai_regular_bytes()),
-        face("LXGW WenKai Lite Medium", 700, lxgw_wenkai_medium_bytes()),
-    )
+        face("LXGW WenKai Lite Medium", 700, lxgw_wenkai_medium_bytes())
+    );
+    format!("{mono}{cjk}")
 }
 
 fn escape_html(value: &str) -> String {
@@ -345,6 +766,7 @@ table { width: 100%; border-collapse: collapse; border-spacing: 0; margin: 0 0 2
 th, td { padding: 8px 12px; border: 1px solid rgba(127, 127, 127, .22); text-align: left; }
 th { font-weight: 700; }
 tbody tr:nth-child(even) { background: rgba(127, 127, 127, .055); }
+img { max-width: 100%; }
 "#;
 
 const MARKDOWN_DOM_COMPATIBILITY: &str = r#"
@@ -409,6 +831,10 @@ pub fn bold_latin_font_bytes() -> Option<Vec<u8>> {
 const JB_MONO_REGULAR: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
 /// JetBrains Mono 粗体字体内置字节。
 const JB_MONO_BOLD: &[u8] = include_bytes!("../fonts/JetBrainsMono-Bold.ttf");
+/// JetBrains Mono 斜体，用于渲染 `*强调*`（egui 不会合成倾斜字形）。
+const JB_MONO_ITALIC: &[u8] = include_bytes!("../fonts/JetBrainsMono-Italic.ttf");
+/// JetBrains Mono 粗斜体，用于渲染 `***加粗斜体***`。
+const JB_MONO_BOLD_ITALIC: &[u8] = include_bytes!("../fonts/JetBrainsMono-BoldItalic.ttf");
 /// 霞鹜文楷轻便版常规字体，仅作为 JetBrains Mono 缺失中文字符的回退。
 const LXGW_WENKAI_REGULAR: &[u8] = include_bytes!("../fonts/LXGWWenKaiLite-Regular.ttf");
 /// 霞鹜文楷轻便版 Medium 字重，用于中文标题和粗体。
@@ -430,7 +856,8 @@ pub fn lxgw_wenkai_medium_bytes() -> &'static [u8] {
     LXGW_WENKAI_MEDIUM
 }
 
-/// 构造应用字体：英文优先 JetBrains Mono，中文回退到霞鹜文楷。
+/// 构造应用字体：英文使用 JetBrains Mono，中文回退到霞鹜文楷；斜体与粗体
+/// 使用各自的真实字重，代码保留等宽字体。
 fn app_font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -443,6 +870,14 @@ fn app_font_definitions() -> egui::FontDefinitions {
         egui::FontData::from_static(JB_MONO_BOLD).into(),
     );
     fonts.font_data.insert(
+        "jb_mono_italic".to_string(),
+        egui::FontData::from_static(JB_MONO_ITALIC).into(),
+    );
+    fonts.font_data.insert(
+        "jb_mono_bold_italic".to_string(),
+        egui::FontData::from_static(JB_MONO_BOLD_ITALIC).into(),
+    );
+    fonts.font_data.insert(
         "lxgw_wenkai".to_string(),
         egui::FontData::from_static(LXGW_WENKAI_REGULAR).into(),
     );
@@ -451,21 +886,120 @@ fn app_font_definitions() -> egui::FontDefinitions {
         egui::FontData::from_static(LXGW_WENKAI_MEDIUM).into(),
     );
 
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let family_fonts = fonts.families.entry(family).or_default();
-        family_fonts.insert(0, "lxgw_wenkai".to_string());
-        family_fonts.insert(0, "jb_mono".to_string());
+    // Document and UI text: JetBrains Mono first so Latin glyphs always come
+    // from it, 霞鹜文楷 picks up the CJK glyphs it lacks. egui's bundled
+    // Ubuntu-Light is dropped from the text slots; only the emoji fallback
+    // fonts from the default set are kept at the tail.
+    let default_families = fonts.families.clone();
+    let keep_fallbacks = |family: &[String]| -> Vec<String> {
+        family
+            .iter()
+            .filter(|name| {
+                let lower = name.to_ascii_lowercase();
+                lower.contains("emoji") || lower.contains("symbol")
+            })
+            .cloned()
+            .collect()
+    };
+    {
+        let proportional = fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default();
+        *proportional = ["jb_mono", "lxgw_wenkai"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        proportional.extend(keep_fallbacks(
+            &default_families[&egui::FontFamily::Proportional],
+        ));
+    }
+    {
+        let monospace = fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default();
+        *monospace = ["jb_mono", "lxgw_wenkai"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        monospace.extend(keep_fallbacks(
+            &default_families[&egui::FontFamily::Monospace],
+        ));
     }
 
-    let bold_family = vec!["jb_mono_bold".to_string(), "lxgw_wenkai_medium".to_string()];
-
-    fonts
-        .families
-        .insert(egui::FontFamily::Name("bold".into()), bold_family);
+    // egui has no font-weight concept, so each style is its own family. CJK
+    // falls back to the matching 霞鹜文楷 weight.
+    fonts.families.insert(
+        egui::FontFamily::Name("bold".into()),
+        vec![
+            "jb_mono_bold".to_string(),
+            "lxgw_wenkai_medium".to_string(),
+            "NotoEmoji-Regular".to_string(),
+            "emoji-icon-font".to_string(),
+        ],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("italic".into()),
+        vec![
+            "jb_mono_italic".to_string(),
+            "lxgw_wenkai".to_string(),
+            "NotoEmoji-Regular".to_string(),
+            "emoji-icon-font".to_string(),
+        ],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("bold_italic".into()),
+        vec![
+            "jb_mono_bold_italic".to_string(),
+            "lxgw_wenkai_medium".to_string(),
+            "NotoEmoji-Regular".to_string(),
+            "emoji-icon-font".to_string(),
+        ],
+    );
+    // CJK 标点专用族：JetBrains Mono 自带 `—— … “” ‘’ ·` 的半宽字形，而
+    // 中文排版需要全角（霞鹜文楷）。预览层按字符把这些标点切分到本族，
+    // 霞鹜文楷优先，其余字形仍回退 JetBrains Mono 保持一致。
+    fonts.families.insert(
+        egui::FontFamily::Name("cjk".into()),
+        vec![
+            "lxgw_wenkai".to_string(),
+            "jb_mono".to_string(),
+            "NotoEmoji-Regular".to_string(),
+            "emoji-icon-font".to_string(),
+        ],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("cjk_bold".into()),
+        vec![
+            "lxgw_wenkai_medium".to_string(),
+            "jb_mono_bold".to_string(),
+            "NotoEmoji-Regular".to_string(),
+            "emoji-icon-font".to_string(),
+        ],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("cjk_italic".into()),
+        vec![
+            "lxgw_wenkai".to_string(),
+            "jb_mono_italic".to_string(),
+            "NotoEmoji-Regular".to_string(),
+            "emoji-icon-font".to_string(),
+        ],
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("cjk_bold_italic".into()),
+        vec![
+            "lxgw_wenkai_medium".to_string(),
+            "jb_mono_bold_italic".to_string(),
+            "NotoEmoji-Regular".to_string(),
+            "emoji-icon-font".to_string(),
+        ],
+    );
     fonts
 }
 
-/// 安装应用字体：英文保持 JetBrains Mono，中文使用霞鹜文楷轻便版。
+/// 安装应用字体：正文使用比例字体，代码使用 JetBrains Mono，中文使用霞鹜文楷轻便版。
 pub fn install_app_fonts(ctx: &egui::Context) {
     ctx.set_fonts(app_font_definitions());
 }
@@ -479,24 +1013,49 @@ mod tests {
     }
 
     #[test]
-    fn compatible_strong_markup_is_exported_as_strong_html() {
+    fn strict_parser_keeps_malformed_strong_markup_literal() {
         let document = parsed("1. **结构层： **训练一个统一的纹样 LoRA。");
         let html = render_html(&document);
-        assert!(html.contains("<strong>结构层：</strong> 训练一个统一的纹样 LoRA。"));
-        assert!(!html.contains("**结构层"));
+        assert!(html.contains("**结构层： **训练一个统一的纹样 LoRA。"));
+        assert!(!html.contains("<strong>结构层：</strong>"));
     }
 
     #[test]
-    fn 英文优先jetbrains中文回退霞鹜文楷() {
+    fn 正文使用比例字体代码使用等宽字体() {
         let fonts = app_font_definitions();
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            let names = &fonts.families[&family];
-            assert_eq!(names[0], "jb_mono");
-            assert_eq!(names[1], "lxgw_wenkai");
+        // Latin text must come from JetBrains Mono, CJK falls back to 霞鹜文楷,
+        // and egui's bundled Ubuntu-Light must not linger in any text slot.
+        for family in [
+            egui::FontFamily::Proportional,
+            egui::FontFamily::Monospace,
+            egui::FontFamily::Name("bold".into()),
+            egui::FontFamily::Name("italic".into()),
+            egui::FontFamily::Name("bold_italic".into()),
+            egui::FontFamily::Name("cjk".into()),
+            egui::FontFamily::Name("cjk_bold".into()),
+            egui::FontFamily::Name("cjk_italic".into()),
+            egui::FontFamily::Name("cjk_bold_italic".into()),
+        ] {
+            assert!(
+                !fonts.families[&family]
+                    .iter()
+                    .any(|name| name.contains("Ubuntu")),
+                "族 {family:?} 不应再包含 Ubuntu-Light"
+            );
         }
+        let proportional = &fonts.families[&egui::FontFamily::Proportional];
+        assert_eq!(proportional[0], "jb_mono");
+        assert_eq!(proportional[1], "lxgw_wenkai");
+        let monospace = &fonts.families[&egui::FontFamily::Monospace];
+        assert_eq!(monospace[0], "jb_mono");
+        assert_eq!(monospace[1], "lxgw_wenkai");
         let bold = &fonts.families[&egui::FontFamily::Name("bold".into())];
         assert_eq!(bold[0], "jb_mono_bold");
         assert_eq!(bold[1], "lxgw_wenkai_medium");
+        let italic = &fonts.families[&egui::FontFamily::Name("italic".into())];
+        assert_eq!(italic[0], "jb_mono_italic");
+        let bold_italic = &fonts.families[&egui::FontFamily::Name("bold_italic".into())];
+        assert_eq!(bold_italic[0], "jb_mono_bold_italic");
     }
 
     #[test]
@@ -508,6 +1067,123 @@ mod tests {
         assert!(html_doc.contains("<ul>"));
         assert!(html_doc.contains("<li>本周发布 v1.2</li>"));
         assert!(html_doc.contains("<a href=\"https://example.com\">接口文档</a>"));
+    }
+
+    #[test]
+    fn 导出会屏蔽可执行链接协议() {
+        let document = parsed("[危险](javascript:alert(1)) [安全](notes/next.md)\n");
+        let html_doc = render_html(&document);
+        assert!(html_doc.contains("<a href=\"#\">危险</a>"));
+        assert!(html_doc.contains("<a href=\"notes/next.md\">安全</a>"));
+        assert!(!html_doc.contains("javascript:"));
+        let styled = render_styled_html(&document, test_options(None));
+        assert!(!styled.contains("javascript:"));
+    }
+
+    #[test]
+    fn markdown图片无法验证时不会回退到原始地址() {
+        let document = parsed("![危险](javascript:alert(1))\n![网络](https://example.com/a.png)\n");
+        let plain_html = render_html(&document);
+        assert!(!plain_html.to_ascii_lowercase().contains("javascript:"));
+        assert!(!plain_html.contains("https://example.com/a.png"));
+        let html_doc = render_styled_html(&document, test_options(None));
+        assert!(!html_doc.to_ascii_lowercase().contains("javascript:"));
+        assert!(!html_doc.contains("https://example.com/a.png"));
+        assert!(html_doc.matches("src=\"#\"").count() >= 2);
+    }
+
+    #[test]
+    fn svg图片不会被原样内嵌() {
+        let dir = std::env::temp_dir().join(format!(
+            "md_editor_svg_image_boundary_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("unsafe.svg"),
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>"#,
+        )
+        .unwrap();
+        let document = parsed("![图](unsafe.svg)\n");
+        let html_doc = render_styled_html(&document, test_options(Some(&dir)));
+        assert!(!html_doc.contains("image/svg+xml"));
+        assert!(!html_doc.contains("<script>alert(1)</script>"));
+        assert!(html_doc.contains("src=\"#\""));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn 主题css不会突破style边界() {
+        let document = parsed("安全\n");
+        let html_doc = render_styled_html(
+            &document,
+            ExportOptions {
+                title: "测试",
+                theme_css: "body { color: red; } </style><script>alert(1)</script>",
+                body_font_size: None,
+                base_directory: None,
+            },
+        );
+        assert!(!html_doc.contains("</style><script>"));
+        assert!(html_doc.contains("\\3c "));
+    }
+
+    #[test]
+    fn 原始html仅保留安全标签和属性() {
+        let document = parsed(
+            r#"<script>alert(1)</script><div onclick="alert(2)" style="color:red">安全</div><img src="javascript:alert(3)" onerror="alert(4)" alt="图">"#,
+        );
+        let html_doc = render_html(&document);
+        assert!(!html_doc.contains("<script"));
+        assert!(!html_doc.contains("onclick"));
+        assert!(!html_doc.contains("onerror"));
+        assert!(!html_doc.contains("javascript:"));
+        assert!(html_doc.contains("<div>安全</div>"));
+        assert!(html_doc.contains("<img alt=\"图\">") || html_doc.contains("<img alt=\"图\" />"));
+    }
+
+    #[test]
+    fn 前导空白或实体编码的可执行协议在导出中同样被阻断() {
+        // Browsers strip leading control characters and entities like &#x0A;
+        // before resolving the scheme, so the sanitizer must normalize first.
+        let document = parsed(
+            r#"<a href=" javascript:alert(1)">危险一</a><a href="&#x09;javascript:alert(2)">危险二</a><a href="&#10;javascript:alert(3)">危险三</a>"#,
+        );
+        let html_doc = render_html(&document);
+        let lower = html_doc.to_ascii_lowercase();
+        assert!(!lower.contains("javascript"), "{html_doc}");
+        assert_eq!(html_doc.matches("href=\"#\"").count(), 3, "{html_doc}");
+    }
+
+    #[test]
+    fn 图片style仅保留尺寸白名单其余整体丢弃() {
+        let document = parsed(
+            r#"<img src="a.png" style="display:block;width:320px;max-width:100%"><img src="b.png" style="position:fixed;background:url(http://evil/x)">"#,
+        );
+        let html_doc = render_html(&document);
+        assert!(
+            html_doc.contains("style=\"display:block;width:320px;max-width:100%\""),
+            "{html_doc}"
+        );
+        assert!(!html_doc.contains("position"), "{html_doc}");
+        assert!(!html_doc.contains("url("), "{html_doc}");
+    }
+
+    #[test]
+    fn 本地图片仅允许文档目录内的相对路径() {
+        let dir =
+            std::env::temp_dir().join(format!("md_editor_image_boundary_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(
+            dir.join("assets/a.png"),
+            include_bytes!("../assets/app-icon-256.png"),
+        )
+        .unwrap();
+        assert!(local_image_path("assets/a.png", Some(&dir)).is_some());
+        assert!(local_image_path("../a.png", Some(&dir)).is_none());
+        assert!(local_image_path("file:///C:/secret.png", Some(&dir)).is_none());
+        assert!(local_image_path("C:/secret.png", Some(&dir)).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -569,6 +1245,10 @@ mod tests {
         assert!(html.contains("src=\"data:image/png;base64,"));
         assert!(html.contains("alt=\"羊群正样本\""));
         assert!(html.contains("width=\"720\""));
+        assert!(
+            html.contains("style=\"width:720px;max-width:100%\""),
+            "重写注入的尺寸样式必须穿过消毒器存活，实际输出: {html}"
+        );
         assert!(!html.contains("./无人机动物检测讲解_assets/image7.png"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -582,13 +1262,26 @@ mod tests {
         assert!(html.contains("mermaid-diagram"));
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn windows绝对图片路径不会被误判为url() {
-        assert_eq!(
-            local_image_path(r"C:\纹样\莲花.png", None),
-            Some(std::path::PathBuf::from(r"C:\纹样\莲花.png"))
+    fn html导出按内容决定是否内嵌中文字体() {
+        // A pure-ASCII document must not pay for the ~26 MB LXGW payload,
+        // while any CJK or typographic punctuation still embeds both families.
+        let ascii = parsed("# Title\n\nEnglish body text only.\n");
+        let ascii_html = render_styled_html(&ascii, test_options(None));
+        assert!(ascii_html.contains("@font-face"));
+        assert!(ascii_html.contains("Markdown Editor Mono"));
+        assert!(
+            !ascii_html.contains("LXGW WenKai"),
+            "纯 ASCII 导出不应内嵌中文字体"
         );
+
+        let cjk = parsed("# 标题\n\n正文内容。\n");
+        let cjk_html = render_styled_html(&cjk, test_options(None));
+        assert!(
+            cjk_html.contains("LXGW WenKai Lite"),
+            "含中文导出必须内嵌中文字体"
+        );
+        assert!(cjk_html.contains("font-family:'Markdown Editor Mono','LXGW WenKai Lite'"));
     }
 
     #[test]

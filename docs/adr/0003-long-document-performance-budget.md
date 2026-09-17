@@ -1,6 +1,6 @@
 # ADR-0003：长文档采用分层基准和容量预算
 
-- 状态：已接受
+- 状态：已废弃（当前实现不使用 WebView）
 - 日期：2026-08-13
 
 ## 背景
@@ -81,3 +81,9 @@
 - 解析器、主题兼容层、WebView 或导出引擎更换；
 - 固定性能机连续两次越过预算；
 - 需要把 10 MiB 的完整 HTML 生成或编辑输入延迟纳入更严格的实时体验承诺。
+
+## 后续变更（2026-09-16）
+
+- 随 WebView 预览通道整体移除，本 ADR 依赖的基准设施一并删除：`scripts/benchmark-long-docs.ps1` 与基准二进制 `src/bin/markdown_benchmark.rs` 已不存在，“决策”中的两条 PowerShell 命令无法执行。文中的预算表与两轮基线数据保留为历史记录。
+- 长文档性能验证改由 `src/preview.rs` 测试模块承担：egui 帧级基准 `长文档全帧渲染耗时`（`#[ignore]`，手动 `cargo test -- --ignored --nocapture` 运行，`MD_BENCH_KB` 环境变量调节语料规模），以及视口剔除、陈旧解析等帧级回归测试。
+- 编辑架构的后续演进见 ADR-0004（Core + Worker + Snapshot）。

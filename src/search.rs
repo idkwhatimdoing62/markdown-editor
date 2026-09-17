@@ -13,13 +13,7 @@ impl SearchResults {
         if query.is_empty() {
             return Self::default();
         }
-        let byte_ranges = if query.is_ascii() {
-            ascii_case_insensitive_ranges(text, query)
-        } else {
-            text.match_indices(query)
-                .map(|(start, matched)| start..start + matched.len())
-                .collect::<Vec<_>>()
-        };
+        let byte_ranges = case_insensitive_byte_ranges(text, query);
         let ranges = byte_ranges_to_char_ranges(text, &byte_ranges);
         let current = (!ranges.is_empty()).then_some(0);
         Self { ranges, current }
@@ -55,17 +49,34 @@ impl SearchResults {
     }
 }
 
-fn ascii_case_insensitive_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
+/// ASCII 大小写不敏感的字节级子串搜索（Horspool 坏字符跳跃 + 逐字节验证）。
+///
+/// 非 ASCII 字节按原值精确比较：完整的 Unicode 大小写折叠会改变字节长度、
+/// 无法保持偏移稳定，所以 `café` 匹配不到 `CAFÉ`（重音字符仍区分大小写），
+/// 但 ASCII 字母部分一律忽略大小写。UTF-8 下字节级精确匹配天然落在字符
+/// 边界上：needle 的非 ASCII 字节序列只可能命中相同的合法序列。
+fn case_insensitive_byte_ranges(text: &str, query: &str) -> Vec<Range<usize>> {
     let haystack = text.as_bytes();
     let needle = query.as_bytes();
     let mut ranges = Vec::new();
-    let mut start = 0usize;
-    while start + needle.len() <= haystack.len() {
-        if haystack[start..start + needle.len()].eq_ignore_ascii_case(needle) {
-            ranges.push(start..start + needle.len());
-            start += needle.len();
+    let m = needle.len();
+    if m == 0 || m > haystack.len() {
+        return ranges;
+    }
+    let fold = |byte: u8| byte.to_ascii_lowercase();
+    // 坏字符表：窗口末字节（折叠后）在 needle 中最后一次出现的相对位置
+    // 决定下次窗口起点，天然文本上通常亚线性。
+    let mut skip = [m; 256];
+    for (index, byte) in needle[..m - 1].iter().enumerate() {
+        skip[fold(*byte) as usize] = m - 1 - index;
+    }
+    let mut position = 0usize;
+    while position + m <= haystack.len() {
+        if haystack[position..position + m].eq_ignore_ascii_case(needle) {
+            ranges.push(position..position + m);
+            position += m; // 匹配互不重叠
         } else {
-            start += 1;
+            position += skip[fold(haystack[position + m - 1]) as usize];
         }
     }
     ranges
@@ -140,5 +151,27 @@ mod tests {
         let results = SearchResults::new("Rust rust RUST", "rust");
 
         assert_eq!(results.ranges(), &[0..4, 5..9, 10..14]);
+    }
+
+    #[test]
+    fn 混合大小写查询同样忽略ascii大小写() {
+        let results = SearchResults::new("Rust rust RUST", "RuSt");
+
+        assert_eq!(results.ranges(), &[0..4, 5..9, 10..14]);
+    }
+
+    #[test]
+    fn 非ascii查询走同一条匹配路径() {
+        let results = SearchResults::new("甲搜索乙，搜索丙", "搜索");
+
+        assert_eq!(results.ranges(), &[1..3, 5..7]);
+    }
+
+    #[test]
+    fn utf8续字节不会被误认成匹配() {
+        // "é" = 0xC3 0xA9；任何多字节字符内部都不会被 ASCII 查询命中。
+        let results = SearchResults::new("café café", "caf");
+
+        assert_eq!(results.ranges(), &[0..3, 5..8]);
     }
 }

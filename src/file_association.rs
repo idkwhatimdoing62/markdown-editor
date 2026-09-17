@@ -21,6 +21,9 @@ pub fn register_and_open_default_apps() -> Result<(), String> {
     register(&executable)?;
 
     // Inform Explorer before opening Settings so the newly registered app is visible immediately.
+    // SAFETY: SHCNF_IDLIST with two null pointers means "no specific items";
+    // the event and flags are documented constants and the call touches no
+    // memory of ours.
     unsafe {
         SHChangeNotify(
             SHCNE_ASSOCCHANGED as i32,
@@ -45,22 +48,14 @@ fn register(executable: &Path) -> Result<(), String> {
     let command = open_command(executable);
     let icon = format!("{executable},0");
 
+    // ProgID 键路径统一由常量拼接，避免字符串字面量与 PROG_ID 漂移。
+    let classes_key = format!("Software\\Classes\\{PROG_ID}");
+    let classes_icon_key = format!("Software\\Classes\\{PROG_ID}\\DefaultIcon");
+    let classes_command_key = format!("Software\\Classes\\{PROG_ID}\\shell\\open\\command");
     let string_values = [
-        (
-            "Software\\Classes\\MarkdownEditor.Markdown",
-            "",
-            "Markdown 文档",
-        ),
-        (
-            "Software\\Classes\\MarkdownEditor.Markdown\\DefaultIcon",
-            "",
-            icon.as_str(),
-        ),
-        (
-            "Software\\Classes\\MarkdownEditor.Markdown\\shell\\open\\command",
-            "",
-            command.as_str(),
-        ),
+        (classes_key.as_str(), "", "Markdown 文档"),
+        (classes_icon_key.as_str(), "", icon.as_str()),
+        (classes_command_key.as_str(), "", command.as_str()),
         (
             "Software\\MarkdownEditor\\Capabilities",
             "ApplicationName",
@@ -106,6 +101,9 @@ fn set_registry_string(key_path: &str, value_name: &str, value: &str) -> Result<
     let value_name = wide(value_name);
     let value = wide(value);
     let mut key: HKEY = ptr::null_mut();
+    // SAFETY: every pointer is either null (an accepted "no value" argument)
+    // or a null-terminated wide buffer owned by the locals below and valid for
+    // the call; `&mut key` receives a handle we then close.
     let create_result = unsafe {
         RegCreateKeyExW(
             HKEY_CURRENT_USER,
@@ -124,6 +122,9 @@ fn set_registry_string(key_path: &str, value_name: &str, value: &str) -> Result<
     }
 
     let bytes = value.len().saturating_mul(size_of::<u16>());
+    // SAFETY: `key` is a live handle from RegCreateKeyExW above; the value
+    // pointer covers exactly `bytes` wide characters of the null-terminated
+    // buffer held by `value`.
     let set_result = unsafe {
         RegSetValueExW(
             key,
@@ -134,6 +135,8 @@ fn set_registry_string(key_path: &str, value_name: &str, value: &str) -> Result<
             bytes as u32,
         )
     };
+    // SAFETY: `key` is the handle opened above and is closed exactly once on
+    // every path through this function.
     unsafe {
         RegCloseKey(key);
     }
