@@ -117,8 +117,11 @@ fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool
     } else {
         pdf_font_css()
     };
+    // Mermaid 的引导脚本必须排在 body 之后：内联 script 在解析到它时就同步执行，
+    // 放在 <head> 里时文档还没有任何节点，querySelectorAll 必然为空，图表永远
+    // 渲染不出来（defer 对内联脚本无效）。
     format!(
-        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{STRUCTURAL_FALLBACK}</style><style>{}</style><style>{}{}{font_size}</style>{mermaid}</head><body>{body}</body></html>",
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{STRUCTURAL_FALLBACK}</style><style>{}</style><style>{}{}{font_size}</style></head><body>{body}{mermaid}</body></html>",
         escape_html(options.title),
         theme_css,
         font_css,
@@ -627,7 +630,10 @@ fn local_image_path(
     if Path::new(destination).is_absolute() || url::Url::parse(destination).is_ok() {
         return None;
     }
-    let candidate = base.join(Path::new(destination));
+    // 与预览共用同一套归一规则（解百分号转义、丢掉查询串/片段），否则
+    // `图%20一.png` 在应用里可见、在导出产物里却解析不到文件。
+    let destination = crate::markdown::local_image_destination(destination);
+    let candidate = base.join(Path::new(&destination));
     let canonical_base = std::fs::canonicalize(base).ok()?;
     let canonical_candidate = std::fs::canonicalize(candidate).ok()?;
     canonical_candidate
@@ -782,7 +788,7 @@ const MARKDOWN_DOM_COMPATIBILITY: &str = r#"
 pre > code { color: inherit; background: transparent; border-radius: 0; font-family: inherit; padding: 0; font-size: inherit; }
 pre[data-language] { position: relative; }
 pre[data-language] > code { display: block; padding-right: 5.5em; }
-pre[data-language]::before { content: attr(data-language); position: absolute; top: 8px; right: 12px; color: #5E6062; font-size: 13px; font-weight: 400; line-height: 1; letter-spacing: .08em; text-transform: uppercase; }
+pre[data-language]::before { content: attr(data-language); position: absolute; top: 8px; right: 12px; color: #5E6062; font-size: 11px; font-weight: 400; line-height: 1; letter-spacing: .08em; text-transform: uppercase; }
 .mermaid-diagram { display: flex; justify-content: center; width: 100%; margin: 1.5em 0; overflow-x: auto; }
 .mermaid-diagram svg { display: block; max-width: 100%; height: auto; }
 ol:not(#footnotes), ul { padding-inline-start: clamp(1.5em, 3vw, 2.25em) !important; }
@@ -1198,6 +1204,17 @@ mod tests {
         assert!(local_image_path("../a.png", Some(&dir)).is_none());
         assert!(local_image_path("file:///C:/secret.png", Some(&dir)).is_none());
         assert!(local_image_path("C:/secret.png", Some(&dir)).is_none());
+        // 预览会解百分号转义并丢掉查询串/片段，导出必须走同一套规则。
+        std::fs::write(
+            dir.join("assets/a b.png"),
+            include_bytes!("../assets/app-icon-256.png"),
+        )
+        .unwrap();
+        assert!(local_image_path("assets/a%20b.png", Some(&dir)).is_some());
+        assert!(local_image_path("assets/a.png?v=2", Some(&dir)).is_some());
+        assert!(local_image_path("assets/a.png#片段", Some(&dir)).is_some());
+        // 归一之后再越界同样要被挡下。
+        assert!(local_image_path("..%2F..%2Fsecret.png", Some(&dir)).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1239,6 +1256,30 @@ mod tests {
     }
 
     #[test]
+    fn html导出内嵌百分号转义的本地图片() {
+        // 回归：预览会解 %20 并忽略查询串，导出曾按字面拼路径，
+        // 同一张图在应用里能看见、在导出产物里变成 src="#"。
+        let dir = std::env::temp_dir().join(format!(
+            "md_editor_encoded_image_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("图 一.png"),
+            include_bytes!("../assets/app-icon-256.png"),
+        )
+        .unwrap();
+        let document = parsed("![图](图%20一.png)\n");
+        let html = render_styled_html(&document, test_options(Some(&dir)));
+        assert!(
+            html.contains("src=\"data:image/png;base64,"),
+            "百分号转义的图片必须被内嵌，实际输出: {html}"
+        );
+        assert!(!html.contains("src=\"#\""), "不得退化成占位：{html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn html导出内嵌原生img标签的相对本地图片() {
         let dir = std::env::temp_dir().join(format!(
             "md_editor_raw_html_image_test_{}",
@@ -1275,6 +1316,17 @@ mod tests {
         assert!(html.contains("language-mermaid"));
         assert!(html.contains("mermaid.initialize"));
         assert!(html.contains("mermaid-diagram"));
+        // 引导脚本在 <head> 里会先于 body 解析执行，querySelectorAll 拿到空集合，
+        // 图表永远渲染不出来；它必须排在 body 之后。定位用引导脚本自己的
+        // 渲染 id 前缀：mermaid 压缩包内部也含 `mermaid.initialize` 与
+        // `</body>` 字样，按它们取下标会落到错误的位置。
+        let body_start = html.find("<body>").expect("导出必须有 body");
+        let bootstrap = html
+            .find("markdown-editor-mermaid-")
+            .expect("必须带引导脚本");
+        let body_end = html.rfind("</body>").expect("导出必须有闭合 body");
+        assert!(bootstrap > body_start, "引导脚本不能出现在 <head> 里");
+        assert!(bootstrap < body_end, "引导脚本必须仍在文档内");
     }
 
     #[test]

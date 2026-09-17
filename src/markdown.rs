@@ -68,6 +68,43 @@ pub fn normalize_url_for_scheme_check(destination: &str) -> std::borrow::Cow<'_,
     }
 }
 
+/// 把图片目标归一成可以当本地路径用的字符串：丢掉查询串与片段，解百分号转义。
+///
+/// 预览与导出必须共用这一套规则。两边各自实现时出现过分歧：`a%20b.png`、
+/// `a.png?v=2` 在应用里能显示，导出时却解析不到文件，图片静默变成占位。
+pub fn local_image_destination(url: &str) -> String {
+    percent_decode(url.split(['#', '?']).next().unwrap_or(url))
+}
+
+/// 百分号转义解码。非法转义（`%2`、`%zz`）按字面保留。
+pub fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
+        {
+            output.push(high * 16 + low);
+            index += 3;
+            continue;
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Inline {
     Text(String),
@@ -798,6 +835,23 @@ fn plain_of_inlines(inlines: &[Inline]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 图片目标归一同时处理转义与查询串() {
+        // 预览与导出共用这条规则：解百分号转义、丢掉片段与查询串。
+        assert_eq!(local_image_destination("图%20一.png"), "图 一.png");
+        assert_eq!(local_image_destination("assets/a.png?v=2"), "assets/a.png");
+        assert_eq!(local_image_destination("assets/a.png#frag"), "assets/a.png");
+        assert_eq!(
+            local_image_destination("assets/图 一.png"),
+            "assets/图 一.png"
+        );
+        // 非法转义按字面保留，不能吞字符也不能 panic。
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%zz"), "%zz");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("100%25"), "100%");
+    }
 
     #[derive(Debug, Default, PartialEq, Eq)]
     struct StructureCounts {

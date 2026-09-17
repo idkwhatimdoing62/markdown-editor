@@ -476,7 +476,39 @@ pub(crate) fn mix_color(background: Color32, foreground: Color32, amount: f32) -
 }
 
 /// 等宽标签（代码块语言名等）的最小字号，取自设计系统字阶的 mono 档。
-pub const MONO_LABEL_SIZE: f32 = 13.0;
+pub const MONO_LABEL_SIZE: f32 = 11.0;
+
+/// 正文、次要文字、标题、强调色与代码块标签的对比度下限（WCAG AA）。
+///
+/// 弱化不等于可以牺牲可读性：专注模式下被弱化的文字同样适用。派生色
+/// （`code_block_label_color`、`dimmed_*`、`code_comment_color`）都必须
+/// 以它为界，内置主题由用例逐项钉住。
+pub const MIN_CONTRAST_RATIO: f32 = 4.5;
+
+/// WCAG 2.x 相对亮度。
+pub fn relative_luminance(color: Color32) -> f32 {
+    let channel = |value: u8| {
+        let value = f32::from(value) / 255.0;
+        if value <= 0.040_45 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
+}
+
+/// WCAG 2.x 对比度，参数顺序不影响结果。
+pub fn contrast_ratio(first: Color32, second: Color32) -> f32 {
+    let first = relative_luminance(first);
+    let second = relative_luminance(second);
+    let (lighter, darker) = if first > second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
 
 /// 代码块语言标签的前景色。
 ///
@@ -485,6 +517,27 @@ pub const MONO_LABEL_SIZE: f32 = 13.0;
 /// 颜色字段，也就不会破坏主题包格式。
 pub fn code_block_label_color(spec: &ThemeSpec) -> Color32 {
     mix_color(spec.muted, spec.text, 0.25)
+}
+
+/// 代码注释弱化的起始比例：正文色向代码底色靠拢 30%。
+const CODE_COMMENT_DIM: f32 = 0.7;
+
+/// 代码注释的前景色：正文色向代码底色靠拢一档。
+///
+/// 弱化幅度不能固定死。专注模式已经把正文色换成 `dimmed_text_color`
+/// （本身弱化过一档），再按固定比例压一次会把注释降到浅色主题 3.3:1、
+/// 深色主题 4.1:1，低于 [`MIN_CONTRAST_RATIO`]。所以这里从
+/// [`CODE_COMMENT_DIM`] 起步，按需回退到刚好达标的位置：注释始终比正文弱，
+/// 但永远读得清。
+pub fn code_comment_color(text: Color32, code_bg: Color32) -> Color32 {
+    let mut amount = CODE_COMMENT_DIM;
+    loop {
+        let candidate = mix_color(code_bg, text, amount);
+        if amount >= 1.0 || contrast_ratio(candidate, code_bg) >= MIN_CONTRAST_RATIO {
+            return candidate;
+        }
+        amount = (amount + 0.01).min(1.0);
+    }
 }
 
 /// 专注模式下非当前段落的正文字色。
@@ -937,9 +990,23 @@ mod tests {
             // 旧的 muted 直接画在 code_bg 上只有 4.40:1，必须走加深后的标签色。
             let label_ratio = contrast_ratio(code_block_label_color(&spec), spec.code_bg);
             assert!(
-                label_ratio >= 4.5,
+                label_ratio >= MIN_CONTRAST_RATIO,
                 "代码块语言标签对比度 {label_ratio:.2} 低于 4.5（dark={dark}）"
             );
+            // 代码注释比正文弱一档，但同样受硬约束。专注模式先换过一档
+            // dimmed_text_color，二次弱化最容易在这里跌破基线。
+            for (name, body) in [
+                ("正文", spec.text),
+                ("专注模式正文", dimmed_text_color(&spec)),
+            ] {
+                let comment = code_comment_color(body, spec.code_bg);
+                let ratio = contrast_ratio(comment, spec.code_bg);
+                assert!(
+                    ratio >= MIN_CONTRAST_RATIO,
+                    "{name}上的代码注释对比度 {ratio:.2} 低于 4.5（dark={dark}）"
+                );
+                assert_ne!(comment, body, "注释必须比正文弱，不能退化成同一个颜色");
+            }
             // 专注模式弱化的是正文，不是装饰。
             for (name, foreground) in [
                 ("专注模式正文", dimmed_text_color(&spec)),
@@ -973,29 +1040,5 @@ mod tests {
             (steps - steps.round()).abs() < 1e-4,
             "{value} 不在 {SPACING_GRID}px 网格上"
         );
-    }
-
-    /// WCAG 2.x 相对亮度。
-    fn relative_luminance(color: Color32) -> f32 {
-        let channel = |value: u8| {
-            let value = f32::from(value) / 255.0;
-            if value <= 0.040_45 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(color.r()) + 0.7152 * channel(color.g()) + 0.0722 * channel(color.b())
-    }
-
-    fn contrast_ratio(first: Color32, second: Color32) -> f32 {
-        let first = relative_luminance(first);
-        let second = relative_luminance(second);
-        let (lighter, darker) = if first > second {
-            (first, second)
-        } else {
-            (second, first)
-        };
-        (lighter + 0.05) / (darker + 0.05)
     }
 }

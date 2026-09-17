@@ -729,6 +729,10 @@ struct MdEditorApp {
     /// hits must not move the edit block: egui focus is last-wins, so a
     /// request_focus from the block editor would steal the query keystrokes.
     search_input_has_focus: bool,
+    /// 一次显式搜索导航（打开查找、改查询、上/下一项）请求把编辑器移到命中
+    /// 块上，等命中真的出现后消费掉。后台搜索是异步的，这个标志会跨帧等待；
+    /// 命中本身不能当条件——逐帧重锚会把用户点开的段落拉回命中块。
+    search_anchor_pending: bool,
     pending_close: Option<usize>,
     window_close_guard: window_close::CloseGuard,
     recovery: Option<io::DraftSession>,
@@ -740,6 +744,8 @@ struct MdEditorApp {
     pending_edit_cursor: Option<usize>,
     edit_focus_requested: bool,
     show_status: bool,
+    /// 章节目录默认隐藏，F7 或视图菜单呼出：写作时少一块常驻干扰。
+    show_toc: bool,
     body_font_size: f32,
     theme_package: Option<ThemePackage>,
     auto_reload_external: bool,
@@ -825,6 +831,7 @@ impl MdEditorApp {
             search_scroll_requested: false,
             search_backwards: false,
             search_input_has_focus: false,
+            search_anchor_pending: false,
             pending_close: None,
             window_close_guard: window_close::CloseGuard::default(),
             recovery,
@@ -836,6 +843,7 @@ impl MdEditorApp {
             pending_edit_cursor: None,
             edit_focus_requested: false,
             show_status: true,
+            show_toc: false,
             body_font_size: initial_body_font_size,
             theme_package,
             auto_reload_external: true,
@@ -1040,12 +1048,14 @@ impl MdEditorApp {
         self.search_open = true;
         self.search_focus_requested = true;
         self.refresh_search();
+        self.search_anchor_pending = true;
     }
 
     fn close_search(&mut self) {
         self.search_open = false;
         self.search_focus_requested = false;
         self.search_scroll_requested = false;
+        self.search_anchor_pending = false;
         self.search_pending = None;
     }
 
@@ -1159,6 +1169,7 @@ impl MdEditorApp {
         if self.search_results.next().is_some() {
             self.search_backwards = false;
             self.search_scroll_requested = true;
+            self.search_anchor_pending = true;
         }
     }
 
@@ -1166,6 +1177,7 @@ impl MdEditorApp {
         if self.search_results.previous().is_some() {
             self.search_backwards = true;
             self.search_scroll_requested = true;
+            self.search_anchor_pending = true;
         }
     }
 
@@ -1186,17 +1198,24 @@ impl MdEditorApp {
         if index >= self.tabs.len() {
             return;
         }
-        if index != self.active_tab && !self.is_tab_dirty(index) {
-            self.close_tab_now(index);
-            return;
-        }
-        if index != self.active_tab {
-            self.switch_tab(index);
-        }
-        if self.is_active_dirty() {
-            self.pending_close = Some(self.active_tab);
-        } else {
-            self.close_tab_now(self.active_tab);
+        match close_tab_plan(
+            self.active_tab,
+            index,
+            self.pending_close.is_some(),
+            self.is_tab_dirty(index),
+            self.is_active_dirty(),
+        ) {
+            // 已有确认弹窗时不能再叠加请求：`switch_tab` 会拒绝切换，
+            // 之后的判断就落到当前标签上，结果是关错标签。
+            TabClosePlan::Ignore => {}
+            TabClosePlan::Close(target) => self.close_tab_now(target),
+            TabClosePlan::SwitchThenConfirm(target) => {
+                self.switch_tab(target);
+                if self.active_tab == target && self.is_active_dirty() {
+                    self.pending_close = Some(target);
+                }
+            }
+            TabClosePlan::Confirm(target) => self.pending_close = Some(target),
         }
     }
 
@@ -1721,6 +1740,9 @@ impl MdEditorApp {
             self.active_edit_block = Some(self.active_edit_block.unwrap_or(0));
             self.edit_focus_requested = true;
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F7)) {
+            self.show_toc = !self.show_toc;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F8)) {
             self.focus_mode = !self.focus_mode;
         }
@@ -1911,6 +1933,10 @@ impl MdEditorApp {
                 if let Err(error) = self.persist_draft_session() {
                     self.status_note = format!("文档已保存；草稿会话更新失败：{error}");
                 }
+                // 保存满足了待处理的关闭确认：与覆盖保存/另存为/重新载入
+                // 一致地兑现它，否则弹窗会留在屏幕上，而它守着的标签已经
+                // 没有未保存内容。
+                self.finish_pending_close_if_saved();
             }
             Err(io::SaveError::ExternalModified) => {
                 self.conflict = Some(path);
@@ -2244,6 +2270,7 @@ impl MdEditorApp {
                         self.pending_external_changes.clear();
                         self.last_external_poll = f64::NEG_INFINITY;
                     }
+                    ui.checkbox(&mut self.show_toc, "章节目录 (F7)");
                     ui.checkbox(&mut self.show_status, "显示状态栏");
                     let theme = if self.dark {
                         "浅色外观"
@@ -2383,17 +2410,17 @@ impl MdEditorApp {
                 let hint = if !self.document.blocks().is_empty()
                     && self.document.block_ranges().len() != self.document.blocks().len()
                 {
-                    "全文编辑 · 当前 Markdown 结构暂不支持逐块编辑 · F8 专注 · F9 打字机"
+                    "全文编辑 · 当前 Markdown 结构暂不支持逐块编辑 · F7 目录 · F8 专注 · F9 打字机"
                         .to_string()
                 } else {
                     match self.active_edit_block {
                         Some(index) => {
                             format!(
-                                "正在编辑第 {} 段 · Esc 收起 · F8 专注 · F9 打字机",
+                                "正在编辑第 {} 段 · Esc 收起 · F7 目录 · F8 专注 · F9 打字机",
                                 index + 1
                             )
                         }
-                        None => "点击段落开始编辑 · F8 专注 · F9 打字机".to_string(),
+                        None => "点击段落开始编辑 · F7 目录 · F8 专注 · F9 打字机".to_string(),
                     }
                 };
                 ui.label(egui::RichText::new(hint).weak().size(11.0));
@@ -2454,6 +2481,7 @@ impl MdEditorApp {
         );
         if query_changed {
             self.refresh_search();
+            self.search_anchor_pending = true;
         }
         if go_previous {
             self.search_previous();
@@ -2831,7 +2859,7 @@ impl eframe::App for MdEditorApp {
                 .show_separator_line(false)
                 .frame(
                     egui::Frame::new()
-                        .fill(ui.visuals().panel_fill)
+                        .fill(ui.visuals().window_fill)
                         .inner_margin(egui::Margin::symmetric(16, 3))
                         .stroke(egui::Stroke::NONE),
                 )
@@ -2870,14 +2898,14 @@ impl eframe::App for MdEditorApp {
                 None => self.tabs[active_index].core.document(),
             };
             let headings = parsed_document.headings();
-            if !self.focus_mode {
+            if !self.focus_mode && self.show_toc {
                 egui::Panel::left("reading_toc_panel")
                     .resizable(false)
                     .show_separator_line(false)
                     .exact_size(228.0)
                     .frame(
                         egui::Frame::new()
-                            .fill(ui.visuals().panel_fill)
+                            .fill(ui.visuals().window_fill)
                             .inner_margin(egui::Margin::symmetric(16, 0)),
                     )
                     .show(ui, |ui| {
@@ -2889,14 +2917,18 @@ impl eframe::App for MdEditorApp {
             let effective_search_range = parsed_current
                 .then_some(search_byte_range.clone())
                 .flatten();
-            if let Some(search) = effective_search_range.as_ref()
-                && let Some(index) =
-                    preview::block_index_for_search(parsed_document.block_ranges(), search)
-                && self.active_edit_block != Some(index)
-                && !self.search_input_has_focus
-            {
-                // 搜索输入框获得焦点的帧不抢焦点：egui 的 request_focus 是
-                // 后写覆盖，正文编辑器抢焦点会把查询按键打进文档。
+            let hit_block = effective_search_range.as_ref().and_then(|search| {
+                preview::block_index_for_search(parsed_document.block_ranges(), search)
+            });
+            // 只在显式导航后锚定一次。搜索输入框获得焦点的帧不抢焦点：
+            // egui 的 request_focus 是后写覆盖，正文编辑器抢焦点会把查询
+            // 按键打进文档。
+            if let Some(index) = search_anchor_target(
+                self.search_anchor_pending,
+                hit_block,
+                self.search_input_has_focus,
+            ) {
+                self.search_anchor_pending = false;
                 self.active_edit_block = Some(index);
                 self.active_edit_range = None;
                 self.edit_focus_requested = true;
@@ -3034,6 +3066,65 @@ fn document_scroll_id(scope: &'static str, tab_id: u64) -> egui::Id {
 /// stale index is dropped.
 fn clicked_block_accepted(parsed_current: bool, clicked_block: Option<usize>) -> Option<usize> {
     clicked_block.filter(|_| parsed_current)
+}
+
+/// 本次显式搜索导航要锚定到的块。
+///
+/// 只有导航请求（`pending`）尚未消费、命中已经算出来、且查询框没有抢焦点时
+/// 才移动编辑器。把"命中存在"或"命中变化"当条件逐帧重锚，会把用户点开的
+/// 段落一直拉回命中块：查找面板打开期间就编辑不了别处。命中还没算出来时
+/// `pending` 保持为真，结果到达的那一帧再锚定。
+fn search_anchor_target(
+    pending: bool,
+    hit_block: Option<usize>,
+    input_has_focus: bool,
+) -> Option<usize> {
+    if !pending || input_has_focus {
+        return None;
+    }
+    hit_block
+}
+
+/// 点击标签页 ✕ 之后的动作。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabClosePlan {
+    /// 已有确认弹窗：忽略这次请求，绝不改动手里的目标。
+    Ignore,
+    /// 目标标签已保存：直接关掉它。
+    Close(usize),
+    /// 目标标签有未保存内容：先切过去，再弹确认。
+    SwitchThenConfirm(usize),
+    /// 当前标签有未保存内容：弹确认。
+    Confirm(usize),
+}
+
+/// 关闭标签页的决策：每一步都对着被点击的 `index`，而不是"当前标签"。
+///
+/// 关闭确认是个非模态弹窗，弹着的时候其余界面仍可点击。旧实现先用
+/// `switch_tab` 尝试切换，但它在弹窗存在时是空操作，随后的判断就落回当前
+/// 标签：点另一个标签的 ✕ 会被丢掉，若当前标签这时正好变干净（例如刚
+/// Ctrl+S），就会把当前标签关掉。
+fn close_tab_plan(
+    active_tab: usize,
+    index: usize,
+    confirmation_open: bool,
+    index_dirty: bool,
+    active_dirty: bool,
+) -> TabClosePlan {
+    if index == active_tab {
+        return if active_dirty {
+            TabClosePlan::Confirm(index)
+        } else {
+            TabClosePlan::Close(index)
+        };
+    }
+    if confirmation_open {
+        return TabClosePlan::Ignore;
+    }
+    if !index_dirty {
+        return TabClosePlan::Close(index);
+    }
+    TabClosePlan::SwitchThenConfirm(index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3305,6 +3396,7 @@ mod app_tests {
             search_scroll_requested: false,
             search_backwards: false,
             search_input_has_focus: false,
+            search_anchor_pending: false,
             pending_close: None,
             window_close_guard: window_close::CloseGuard::default(),
             recovery: None,
@@ -3316,6 +3408,7 @@ mod app_tests {
             pending_edit_cursor: None,
             edit_focus_requested: false,
             show_status: true,
+            show_toc: false,
             body_font_size: 15.0,
             theme_package: None,
             auto_reload_external: true,
@@ -3335,6 +3428,67 @@ mod app_tests {
             search_byte_cache: None,
             last_window_title: None,
         }
+    }
+
+    #[test]
+    fn 关闭确认弹窗期间点击别的标签不会关错标签() {
+        // 非模态弹窗弹着时其余界面仍可点击；旧实现会先尝试切换（弹窗存在时
+        // 被拒），随后按"当前标签"决策，于是丢掉点击、或在当前标签已保存时
+        // 把当前标签关掉。
+        assert_eq!(
+            close_tab_plan(0, 1, true, false, true),
+            TabClosePlan::Ignore,
+            "确认弹窗期间点别的标签不得被当成关当前标签"
+        );
+        assert_eq!(
+            close_tab_plan(0, 1, true, true, false),
+            TabClosePlan::Ignore,
+            "当前标签已保存时更危险：旧实现会把它关掉"
+        );
+        // 点的是自己：重复点 ✕ 只是重申同一个确认。
+        assert_eq!(
+            close_tab_plan(0, 0, true, true, true),
+            TabClosePlan::Confirm(0)
+        );
+        // 无弹窗时逐项对照。
+        assert_eq!(
+            close_tab_plan(0, 1, false, false, true),
+            TabClosePlan::Close(1)
+        );
+        assert_eq!(
+            close_tab_plan(0, 1, false, true, false),
+            TabClosePlan::SwitchThenConfirm(1)
+        );
+        assert_eq!(
+            close_tab_plan(0, 0, false, false, false),
+            TabClosePlan::Close(0)
+        );
+        assert_eq!(
+            close_tab_plan(2, 2, false, true, true),
+            TabClosePlan::Confirm(2)
+        );
+    }
+
+    #[test]
+    fn 搜索只在显式导航后锚定一次() {
+        // 回归：把"命中存在"当条件会每帧重锚，用户点开的段落立刻被拉回
+        // 命中块，查找面板打开期间根本编辑不了别处。
+        assert_eq!(search_anchor_target(true, Some(3), false), Some(3));
+        assert_eq!(
+            search_anchor_target(false, Some(3), false),
+            None,
+            "命中仍在、但导航已消费：不得再移动编辑器"
+        );
+        assert_eq!(
+            search_anchor_target(true, None, false),
+            None,
+            "命中还没算出来：标志保持，等结果到达那一帧"
+        );
+        assert_eq!(
+            search_anchor_target(true, Some(3), true),
+            None,
+            "查询框有焦点时不得抢焦点"
+        );
     }
 
     #[test]

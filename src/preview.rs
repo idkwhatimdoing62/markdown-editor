@@ -146,6 +146,10 @@ pub struct BlockEditorOutput {
     /// True when a culled block's real height differed from its cached
     /// estimate this frame; the caller repaints so spacers converge.
     pub viewport_unsettled: bool,
+    /// 本帧收到 `scroll_to_me` 的块索引（TOC 跳转目标）。只有用例读取：它
+    /// 钉住"点目录确实落到了目标标题所在的块上"，而不只是"某个标题滚了"。
+    #[cfg(test)]
+    pub scrolled_heading_block: Option<usize>,
 }
 
 /// Documents above this block count render only blocks near the viewport.
@@ -741,6 +745,93 @@ fn layout_code_block_source(
     job
 }
 
+/// 语言 → 行注释起始符。未识别的语言返回 `None`，整块保持字面色。
+fn code_comment_prefix(lang: &str) -> Option<&'static str> {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "bash" | "sh" | "shell" | "zsh" | "fish" | "powershell" | "ps1" | "pwsh" | "python"
+        | "py" | "ruby" | "rb" | "perl" | "r" | "yaml" | "yml" | "toml" | "ini" | "conf"
+        | "nginx" | "dockerfile" | "docker" | "makefile" | "terraform" | "hcl" | "env"
+        | "dotenv" | "gitignore" | "crontab" => Some("#"),
+        "c" | "cpp" | "cs" | "java" | "javascript" | "js" | "jsx" | "typescript" | "ts" | "tsx"
+        | "go" | "rust" | "rs" | "kotlin" | "swift" | "php" | "scala" | "dart" | "jsonc"
+        | "json5" | "vue" => Some("//"),
+        "sql" | "lua" | "haskell" | "vhdl" | "ada" => Some("--"),
+        "asm" | "nasm" | "gas" => Some(";"),
+        _ => None,
+    }
+}
+
+/// 在字符串字面量之外、行首或空白后的第一个注释符处切分；返回注释起始字节。
+/// 字符串里的 `#`、词中间的 `#`（如 `a#b`）都不算注释。
+fn split_code_comment(line: &str, prefix: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let prefix = prefix.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(open) => {
+                if byte == b'\\' && open == b'"' {
+                    index += 2;
+                    continue;
+                }
+                if byte == open {
+                    quote = None;
+                }
+                index += 1;
+            }
+            None if byte == b'"' || byte == b'\'' => {
+                quote = Some(byte);
+                index += 1;
+            }
+            None if bytes[index..].starts_with(prefix)
+                && (index == 0 || bytes[index - 1].is_ascii_whitespace()) =>
+            {
+                return Some(index);
+            }
+            None => index += 1,
+        }
+    }
+    None
+}
+
+/// 阅读态代码块排版：正文用当前文字色，注释向代码底色靠拢一档。
+/// 注释色由 `theme::code_comment_color` 派生，专注模式的置灰叠加后仍守住
+/// 4.5:1 的硬约束。
+fn layout_code_with_comments(
+    code: &str,
+    font_id: FontId,
+    text: Color32,
+    code_bg: Color32,
+    prefix: &str,
+    wrap_width: f32,
+) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    job.keep_trailing_whitespace = true;
+    let text_format = TextFormat {
+        font_id: font_id.clone(),
+        color: text,
+        ..Default::default()
+    };
+    let comment_format = TextFormat {
+        font_id,
+        color: crate::theme::code_comment_color(text, code_bg),
+        ..Default::default()
+    };
+    for line in code.split_inclusive('\n') {
+        match split_code_comment(line, prefix) {
+            Some(start) => {
+                append_text_with_cjk_punct(&mut job, &line[..start], &text_format);
+                append_text_with_cjk_punct(&mut job, &line[start..], &comment_format);
+            }
+            None => append_text_with_cjk_punct(&mut job, line, &text_format),
+        }
+    }
+    job
+}
+
 fn cursor_index_for_click(
     ui: &egui::Ui,
     source: &str,
@@ -781,6 +872,10 @@ struct RenderPosition {
     table_id: usize,
     heading_index: usize,
     heading_target: Option<usize>,
+    /// 本帧收到滚动请求的标题序号。只有用例读取：它钉住"点目录确实落到了
+    /// 目标标题上"，发布构建不需要这个诊断位。
+    #[cfg(test)]
+    scrolled_heading: Option<usize>,
 }
 
 impl ImageCache {
@@ -939,6 +1034,8 @@ pub fn show_preview_with_heading_target_and_images(
         table_id: 0,
         heading_index: 0,
         heading_target,
+        #[cfg(test)]
+        scrolled_heading: None,
     };
     let mut clicked_block = None;
     for (index, block) in blocks.iter().enumerate() {
@@ -998,6 +1095,8 @@ pub fn show_preview_with_block_editor_and_search(
         table_id: 0,
         heading_index: 0,
         heading_target,
+        #[cfg(test)]
+        scrolled_heading: None,
     };
     // 专注模式：除当前编辑块外全部向弱化色靠拢，视线自然锚定在写作位置。
     // 两个系数与 4.5:1 对比度约束绑定，见 `theme::dimmed_text_color`。
@@ -1291,7 +1390,7 @@ pub fn show_preview_with_block_editor_and_search(
                     theme.code_padding[1],
                 ))
                 .corner_radius(theme.code_radius)
-                .stroke(Stroke::new(1.0, theme.border));
+                .stroke(Stroke::NONE);
             frame
                 .show(ui, |ui| edit.layouter(&mut layouter).show(ui))
                 .inner
@@ -1381,7 +1480,17 @@ pub fn show_preview_with_block_editor_and_search(
         None
     };
 
+    // 渲染顺序计数器从块列表推导，而不是逐块累加：被跳过、被编辑器替换、
+    // 被编辑区间吞掉的块都不会走 `show_block`，逐块累加会让 TOC 的
+    // heading_target 与 heading_index 错位——点目录跳转就静默失效。
+    let mut running_headings = 0usize;
+    let mut running_tables = 0usize;
+
     for (index, block) in blocks.iter().enumerate() {
+        position.heading_index = running_headings;
+        position.table_id = running_tables;
+        #[cfg(test)]
+        let scrolled_before = position.scrolled_heading;
         // With a stale parse the ranges describe the previous source, so the
         // grown editor range must not claim the blocks that follow it: only the
         // block being edited is replaced by the source editor.
@@ -1414,10 +1523,6 @@ pub fn show_preview_with_block_editor_and_search(
             {
                 *slot = reserved;
             }
-            // Keep render-order counters correct across skipped blocks: the
-            // table ids and heading indices (TOC target) must not shift.
-            position.heading_index += heading_count(block);
-            position.table_id += table_count(block);
         } else {
             if is_editor_anchor {
                 show_editor(ui, source, &mut output);
@@ -1464,6 +1569,15 @@ pub fn show_preview_with_block_editor_and_search(
                 }
             }
         }
+        // 每个块恰好推进一次，与它本帧以哪种形态出现无关。
+        running_headings += heading_count(block);
+        running_tables += table_count(block);
+        #[cfg(test)]
+        {
+            if position.scrolled_heading != scrolled_before {
+                output.scrolled_heading_block = Some(index);
+            }
+        }
     }
     if !editor_shown {
         // Empty ranges at EOF have no block to anchor to.
@@ -1492,6 +1606,10 @@ fn show_block(
             ui.add_space(if *level == 1 { 10.0 } else { 16.0 });
             let response = ui.scope(|ui| show_heading(ui, inlines, size, *level, theme, images));
             if position.heading_target == Some(position.heading_index) {
+                #[cfg(test)]
+                {
+                    position.scrolled_heading = Some(position.heading_index);
+                }
                 response.response.scroll_to_me(Some(egui::Align::Min));
             }
             position.heading_index += 1;
@@ -1559,6 +1677,8 @@ fn show_block(
             }
         }
         Block::Code { lang, text } => {
+            // 与导出 HTML 同一套样式：无描边的纯色盒，语言名右上角小标签
+            // （导出的 pre[data-language]::before 也在右上角），阅读态不再多一层盒中盒。
             egui::Frame::new()
                 .fill(theme.code_bg)
                 .inner_margin(egui::Margin::symmetric(
@@ -1566,24 +1686,33 @@ fn show_block(
                     theme.code_padding[1],
                 ))
                 .corner_radius(theme.code_radius)
-                .stroke(Stroke::new(1.0, theme.border))
+                .stroke(Stroke::NONE)
                 .show(ui, |ui| {
                     ui.set_min_width((ui.available_width() - 32.0).max(120.0));
                     if !lang.is_empty() {
                         // 语言名是等宽标签：字号取 mono 档下限，颜色必须在
                         // code_bg 上达到 4.5:1（直接用 muted 只有 4.40:1）。
-                        ui.label(
-                            egui::RichText::new(lang.to_uppercase())
-                                .color(crate::theme::code_block_label_color(theme))
-                                .size(crate::theme::MONO_LABEL_SIZE),
-                        );
-                        ui.add_space(8.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            ui.label(
+                                egui::RichText::new(lang.to_uppercase())
+                                    .color(crate::theme::code_block_label_color(theme))
+                                    .size(crate::theme::MONO_LABEL_SIZE),
+                            );
+                        });
+                        ui.add_space(4.0);
                     }
-                    ui.label(
-                        egui::RichText::new(text)
-                            .monospace()
-                            .size((body_size - 2.0).max(11.0)),
-                    );
+                    let code_size = (body_size - 2.0).max(11.0);
+                    match code_comment_prefix(lang) {
+                        Some(prefix) => ui.label(layout_code_with_comments(
+                            text,
+                            FontId::new(code_size, FontFamily::Monospace),
+                            ui.visuals().text_color(),
+                            theme.code_bg,
+                            prefix,
+                            ui.available_width(),
+                        )),
+                        None => ui.label(egui::RichText::new(text).monospace().size(code_size)),
+                    }
                 });
         }
         Block::Quote(blocks) => {
@@ -1597,6 +1726,9 @@ fn show_block(
                     HeadingStyle::Tech => 2,
                 })
                 .show(ui, |ui| {
+                    // 引用体弱化一档：用 muted 中性阶（#6F7274），与导出 CSS 的
+                    // blockquote 颜色 #6E6E6B 同档；在 quote_bg 上实测 ≈4.6:1，仍达标。
+                    ui.visuals_mut().override_text_color = Some(theme.muted);
                     for b in blocks {
                         show_block(ui, b, body_size, theme, position, images);
                     }
@@ -1609,7 +1741,9 @@ fn show_block(
             ui.painter().rect_filled(
                 rule,
                 egui::CornerRadius::same(1),
-                theme.accent.gamma_multiply(0.7),
+                // 与导出 CSS 的 blockquote 左边线同色（neutral，不是强调色）：
+                // 引用是弱化内容，配蓝色竖线会把视线反吸到引用上。
+                theme.border,
             );
         }
         Block::Table { headers, rows } => {
@@ -1697,10 +1831,9 @@ fn show_heading(
                 ui.visuals_mut().override_text_color = Some(theme.heading);
                 show_inlines_block(ui, inlines, size, true, true, 1.25, images);
             });
-            if level == 2 {
-                ui.add_space(4.0);
-                ui.separator();
-            }
+            // 旧实现在这里给二级标题画一条 separator：那是 sspai 时代
+            // “h2 带底线”的残留，导出的 focus.css 里并没有这条线，
+            // 纯白页面上反而像一条游离的分割线。层级交给字号与留白。
         }
         HeadingStyle::Card if level <= 2 => {
             egui::Frame::new()
@@ -2179,7 +2312,7 @@ fn resolve_image_path(url: &str, base: Option<&Path>) -> Option<PathBuf> {
     if url.is_empty() || url.starts_with('#') || url.contains("://") || url.starts_with("data:") {
         return None;
     }
-    let clean = percent_decode(url.split(['#', '?']).next().unwrap_or(url));
+    let clean = markdown::local_image_destination(url);
     let path = Path::new(&clean);
     let resolved = if path.is_absolute() {
         path.to_path_buf()
@@ -2187,34 +2320,6 @@ fn resolve_image_path(url: &str, base: Option<&Path>) -> Option<PathBuf> {
         base?.join(path)
     };
     Some(resolved)
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2]))
-        {
-            output.push(high * 16 + low);
-            index += 3;
-            continue;
-        }
-        output.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&output).into_owned()
-}
-
-fn hex(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn inlines_to_job(
@@ -2313,7 +2418,10 @@ fn task_marker(item: &[Block]) -> Option<(bool, &'static str)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color32, FontFamily, FontId, TextFormat};
+    use super::{
+        Color32, FontFamily, FontId, TextFormat, code_comment_prefix, layout_code_with_comments,
+        split_code_comment,
+    };
     use crate::markdown::parse;
     use crate::preview::bold_family;
 
@@ -2491,6 +2599,60 @@ mod tests {
             joined.contains("目标：系统要帮谁省掉什么麻烦；"),
             "列表项文字应完整，实际 {joined:?}"
         );
+    }
+
+    #[test]
+    fn 代码块注释按语言变灰而字符串里的注释符不算() {
+        let theme = crate::theme::ThemeSpec::fallback(false);
+        let body = theme.text;
+        let code_bg = theme.code_bg;
+        let font = FontId::new(13.0, FontFamily::Monospace);
+        let job =
+            layout_code_with_comments("cmd  # 注释\n", font.clone(), body, code_bg, "#", 600.0);
+        assert_eq!(job.text, "cmd  # 注释\n");
+        let comment = crate::theme::code_comment_color(body, code_bg);
+        assert_eq!(
+            job.sections.last().unwrap().format.color,
+            comment,
+            "注释段应用弱化色"
+        );
+        assert_ne!(comment, body, "注释必须与正文有可见区分");
+        assert!(
+            crate::theme::contrast_ratio(comment, code_bg) >= crate::theme::MIN_CONTRAST_RATIO,
+            "注释色必须守住代码底色上的 4.5:1"
+        );
+        assert!(
+            job.sections
+                .iter()
+                .take_while(|s| s.format.color == body)
+                .count()
+                >= 1,
+            "正文段保持原色"
+        );
+        // 字符串内部与词中间的 # 都不是注释；未识别语言整块字面色。
+        let job = layout_code_with_comments(
+            "echo \"a # b\"\nx#y\n",
+            font.clone(),
+            body,
+            code_bg,
+            "#",
+            600.0,
+        );
+        assert!(job.sections.iter().all(|s| s.format.color == body));
+        // 专注模式先换过一档 dimmed_text_color，二次弱化后仍须达标。
+        let dimmed = crate::theme::dimmed_text_color(&theme);
+        let job = layout_code_with_comments("cmd  # 注释\n", font, dimmed, code_bg, "#", 600.0);
+        let dimmed_comment = job.sections.last().unwrap().format.color;
+        assert!(
+            crate::theme::contrast_ratio(dimmed_comment, code_bg)
+                >= crate::theme::MIN_CONTRAST_RATIO,
+            "专注模式下的注释色 {dimmed_comment:?} 跌破 4.5:1"
+        );
+        assert_eq!(code_comment_prefix("PowerShell"), Some("#"));
+        assert_eq!(code_comment_prefix("rust"), Some("//"));
+        assert_eq!(code_comment_prefix("brainfuck"), None);
+        // 行首 URL 里的 // 不会被误判成注释（前面不是空白）。
+        assert_eq!(split_code_comment("https://example.com", "//"), None);
     }
 
     #[test]
@@ -2914,6 +3076,65 @@ mod tests {
     }
 
     #[test]
+    fn 目录跳转落在目标标题上而不被编辑中的块打断() {
+        // 回归：块被源码编辑器替换（或被编辑区间吞掉）时不推进渲染序号，
+        // heading_target 就永远对不上 heading_index，点目录静默不动。
+        let source = "## 第一节\n\n## 第二节\n\n## 第三节\n";
+        let document = crate::markdown::parse_document(source);
+        let blocks = document.blocks().to_vec();
+        let block_ranges = document.block_ranges().to_vec();
+        assert_eq!(blocks.len(), 3, "三个标题各是一个块");
+        assert_eq!(super::block_index_for_heading(&blocks, 1), Some(1));
+
+        let ctx = egui::Context::default();
+        crate::export::install_app_fonts(&ctx);
+        let theme = crate::theme::ThemeSpec::fallback(false);
+        let input = frame_input(Vec::new(), None);
+        let mut text = source.to_string();
+        let mut heights = vec![0.0f32; blocks.len()];
+        let mut cache = super::ImageCache::default();
+        // 第一个标题块正在被编辑：它以源码编辑器形态出现，不走 show_block。
+        let (output, _) = render_hybrid_frame(
+            &ctx,
+            &input,
+            &blocks,
+            &block_ranges,
+            &theme,
+            &mut text,
+            &mut heights,
+            &mut cache,
+            Some(0),
+            None,
+            false,
+            Some(1),
+        );
+        assert_eq!(
+            output.scrolled_heading_block,
+            Some(1),
+            "目录跳转必须落到目标标题所在的块（第 2 个标题）上"
+        );
+
+        // 对照组：不点目录时不该有滚动请求。
+        let mut text = source.to_string();
+        let mut heights = vec![0.0f32; blocks.len()];
+        let (output, _) = render_hybrid_frame(
+            &ctx,
+            &input,
+            &blocks,
+            &block_ranges,
+            &theme,
+            &mut text,
+            &mut heights,
+            &mut cache,
+            Some(0),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(output.scrolled_heading_block, None);
+    }
+
+    #[test]
     fn 高度估算随行数增长并封顶() {
         let source = "一\n二\n三\n";
         let one = super::estimate_block_height(source, &(0..2), 20.0);
@@ -2937,6 +3158,38 @@ mod tests {
         active_block: Option<usize>,
         active_range: Option<std::ops::Range<usize>>,
         stale_blocks: bool,
+    ) -> (super::BlockEditorOutput, Vec<(String, egui::Rect)>) {
+        render_hybrid_frame(
+            ctx,
+            input,
+            blocks,
+            block_ranges,
+            theme,
+            text,
+            heights,
+            cache,
+            active_block,
+            active_range,
+            stale_blocks,
+            None,
+        )
+    }
+
+    /// 同 [`render_virtualized_frame`]，但可以带 TOC 跳转目标渲染一帧。
+    #[allow(clippy::too_many_arguments)]
+    fn render_hybrid_frame(
+        ctx: &egui::Context,
+        input: &egui::RawInput,
+        blocks: &[crate::markdown::Block],
+        block_ranges: &[std::ops::Range<usize>],
+        theme: &crate::theme::ThemeSpec,
+        text: &mut String,
+        heights: &mut Vec<f32>,
+        cache: &mut super::ImageCache,
+        active_block: Option<usize>,
+        active_range: Option<std::ops::Range<usize>>,
+        stale_blocks: bool,
+        heading_target: Option<usize>,
     ) -> (super::BlockEditorOutput, Vec<(String, egui::Rect)>) {
         let mut captured: Option<super::BlockEditorOutput> = None;
         let output = ctx.run_ui(input.clone(), |ui| {
@@ -2962,7 +3215,7 @@ mod tests {
                     false,
                     false,
                     stale_blocks,
-                    None,
+                    heading_target,
                     &mut super::PreviewImages {
                         base_directory: None,
                         cache,
