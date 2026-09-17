@@ -27,8 +27,8 @@ pub struct OpenRequest {
     pub schema_version: u32,
     pub paths: Vec<PathBuf>,
     pub focus_window: bool,
-    /// Shared secret of this user's installation; see [`token`].
-    #[serde(default)]
+    /// Shared secret of this user's installation; see [`token`]. Required:
+    /// a message without it cannot be authorised anyway.
     pub token: String,
 }
 

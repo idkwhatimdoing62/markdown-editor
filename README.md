@@ -37,6 +37,12 @@ cargo test
 cargo build --release
 ```
 
+提交前跑一遍与 CI 相同的门禁：
+
+```powershell
+cargo fmt -- --check; cargo test; cargo clippy --all-targets -- -D warnings
+```
+
 构建产物位于 `target/release/markdown-editor.exe`。
 
 生成安装版需要 Inno Setup 6：
@@ -85,6 +91,16 @@ macOS 使用 `⌘` 代替上述快捷键中的 `Ctrl`。
 ```powershell
 markdown-editor --new-window [文件路径]
 ```
+
+## 视觉基准
+
+界面遵循一套固定基准。超出基准的取值在加载主题包时会被收敛，并有用例钉住，因此换主题不会让规范失效：
+
+- **间距**：主题间距 token 与区块留白都落在 4px 网格上。第三方主题包里的网格外数值（例如 `block_spacing: 10`、`code_padding_y: 13`）在 `ThemeSpec` 出口吸附到最近的网格点，不会破坏既有主题包。1–3px 的描边、面板内边距和圆角属于刻意的光学微调（与 `focus.css` 里的 1px/3px 边框同理），不参与网格约束。
+- **行宽**：正文用等宽字族，字身宽固定为 0.6em，因此一行的字符数完全由字号与栏宽决定。上限 70 字符，内置主题的 `content_width` 是由此反推的 672px（16px 正文），而不是手挑的像素值。
+- **对比度**：正文、次要文字（muted）、标题、强调色以及代码块语言标签都必须达到 4.5:1（WCAG AA），专注模式下被弱化的文字同样适用。内置主题的浅色与深色两套配色由单元测试逐项校验，改坏取色会直接让测试失败。
+- **字阶**：正文 16px，次要说明 14px，等宽标签与代码 13px。
+- **主题颜色格式**：除 `#RRGGBB` 外接受 CSS `oklch(L C H)`（也接受 `55%` 百分比亮度），因此可以按感知均匀的亮度阶组织 token。主题颜色必须不透明，带 `/ alpha` 的写法会报错而不是静默丢弃透明度。
 
 ## 字体与授权
 

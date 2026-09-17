@@ -32,10 +32,12 @@ pub enum DocumentStatus {
 /// become the preview for newer text.
 #[derive(Clone)]
 pub struct DocumentState {
-    /// Current UTF-8 source. Kept public during the incremental migration so
-    /// existing editor code can continue to use `tab.text`; new code should
-    /// prefer [`Self::set_source`] and [`Self::mark_source_changed`].
-    pub text: String,
+    /// Current UTF-8 source. Private on purpose: every mutation must either
+    /// go through [`Self::set_source`] or pair an in-place edit via
+    /// [`Self::source_mut`] with exactly one [`Self::mark_source_changed`],
+    /// otherwise the revision check that keeps stale parses out stops
+    /// working and the UI silently renders the previous AST.
+    text: String,
     /// Last successfully parsed document. It is immutable once published.
     pub document: Arc<ParsedDocument>,
     /// Revision of [`Self::text`].
@@ -82,6 +84,19 @@ impl DocumentState {
         Arc::clone(&self.document)
     }
 
+    /// Read-only view of the current source.
+    pub fn source(&self) -> &str {
+        &self.text
+    }
+
+    /// In-place editing handle for the live text editor. The caller MUST
+    /// call [`Self::mark_source_changed`] exactly once when the content
+    /// actually changed; skipping it leaves the parse revision stale and the
+    /// document renders the previous AST.
+    pub fn source_mut(&mut self) -> &mut String {
+        &mut self.text
+    }
+
     /// Replace the source and advance its revision. The previous parse is
     /// intentionally retained until a matching worker result is installed.
     pub fn set_source(&mut self, text: String) -> bool {
@@ -117,8 +132,9 @@ impl DocumentState {
         true
     }
 
-    /// Synchronous fallback used for paths that have not crossed the worker
-    /// boundary yet (for example external reload during this migration).
+    /// Synchronous parse, bypassing the worker. Used for external reload and
+    /// as the degradation path when the background worker is gone (spawn
+    /// failed or the thread exited).
     pub fn reparse_current_source(&mut self) {
         self.document = Arc::new(parse_document(&self.text));
         self.parsed_revision = self.document_revision;

@@ -173,7 +173,6 @@ pub struct DraftTab {
     pub path: Option<PathBuf>,
     pub text: String,
     pub saved_at_unix: u64,
-    #[serde(default)]
     disk_snapshot_base64: String,
 }
 
@@ -226,13 +225,6 @@ impl DraftSession {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct LegacyDraftEnvelope {
-    schema_version: u32,
-    saved_at_unix: u64,
-    text: String,
-}
-
 pub fn draft_path() -> PathBuf {
     draft_path_for_window(None)
 }
@@ -243,10 +235,6 @@ pub fn draft_path_for_window(window_id: Option<u32>) -> PathBuf {
         |id| format!("draft-window-{id}.json"),
     );
     storage::config_dir().join("state").join(file_name)
-}
-
-fn legacy_draft_path() -> PathBuf {
-    std::env::temp_dir().join("markdown-editor-draft.md")
 }
 
 fn save_draft_at(path: &Path, session: &DraftSession) -> std::io::Result<()> {
@@ -288,33 +276,10 @@ fn load_draft_at(path: &Path, now: u64) -> Option<DraftSession> {
     let bytes = fs::read(path).ok()?;
     let mut session: DraftSession = match serde_json::from_slice(&bytes) {
         Ok(session) => session,
-        Err(_) => match serde_json::from_slice::<LegacyDraftEnvelope>(&bytes) {
-            Ok(legacy)
-                if legacy.schema_version == storage::STORAGE_SCHEMA_VERSION
-                    && !legacy.text.is_empty()
-                    && legacy.text.len() as u64 <= MAX_FILE_SIZE =>
-            {
-                let tab = DraftTab {
-                    id: 1,
-                    path: None,
-                    text: legacy.text,
-                    saved_at_unix: legacy.saved_at_unix,
-                    disk_snapshot_base64: String::new(),
-                };
-                let migrated = DraftSession {
-                    schema_version: DRAFT_SCHEMA_VERSION,
-                    saved_at_unix: legacy.saved_at_unix,
-                    active_tab_id: 1,
-                    tabs: vec![tab],
-                };
-                let _ = save_draft_at(path, &migrated);
-                migrated
-            }
-            _ => {
-                storage::quarantine_corrupt(path);
-                return None;
-            }
-        },
+        Err(_) => {
+            storage::quarantine_corrupt(path);
+            return None;
+        }
     };
     let invalid_version = session.schema_version != DRAFT_SCHEMA_VERSION;
     let invalid_time = session.saved_at_unix > now.saturating_add(24 * 60 * 60);
@@ -358,10 +323,6 @@ fn load_draft_at(path: &Path, now: u64) -> Option<DraftSession> {
         let _ = save_draft_at(path, &session);
     }
     Some(session)
-}
-
-pub fn save_draft(session: &DraftSession) -> std::io::Result<()> {
-    save_draft_for_window(None, session)
 }
 
 /// Windows created with `--new-window` store their session under the process
@@ -410,36 +371,11 @@ pub fn load_draft() -> Option<DraftSession> {
     if let Some(parent) = path.parent() {
         storage::cleanup_sidecars(parent);
     }
-    if path.exists() {
-        return load_draft_at(&path, storage::unix_timestamp());
-    }
-
-    // One-time migration from releases that stored the draft in the OS temp directory.
-    let legacy = legacy_draft_path();
-    let bytes = fs::read(&legacy).ok()?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_FILE_SIZE {
-        let _ = fs::remove_file(legacy);
-        return None;
-    }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => {
-            let _ = fs::remove_file(legacy);
-            return None;
-        }
-    };
-    let session = DraftSession::new(1, vec![DraftTab::new(1, None, text, &[])]);
-    if save_draft(&session).is_ok() {
-        let _ = fs::remove_file(legacy);
-    }
-    Some(session)
+    load_draft_at(&path, storage::unix_timestamp())
 }
 
 pub fn clear_draft_for_window(window_id: Option<u32>) {
     let _ = fs::remove_file(draft_path_for_window(window_id));
-    if window_id.is_none() {
-        let _ = fs::remove_file(legacy_draft_path());
-    }
 }
 
 #[cfg(test)]
@@ -660,25 +596,6 @@ mod tests {
         fs::write(&expired, serde_json::to_vec(&envelope).unwrap()).unwrap();
         assert!(load_draft_at(&expired, DRAFT_RETENTION_SECONDS + 2).is_none());
         assert!(!expired.exists());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn 单份版本一草稿迁移为多标签会话() {
-        let dir = temp_dir();
-        let path = dir.join("draft.json");
-        let legacy = serde_json::json!({
-            "schema_version": 1,
-            "saved_at_unix": storage::unix_timestamp(),
-            "text": "旧版草稿"
-        });
-        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let restored = load_draft_at(&path, storage::unix_timestamp()).unwrap();
-        assert_eq!(restored.schema_version, DRAFT_SCHEMA_VERSION);
-        assert_eq!(restored.tabs.len(), 1);
-        assert_eq!(restored.tabs[0].text, "旧版草稿");
-        let migrated: DraftSession = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(migrated.schema_version, DRAFT_SCHEMA_VERSION);
         let _ = fs::remove_dir_all(dir);
     }
 }

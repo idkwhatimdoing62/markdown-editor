@@ -18,7 +18,7 @@ mod window_close;
 mod window_session;
 
 use std::collections::{HashMap, HashSet};
-use std::ops::{Deref, DerefMut, Range};
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc, mpsc::Receiver};
@@ -176,20 +176,15 @@ struct DocumentTab {
     preview_height_epoch: Option<(u32, u32)>,
 }
 
-// Keep the migration source-compatible with the existing UI while making the
-// document source/AST/revision a single core-owned value. Field access such as
-// `tab.text` transparently dereferences to `DocumentState`.
+// Reads (`tab.text` → `tab.source()`, parse state, status) deref to the core;
+// DerefMut is deliberately absent: every in-place source mutation must name
+// `core.source_mut()` at the call site so the required `mark_source_changed`
+// pairing is greppable instead of silently bypassing the revision invariant.
 impl Deref for DocumentTab {
     type Target = DocumentState;
 
     fn deref(&self) -> &Self::Target {
         &self.core
-    }
-}
-
-impl DerefMut for DocumentTab {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.core
     }
 }
 
@@ -320,7 +315,7 @@ impl DocumentTab {
         }
         let dirty = document_is_dirty(
             self.path.as_ref(),
-            &self.text,
+            self.source(),
             &self.disk_snapshot,
             &self.status,
         );
@@ -366,18 +361,18 @@ fn apply_external_bytes(
         return Ok(ExternalChangeResult::Unchanged);
     }
     let disk_text = io::decode_markdown_bytes(&bytes)?;
-    if disk_text == tab.text {
+    if disk_text == tab.source() {
         tab.replace_disk_snapshot(bytes);
-        tab.status = DocStatus::Saved;
+        tab.core.status = DocStatus::Saved;
         tab.conflict = None;
         tab.status_note = "已同步外部保存".to_string();
         return Ok(ExternalChangeResult::Reconciled);
     }
 
-    let has_local_changes = !snapshot_matches_text(&tab.disk_snapshot, &tab.text)
+    let has_local_changes = !snapshot_matches_text(&tab.disk_snapshot, tab.source())
         || matches!(tab.status, DocStatus::Conflict);
     if has_local_changes {
-        tab.status = DocStatus::Conflict;
+        tab.core.status = DocStatus::Conflict;
         tab.conflict = tab.path.clone();
         tab.status_note = "检测到外部修改，本地未保存内容已保留".to_string();
         return Ok(ExternalChangeResult::Conflict);
@@ -387,14 +382,16 @@ fn apply_external_bytes(
     tab.replace_disk_snapshot(bytes);
     tab.core.reparse_current_source();
     tab.parse_requested_revision = None;
-    tab.status = DocStatus::Saved;
+    tab.core.status = DocStatus::Saved;
     tab.conflict = None;
     tab.status_note = format!("已自动加载外部修改 {}", clock_time());
     Ok(ExternalChangeResult::Reloaded)
 }
 
 fn restore_draft_tab(draft: io::DraftTab) -> DocumentTab {
-    let stored_snapshot = draft.disk_snapshot().unwrap_or_default();
+    // `load_draft_at` 已过滤非法 base64 快照；静默降级成空快照会把磁盘上
+    // 存在的文件当成“新文件”，这里必须响亮地失败而不是给出错误答案。
+    let stored_snapshot = draft.disk_snapshot().expect("草稿快照编码已在加载时校验");
     let (disk_snapshot, status, conflict, status_note) = match draft.path.as_ref() {
         Some(path) => match io::read_snapshot_checked(path) {
             Ok(current) if snapshot_matches_text(&current, &draft.text) => (
@@ -642,7 +639,7 @@ fn reading_headings(blocks: &[Block]) -> Vec<(u8, String)> {
 }
 
 fn reading_toc(ui: &mut egui::Ui, headings: &[markdown::HeadingInfo]) -> Option<usize> {
-    ui.add_space(10.0);
+    ui.add_space(12.0);
     ui.label(
         egui::RichText::new("章节目录")
             .size(15.0)
@@ -652,7 +649,7 @@ fn reading_toc(ui: &mut egui::Ui, headings: &[markdown::HeadingInfo]) -> Option<
     ui.add_space(8.0);
     // Keep the table of contents airy; the heading and indentation already
     // provide enough grouping without a hard divider.
-    ui.add_space(9.0);
+    ui.add_space(8.0);
 
     if headings.is_empty() {
         ui.label(
@@ -777,12 +774,17 @@ impl std::ops::Deref for MdEditorApp {
     type Target = DocumentTab;
 
     fn deref(&self) -> &Self::Target {
+        // `tabs` 必须始终非空：帧循环里所有 `self.source()` / `self.path` 这类访问
+        // 都经过这里，一旦为空就是索引越界 panic。不变量由 `MdEditorApp::new`
+        // 与 `close_tab_now` 的兜底空标签维持，并由测试钉住。
+        debug_assert!(!self.tabs.is_empty(), "tabs 必须至少保留一个标签页");
         &self.tabs[self.active_tab]
     }
 }
 
 impl std::ops::DerefMut for MdEditorApp {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        debug_assert!(!self.tabs.is_empty(), "tabs 必须至少保留一个标签页");
         &mut self.tabs[self.active_tab]
     }
 }
@@ -803,7 +805,6 @@ impl MdEditorApp {
         let initial_theme = theme_package
             .as_ref()
             .and_then(|t| t.spec(false).ok())
-            .or_else(|| built_in_theme.spec(false).ok())
             .unwrap_or_else(|| ThemeSpec::fallback(false));
         apply_visuals(&cc.egui_ctx, false, &initial_theme);
         let recovery = restore_previous_window.then(io::load_draft).flatten();
@@ -876,7 +877,7 @@ impl MdEditorApp {
             revision,
             // The source is cloned once at the hand-off boundary. The UI no
             // longer shares a mutable String with the worker.
-            source: Arc::from(tab.text.as_str()),
+            source: Arc::from(tab.source()),
         };
         tab.parse_requested_revision = Some(revision);
         let request_id = request.tab_id;
@@ -1074,13 +1075,13 @@ impl MdEditorApp {
             tab_id,
             revision,
             generation,
-            source: Arc::from(self.text.as_str()),
+            source: Arc::from(self.source()),
             query: self.search_query.clone(),
         };
         if self.search_worker.submit(request).is_err() {
             // Worker unavailable: search synchronously instead of leaving a
             // pending request that would keep the repaint loop alive.
-            let results = search::SearchResults::new(&self.text, &self.search_query);
+            let results = search::SearchResults::new(self.source(), &self.search_query);
             self.search_results = results;
             self.search_pending = None;
             self.search_scroll_requested = true;
@@ -1119,7 +1120,7 @@ impl MdEditorApp {
         {
             return Some(bytes.clone());
         }
-        let bytes = preview::byte_range_for_chars(&self.text, &char_range);
+        let bytes = preview::byte_range_for_chars(self.source(), &char_range);
         self.search_byte_cache = Some((tab_id, revision, char_range, bytes.clone()));
         Some(bytes)
     }
@@ -1133,7 +1134,7 @@ impl MdEditorApp {
         if disconnected && self.search_pending.take().is_some() && self.search_open {
             // The worker died with a request outstanding: compute the answer
             // synchronously so the 16 ms repaint keep-alive stops.
-            let results = search::SearchResults::new(&self.text, &self.search_query);
+            let results = search::SearchResults::new(self.source(), &self.search_query);
             self.search_results = results;
             applied = true;
         }
@@ -1300,7 +1301,6 @@ impl MdEditorApp {
         self.theme_package
             .as_ref()
             .and_then(|t| t.spec(self.dark).ok())
-            .or_else(|| ThemePackage::built_in_focused().spec(self.dark).ok())
             .unwrap_or_else(|| ThemeSpec::fallback(self.dark))
     }
 
@@ -1309,17 +1309,17 @@ impl MdEditorApp {
     }
 
     fn refresh_status(&mut self) {
-        self.status = match &self.path {
+        self.core.status = match &self.path {
             Some(_) => {
                 // BOM-aware comparison, consistent with `document_is_dirty`.
-                if snapshot_matches_text(&self.disk_snapshot, &self.text) {
+                if snapshot_matches_text(&self.disk_snapshot, self.source()) {
                     DocStatus::Saved
                 } else {
                     DocStatus::Modified
                 }
             }
             None => {
-                if self.text.is_empty() {
+                if self.source().is_empty() {
                     DocStatus::Unsaved
                 } else {
                     DocStatus::Modified
@@ -1508,7 +1508,8 @@ impl MdEditorApp {
             .iter()
             .enumerate()
             .filter_map(|(index, tab)| {
-                (tab.is_dirty() && (!tab.text.is_empty() || tab.path.is_some())).then_some(index)
+                (tab.is_dirty() && (!tab.source().is_empty() || tab.path.is_some()))
+                    .then_some(index)
             })
             .collect()
     }
@@ -1529,12 +1530,12 @@ impl MdEditorApp {
         let drafts = self
             .tabs
             .iter()
-            .filter(|tab| tab.is_dirty() && (!tab.text.is_empty() || tab.path.is_some()))
+            .filter(|tab| tab.is_dirty() && (!tab.source().is_empty() || tab.path.is_some()))
             .map(|tab| {
                 io::DraftTab::new(
                     tab.id,
                     tab.path.clone(),
-                    tab.text.clone(),
+                    tab.source().to_string(),
                     &tab.disk_snapshot,
                 )
             })
@@ -1865,7 +1866,7 @@ impl MdEditorApp {
             Ok((text, snapshot)) => {
                 let replace_blank = self.tabs.len() == 1
                     && self.tabs[0].path.is_none()
-                    && self.tabs[0].text.is_empty()
+                    && self.tabs[0].source().is_empty()
                     && self.tabs[0].disk_snapshot.is_empty()
                     && matches!(self.tabs[0].status, DocStatus::Unsaved);
                 if replace_blank {
@@ -1901,11 +1902,11 @@ impl MdEditorApp {
             return;
         }
         let path = self.path.clone().expect("已检查文档路径");
-        match io::save_with_conflict_check(&path, &self.text, &self.disk_snapshot) {
+        match io::save_with_conflict_check(&path, self.source(), &self.disk_snapshot) {
             Ok(bytes) => {
                 self.replace_disk_snapshot(bytes);
                 self.path = Some(path);
-                self.status = DocStatus::Saved;
+                self.core.status = DocStatus::Saved;
                 self.status_note = format!("已保存 {}", clock_time());
                 if let Err(error) = self.persist_draft_session() {
                     self.status_note = format!("文档已保存；草稿会话更新失败：{error}");
@@ -1913,15 +1914,15 @@ impl MdEditorApp {
             }
             Err(io::SaveError::ExternalModified) => {
                 self.conflict = Some(path);
-                self.status = DocStatus::Conflict;
+                self.core.status = DocStatus::Conflict;
             }
             Err(io::SaveError::TooLarge { size, limit }) => {
-                self.status = DocStatus::SaveFailed(format!(
+                self.core.status = DocStatus::SaveFailed(format!(
                     "保存失败：文件大小 {size} 字节，超过 {limit} 字节限制"
                 ));
             }
             Err(io::SaveError::Io(e)) => {
-                self.status = DocStatus::SaveFailed(format!("保存失败：{}", e));
+                self.core.status = DocStatus::SaveFailed(format!("保存失败：{}", e));
             }
         }
     }
@@ -1930,7 +1931,7 @@ impl MdEditorApp {
         let Some(path) = pick_save_path() else {
             return false;
         };
-        match io::save_overwrite(&path, &self.text, None) {
+        match io::save_overwrite(&path, self.source(), None) {
             Ok(bytes) => {
                 // Moving to a new file: stop watching (and stop polling) the
                 // previous location so stale stamps cannot fire later.
@@ -1943,7 +1944,7 @@ impl MdEditorApp {
                     self.observed_file_stamps.remove(&previous);
                     self.pending_external_changes.remove(&previous);
                 }
-                self.status = DocStatus::Saved;
+                self.core.status = DocStatus::Saved;
                 self.conflict = None;
                 self.status_note = format!("已保存 {}", clock_time());
                 if let Err(error) = self.persist_draft_session() {
@@ -1952,7 +1953,7 @@ impl MdEditorApp {
                 true
             }
             Err(e) => {
-                self.status = DocStatus::SaveFailed(format!("保存失败：{}", e));
+                self.core.status = DocStatus::SaveFailed(format!("保存失败：{}", e));
                 false
             }
         }
@@ -1960,18 +1961,18 @@ impl MdEditorApp {
 
     fn resolve_overwrite(&mut self) {
         if let Some(path) = self.conflict.take() {
-            match io::save_overwrite(&path, &self.text, Some(&self.disk_snapshot)) {
+            match io::save_overwrite(&path, self.source(), Some(&self.disk_snapshot)) {
                 Ok(bytes) => {
                     self.replace_disk_snapshot(bytes);
                     self.path = Some(path);
-                    self.status = DocStatus::Saved;
+                    self.core.status = DocStatus::Saved;
                     self.status_note = "已覆盖保存".to_string();
                     if let Err(error) = self.persist_draft_session() {
                         self.status_note = format!("文档已保存；草稿会话更新失败：{error}");
                     }
                     self.finish_pending_close_if_saved();
                 }
-                Err(e) => self.status = DocStatus::SaveFailed(format!("保存失败：{}", e)),
+                Err(e) => self.core.status = DocStatus::SaveFailed(format!("保存失败：{}", e)),
             }
         }
     }
@@ -1995,7 +1996,7 @@ impl MdEditorApp {
                     self.active_edit_block = None;
                     self.active_edit_range = None;
                     self.edit_focus_requested = false;
-                    self.status = DocStatus::Saved;
+                    self.core.status = DocStatus::Saved;
                     self.status_note = "已重新载入磁盘内容".to_string();
                     if let Err(error) = self.persist_draft_session() {
                         self.status_note = format!("磁盘内容已载入；草稿会话更新失败：{error}");
@@ -2029,7 +2030,7 @@ impl MdEditorApp {
         let options = self.export_options(&title);
         match export::export_html(&path, &document, options) {
             Ok(()) => self.status_note = format!("已导出 HTML：{}", path.display()),
-            Err(e) => self.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
+            Err(e) => self.core.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
         }
     }
 
@@ -2053,7 +2054,7 @@ impl MdEditorApp {
         let options = self.export_options(&title);
         match export::export_pdf(&path, &document, options) {
             Ok(()) => self.status_note = format!("已导出 PDF：{}", path.display()),
-            Err(e) => self.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
+            Err(e) => self.core.status = DocStatus::SaveFailed(format!("导出失败：{}", e)),
         }
     }
 
@@ -2322,8 +2323,8 @@ impl MdEditorApp {
         {
             return (chars, lines);
         }
-        let chars = self.text.chars().count();
-        let lines = self.text.lines().count();
+        let chars = self.source().chars().count();
+        let lines = self.source().lines().count();
         self.text_stats_cache = Some((tab_id, revision, chars, lines));
         (chars, lines)
     }
@@ -2333,13 +2334,13 @@ impl MdEditorApp {
             ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
             if self.workspace_empty {
                 ui.label(egui::RichText::new("没有打开的文档").weak());
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.label(egui::RichText::new("可新建、打开或拖入 Markdown 文件").weak());
                 if !self.status_note.is_empty() {
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     ui.label(&self.status_note);
                 } else if let DocStatus::SaveFailed(message) = &self.status {
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(0xc0, 0x39, 0x2b),
                         format!("出错：{message}"),
@@ -2367,15 +2368,15 @@ impl MdEditorApp {
                 ),
             };
             ui.colored_label(color, label);
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             let (chars, lines) = self.text_stats();
             ui.label(format!("{chars} 字符 / {lines} 行"));
-            if (self.text.len() as u64) > io::MAX_FILE_SIZE {
-                ui.add_space(10.0);
+            if (self.source().len() as u64) > io::MAX_FILE_SIZE {
+                ui.add_space(12.0);
                 ui.colored_label(egui::Color32::from_rgb(0xc0, 0x39, 0x2b), "超过 10 MB 限制");
             }
             if !self.status_note.is_empty() {
-                ui.add_space(10.0);
+                ui.add_space(12.0);
                 ui.label(&self.status_note);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2480,7 +2481,7 @@ impl MdEditorApp {
                     .size(14.0)
                     .weak(),
             );
-            ui.add_space(22.0);
+            ui.add_space(24.0);
             let mut create = false;
             let mut open = false;
             ui.horizontal_centered(|ui| {
@@ -2498,7 +2499,7 @@ impl MdEditorApp {
                     )
                     .clicked();
             });
-            ui.add_space(18.0);
+            ui.add_space(20.0);
             ui.label(
                 egui::RichText::new("也可以将 .md、.markdown 或 .txt 文件拖到这里")
                     .size(12.0)
@@ -2690,15 +2691,15 @@ impl MdEditorApp {
         egui::Modal::new(egui::Id::new("window-close-confirmation")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.heading("关闭窗口");
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.label(format!(
                 "有 {} 个标签包含未保存的修改。关闭窗口前要保存吗？",
                 documents.len()
             ));
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             egui::Frame::new()
                 .fill(ui.visuals().faint_bg_color)
-                .corner_radius(6.0)
+                .corner_radius(8.0)
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -2831,7 +2832,7 @@ impl eframe::App for MdEditorApp {
                 .frame(
                     egui::Frame::new()
                         .fill(ui.visuals().panel_fill)
-                        .inner_margin(egui::Margin::symmetric(14, 3))
+                        .inner_margin(egui::Margin::symmetric(16, 3))
                         .stroke(egui::Stroke::NONE),
                 )
                 .show(ui, |ui| self.status_bar(ui));
@@ -2877,7 +2878,7 @@ impl eframe::App for MdEditorApp {
                     .frame(
                         egui::Frame::new()
                             .fill(ui.visuals().panel_fill)
-                            .inner_margin(egui::Margin::symmetric(14, 0)),
+                            .inner_margin(egui::Margin::symmetric(16, 0)),
                     )
                     .show(ui, |ui| {
                         heading_target = reading_toc(ui, headings);
@@ -2929,7 +2930,7 @@ impl eframe::App for MdEditorApp {
                         preview_height_epoch,
                         ..
                     } = active_tab;
-                    let text = &mut core.text;
+                    let text = core.source_mut();
                     let blocks: &[Block] = parsed_document.blocks();
                     had_blocks = !blocks.is_empty();
                     let block_ranges: &[Range<usize>] = parsed_document.block_ranges();
@@ -3081,7 +3082,7 @@ fn show_hybrid_editor(
                     egui::vec2(width, ui.available_height()),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.add_space(54.0);
+                        ui.add_space(56.0);
                         ui.push_id(("hybrid_document", tab_id), |ui| {
                             preview::show_preview_with_block_editor_and_search(
                                 ui,
@@ -3117,6 +3118,7 @@ fn show_hybrid_editor(
 fn setup_fonts(ctx: &egui::Context) {
     export::install_app_fonts(ctx);
     ctx.all_styles_mut(|style| {
+        // 字阶与间距对齐设计系统：正文 16，small 14，间距落在 4px 网格上。
         style.text_styles.insert(
             egui::TextStyle::Body,
             egui::FontId::new(16.0, egui::FontFamily::Proportional),
@@ -3127,14 +3129,14 @@ fn setup_fonts(ctx: &egui::Context) {
         );
         style.text_styles.insert(
             egui::TextStyle::Small,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
         );
-        style.spacing.item_spacing = egui::vec2(6.0, 5.0);
+        style.spacing.item_spacing = egui::vec2(8.0, 4.0);
         style.spacing.button_padding = egui::vec2(8.0, 4.0);
-        style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(5);
-        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(5);
-        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(5);
-        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(5);
+        style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
     });
 }
 
@@ -3212,14 +3214,37 @@ fn clock_time() -> String {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // macOS 的 libSystem 与 Linux 的 glibc 都导出 localtime_r，直接声明
+        // 这两个字段，避免为状态栏时间新增 libc 依赖（与 Windows 分支
+        // 手写 GetLocalTime 的风格一致）。
+        #[repr(C)]
+        struct Tm {
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            // 余下 6 个 int 字段（mday..isdst）加 glibc/macOS 布局中的
+            // tm_gmtoff + tm_zone，两者在这两个平台上都是 isize/指针宽度。
+            _rest: [i32; 6],
+            _tail: [usize; 2],
+        }
+        unsafe extern "C" {
+            fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
+        }
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        // Time-zone lookup without extra dependencies is only wired up for
-        // Windows; other platforms keep the previous UTC display.
-        let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
-        format!("{:02}:{:02}:{:02}", h, m, s)
+            .as_secs() as i64;
+        let mut tm = unsafe { std::mem::zeroed::<Tm>() };
+        // SAFETY: 两个指针都指向本函数持有的栈上值；Tm 按上述布局至少
+        // 和 struct tm 一样大，localtime_r 不会越界写入。
+        let wrote = unsafe { localtime_r(&raw const secs, &raw mut tm) };
+        if wrote.is_null() {
+            // 系统时钟离谱到超出平台时间范围时退回 UTC 展示：至少与
+            // epoch 秒数一致，不会像零值 tm 那样伪装成真实的本地午夜。
+            let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+            return format!("{:02}:{:02}:{:02}", h, m, s);
+        }
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
     }
 }
 
@@ -3333,7 +3358,7 @@ mod app_tests {
     #[test]
     fn 草稿签名随编辑与磁盘快照变化() {
         let mut app = app_with_two_tabs();
-        app.tabs[0].text = "草稿".to_string();
+        *app.tabs[0].core.source_mut() = "草稿".to_string();
         app.tabs[0].core.mark_source_changed();
         let first = app.draft_signature(&app.draft_candidates());
         assert_eq!(first.len(), 1);
@@ -3348,7 +3373,7 @@ mod app_tests {
     #[test]
     fn 过期解析结果不能覆盖当前文档快照() {
         let mut app = app_with_two_tabs();
-        app.tabs[0].text = "# newest".to_string();
+        *app.tabs[0].core.source_mut() = "# newest".to_string();
         let current_revision = app.tabs[0].core.mark_source_changed();
         app.tabs[0].parse_requested_revision = Some(current_revision);
 
@@ -3388,7 +3413,7 @@ mod app_tests {
     #[test]
     fn 编辑后由后台解析结果恢复一致快照() {
         let mut app = app_with_two_tabs();
-        app.tabs[0].text = "# 后台解析".to_string();
+        *app.tabs[0].core.source_mut() = "# 后台解析".to_string();
         app.mark_tab_source_changed(0, 1.0);
 
         let ctx = egui::Context::default();
@@ -3407,7 +3432,7 @@ mod app_tests {
     #[test]
     fn 过期搜索结果不能覆盖当前查询() {
         let mut app = app_with_two_tabs();
-        app.tabs[0].text = "new new".to_string();
+        *app.tabs[0].core.source_mut() = "new new".to_string();
         app.tabs[0].core.mark_source_changed();
         app.search_open = true;
         app.search_generation = 2;
@@ -3438,7 +3463,7 @@ mod app_tests {
     #[test]
     fn 搜索请求由后台任务返回并带有当前版本() {
         let mut app = app_with_two_tabs();
-        app.tabs[0].text = "alpha beta alpha".to_string();
+        *app.tabs[0].core.source_mut() = "alpha beta alpha".to_string();
         app.tabs[0].core.mark_source_changed();
         app.search_open = true;
         app.search_query = "alpha".to_string();
@@ -3460,8 +3485,8 @@ mod app_tests {
     #[test]
     fn window_close_collects_every_unsaved_tab_not_only_the_active_one() {
         let mut app = app_with_two_tabs();
-        app.tabs[0].text = "first draft".to_string();
-        app.tabs[1].text = "second draft".to_string();
+        *app.tabs[0].core.source_mut() = "first draft".to_string();
+        *app.tabs[1].core.source_mut() = "second draft".to_string();
 
         assert_eq!(
             app.prepare_window_close(),
@@ -3511,7 +3536,7 @@ mod app_tests {
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "new second");
         assert!(app.tabs.iter().all(|tab| !document_is_dirty(
             tab.path.as_ref(),
-            &tab.text,
+            tab.source(),
             &tab.disk_snapshot,
             &tab.status
         )));
@@ -3567,8 +3592,20 @@ mod app_tests {
         let icon = app_icon();
         assert_eq!((icon.width, icon.height), (256, 256));
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
-        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
-        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+        assert!(
+            icon.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] == 0)
+        );
+        assert!(
+            icon.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] == 255)
+        );
     }
 
     #[test]
@@ -3576,7 +3613,7 @@ mod app_tests {
         let tab = DocumentTab::blank(7);
         assert!(!document_is_dirty(
             tab.path.as_ref(),
-            &tab.text,
+            tab.source(),
             &tab.disk_snapshot,
             &tab.status,
         ));
@@ -3596,6 +3633,22 @@ mod app_tests {
     }
 
     #[test]
+    fn 活动标签索引在任何关闭顺序下都有效() {
+        // `MdEditorApp` 的 Deref 会索引 `tabs[active_tab]`，一旦 tabs 为空或
+        // active_tab 越界，帧循环里任何 `self.text` 访问都会 panic。
+        let mut app = app_with_two_tabs();
+        while !app.workspace_empty {
+            app.close_tab_now(app.active_tab);
+            assert!(!app.tabs.is_empty(), "tabs 必须保留兜底标签");
+            assert!(app.active_tab < app.tabs.len(), "active_tab 越界");
+            // 不变量成立时 Deref 不应 panic。
+            let _ = app.source().len();
+        }
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
     fn 每个文件标签独立判断修改状态() {
         let path = PathBuf::from("notes.md");
         let mut tab = DocumentTab::from_file(
@@ -3606,14 +3659,14 @@ mod app_tests {
         );
         assert!(!document_is_dirty(
             tab.path.as_ref(),
-            &tab.text,
+            tab.source(),
             &tab.disk_snapshot,
             &tab.status,
         ));
-        tab.text.push_str("修改");
+        tab.core.source_mut().push_str("修改");
         assert!(document_is_dirty(
             tab.path.as_ref(),
-            &tab.text,
+            tab.source(),
             &tab.disk_snapshot,
             &tab.status,
         ));
@@ -3623,27 +3676,27 @@ mod app_tests {
     #[test]
     fn 界面直接修改活动标签且切换无需写回() {
         let mut app = app_with_two_tabs();
-        app.text = "第一个标签".to_string();
+        *app.core.source_mut() = "第一个标签".to_string();
         app.activate_tab(1);
-        app.text = "第二个标签".to_string();
-        assert_eq!(app.tabs[0].text, "第一个标签");
-        assert_eq!(app.tabs[1].text, "第二个标签");
+        *app.core.source_mut() = "第二个标签".to_string();
+        assert_eq!(app.tabs[0].source(), "第一个标签");
+        assert_eq!(app.tabs[1].source(), "第二个标签");
         app.activate_tab(0);
-        assert_eq!(app.text, "第一个标签");
+        assert_eq!(app.source(), "第一个标签");
     }
 
     #[test]
     fn 草稿会话收集全部未保存标签并保留活动标签() {
         let mut app = app_with_two_tabs();
-        app.tabs[0].text = "草稿一".to_string();
-        app.tabs[1].text = "草稿二".to_string();
+        *app.tabs[0].core.source_mut() = "草稿一".to_string();
+        *app.tabs[1].core.source_mut() = "草稿二".to_string();
         let mut cleared = DocumentTab::from_file(
             3,
             PathBuf::from("cleared.md"),
             "原文".to_string(),
             "原文".as_bytes().to_vec(),
         );
-        cleared.text.clear();
+        cleared.core.source_mut().clear();
         app.tabs.push(cleared);
         app.activate_tab(1);
         let session = app.draft_session().expect("全部未保存标签都应进入草稿会话");
@@ -3694,7 +3747,7 @@ mod app_tests {
             "原磁盘内容".as_bytes(),
         );
         let tab = restore_draft_tab(draft);
-        assert_eq!(tab.text, "本地未保存内容");
+        assert_eq!(tab.source(), "本地未保存内容");
         assert_eq!(tab.status, DocStatus::Conflict);
         assert_eq!(tab.conflict, Some(path.clone()));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "Agent 新内容");
@@ -3717,7 +3770,7 @@ mod app_tests {
         assert_eq!(app.tabs.len(), 3);
         assert_eq!(app.active_tab, 2);
         assert_eq!(app.path.as_ref(), Some(&path));
-        assert_eq!(app.text, "跨进程打开内容");
+        assert_eq!(app.source(), "跨进程打开内容");
 
         app.apply_instance_request(single_instance::OpenRequest::new(vec![path.clone()]));
         assert_eq!(app.tabs.len(), 3, "相同路径应切换标签，不能重复打开");
@@ -3739,7 +3792,7 @@ mod app_tests {
 
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.path.as_ref(), Some(&path));
-        assert_eq!(app.text, "启动文件内容");
+        assert_eq!(app.source(), "启动文件内容");
         assert_eq!(app.active_edit_block, Some(0));
         assert!(app.edit_focus_requested);
         let _ = std::fs::remove_file(path);
@@ -3816,7 +3869,7 @@ mod app_tests {
         );
         let result = apply_external_bytes(&mut tab, "Agent 新内容".as_bytes().to_vec()).unwrap();
         assert_eq!(result, ExternalChangeResult::Reloaded);
-        assert_eq!(tab.text, "Agent 新内容");
+        assert_eq!(tab.source(), "Agent 新内容");
         assert_eq!(tab.disk_snapshot, "Agent 新内容".as_bytes());
         assert_eq!(tab.status, DocStatus::Saved);
     }
@@ -3829,10 +3882,10 @@ mod app_tests {
             "原文".to_string(),
             "原文".as_bytes().to_vec(),
         );
-        tab.text = "本地尚未保存".to_string();
+        *tab.core.source_mut() = "本地尚未保存".to_string();
         let result = apply_external_bytes(&mut tab, "Agent 修改".as_bytes().to_vec()).unwrap();
         assert_eq!(result, ExternalChangeResult::Conflict);
-        assert_eq!(tab.text, "本地尚未保存");
+        assert_eq!(tab.source(), "本地尚未保存");
         assert_eq!(tab.disk_snapshot, "原文".as_bytes());
         assert_eq!(tab.status, DocStatus::Conflict);
         assert_eq!(tab.conflict, Some(PathBuf::from("agent.md")));
@@ -3846,7 +3899,7 @@ mod app_tests {
             "原文".to_string(),
             "原文".as_bytes().to_vec(),
         );
-        tab.text = "共同的新内容".to_string();
+        *tab.core.source_mut() = "共同的新内容".to_string();
         let result = apply_external_bytes(&mut tab, "共同的新内容".as_bytes().to_vec()).unwrap();
         assert_eq!(result, ExternalChangeResult::Reconciled);
         assert_eq!(tab.status, DocStatus::Saved);

@@ -29,16 +29,16 @@
   },
   "layout": {
     "heading_style": "plain",
-    "body_font_size": 15.5,
-    "content_width": 820,
+    "body_font_size": 16,
+    "content_width": 672,
     "preview_padding": 40,
-    "block_spacing": 10,
-    "line_height": 1.55,
-    "list_item_spacing": 6,
+    "block_spacing": 12,
+    "line_height": 1.6,
+    "list_item_spacing": 8,
     "code_radius": 8,
     "code_padding_x": 16,
-    "code_padding_y": 13,
-    "table_spacing_x": 22,
-    "table_spacing_y": 10
+    "code_padding_y": 12,
+    "table_spacing_x": 24,
+    "table_spacing_y": 12
   }
 }

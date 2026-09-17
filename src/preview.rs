@@ -808,14 +808,12 @@ impl ImageCache {
             if let Some(texture) = &entry.texture {
                 return Some(texture.clone());
             }
-            if entry
-                .failed_at
-                .is_some_and(|failed_at| failed_at.elapsed() < IMAGE_RETRY_DELAY)
+            // 守卫已经证明 `failed_at` 是 `Some`，因此这里读一次即可：原来的
+            // `.map(..).unwrap_or(IMAGE_RETRY_DELAY)` 永远不会执行。
+            if let Some(failed_at) = entry.failed_at
+                && failed_at.elapsed() < IMAGE_RETRY_DELAY
             {
-                let remaining = entry
-                    .failed_at
-                    .map(|failed_at| IMAGE_RETRY_DELAY.saturating_sub(failed_at.elapsed()))
-                    .unwrap_or(IMAGE_RETRY_DELAY);
+                let remaining = IMAGE_RETRY_DELAY.saturating_sub(failed_at.elapsed());
                 ui.ctx()
                     .request_repaint_after(remaining.min(Duration::from_millis(250)));
                 return None;
@@ -921,7 +919,7 @@ pub fn show_preview_with_theme(
     );
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn show_preview_with_heading_target_and_images(
     ui: &mut egui::Ui,
     blocks: &[Block],
@@ -1002,10 +1000,11 @@ pub fn show_preview_with_block_editor_and_search(
         heading_target,
     };
     // 专注模式：除当前编辑块外全部向弱化色靠拢，视线自然锚定在写作位置。
+    // 两个系数与 4.5:1 对比度约束绑定，见 `theme::dimmed_text_color`。
     let dim_colors = (dim_inactive && active_block.is_some()).then(|| {
         (
-            crate::theme::mix_color(theme.text, theme.muted, 0.62),
-            crate::theme::mix_color(theme.heading, theme.muted, 0.55),
+            crate::theme::dimmed_text_color(theme),
+            crate::theme::dimmed_heading_color(theme),
         )
     });
     let mut dim_block = |ui: &mut egui::Ui,
@@ -1569,14 +1568,16 @@ fn show_block(
                 .corner_radius(theme.code_radius)
                 .stroke(Stroke::new(1.0, theme.border))
                 .show(ui, |ui| {
-                    ui.set_min_width((ui.available_width() - 34.0).max(120.0));
+                    ui.set_min_width((ui.available_width() - 32.0).max(120.0));
                     if !lang.is_empty() {
+                        // 语言名是等宽标签：字号取 mono 档下限，颜色必须在
+                        // code_bg 上达到 4.5:1（直接用 muted 只有 4.40:1）。
                         ui.label(
                             egui::RichText::new(lang.to_uppercase())
-                                .color(theme.muted)
-                                .size(10.0),
+                                .color(crate::theme::code_block_label_color(theme))
+                                .size(crate::theme::MONO_LABEL_SIZE),
                         );
-                        ui.add_space(5.0);
+                        ui.add_space(8.0);
                     }
                     ui.label(
                         egui::RichText::new(text)
@@ -1587,7 +1588,7 @@ fn show_block(
         }
         Block::Quote(blocks) => {
             let response = egui::Frame::new()
-                .inner_margin(egui::Margin::symmetric(10, 4))
+                .inner_margin(egui::Margin::symmetric(12, 4))
                 .fill(theme.quote_bg)
                 .stroke(Stroke::NONE)
                 .corner_radius(match theme.heading_style {
@@ -1697,18 +1698,18 @@ fn show_heading(
                 show_inlines_block(ui, inlines, size, true, true, 1.25, images);
             });
             if level == 2 {
-                ui.add_space(3.0);
+                ui.add_space(4.0);
                 ui.separator();
             }
         }
         HeadingStyle::Card if level <= 2 => {
             egui::Frame::new()
                 .fill(theme.quote_bg)
-                .inner_margin(egui::Margin::symmetric(16, if level == 1 { 13 } else { 9 }))
+                .inner_margin(egui::Margin::symmetric(16, if level == 1 { 12 } else { 8 }))
                 .corner_radius(if level == 1 { 12 } else { 8 })
                 .stroke(Stroke::new(1.0, theme.border))
                 .show(ui, |ui| {
-                    ui.set_min_width((ui.available_width() - 34.0).max(120.0));
+                    ui.set_min_width((ui.available_width() - 32.0).max(120.0));
                     ui.visuals_mut().override_text_color = Some(theme.heading);
                     show_inlines_block(ui, inlines, size, true, true, 1.25, images);
                 });

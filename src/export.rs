@@ -115,7 +115,7 @@ fn styled_document(body: &str, options: ExportOptions<'_>, include_mermaid: bool
     let font_css = if include_mermaid {
         embedded_font_css(document_needs_cjk_font(body))
     } else {
-        PDF_FONT_CSS.to_string()
+        pdf_font_css()
     };
     format!(
         "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>{STRUCTURAL_FALLBACK}</style><style>{}</style><style>{}{}{font_size}</style>{mermaid}</head><body>{body}</body></html>",
@@ -659,6 +659,13 @@ fn document_needs_cjk_font(body: &str) -> bool {
     !body.is_ascii()
 }
 
+/// 导出 HTML 会在陌生人的浏览器里打开，内嵌字族缺失或字形不全时的回退栈。
+///
+/// 只留一个 `monospace` 关键字时，CJK 会落到浏览器默认等宽字体，度量和字重都
+/// 对不上；这里把设计系统的系统字族回退一并写上。
+const FONT_FALLBACK_STACK: &str =
+    "'霞鹜文楷','PingFang SC','Microsoft YaHei','Noto Serif SC',monospace";
+
 fn embedded_font_css(include_cjk: bool) -> String {
     let face = |family: &str, weight: u16, bytes: &[u8]| {
         format!(
@@ -670,21 +677,23 @@ fn embedded_font_css(include_cjk: bool) -> String {
         // No `font-synthesis` restriction: the default `style weight` lets the
         // browser oblique the mono face for `*emphasis*` while `strong` still
         // resolves to the real bold face through the `!important` rules below.
-        "{}{}body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono',monospace!important;}}strong,b{{font-family:'Markdown Editor Mono Bold',monospace!important;font-weight:700!important;}}",
+        "{}{}body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono',{stack}!important;}}strong,b{{font-family:'Markdown Editor Mono Bold',{stack}!important;font-weight:700!important;}}",
         face("Markdown Editor Mono", 400, jetbrains_mono_regular_bytes()),
         face(
             "Markdown Editor Mono Bold",
             700,
             jetbrains_mono_bold_bytes()
-        )
+        ),
+        stack = FONT_FALLBACK_STACK,
     );
     if !include_cjk {
         return mono;
     }
     let cjk = format!(
-        "{}{}body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono','LXGW WenKai Lite',monospace!important;}}strong,b{{font-family:'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',monospace!important;font-weight:700!important;}}",
+        "{}{}body,pre,code,blockquote::before,blockquote::after{{font-family:'Markdown Editor Mono','LXGW WenKai Lite',{stack}!important;}}strong,b{{font-family:'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',{stack}!important;font-weight:700!important;}}",
         face("LXGW WenKai Lite", 400, lxgw_wenkai_regular_bytes()),
-        face("LXGW WenKai Lite Medium", 700, lxgw_wenkai_medium_bytes())
+        face("LXGW WenKai Lite Medium", 700, lxgw_wenkai_medium_bytes()),
+        stack = FONT_FALLBACK_STACK,
     );
     format!("{mono}{cjk}")
 }
@@ -773,7 +782,7 @@ const MARKDOWN_DOM_COMPATIBILITY: &str = r#"
 pre > code { color: inherit; background: transparent; border-radius: 0; font-family: inherit; padding: 0; font-size: inherit; }
 pre[data-language] { position: relative; }
 pre[data-language] > code { display: block; padding-right: 5.5em; }
-pre[data-language]::before { content: attr(data-language); position: absolute; top: 8px; right: 12px; color: #aaa; font-size: 10px; font-weight: 400; line-height: 1; letter-spacing: .08em; text-transform: uppercase; }
+pre[data-language]::before { content: attr(data-language); position: absolute; top: 8px; right: 12px; color: #5E6062; font-size: 13px; font-weight: 400; line-height: 1; letter-spacing: .08em; text-transform: uppercase; }
 .mermaid-diagram { display: flex; justify-content: center; width: 100%; margin: 1.5em 0; overflow-x: auto; }
 .mermaid-diagram svg { display: block; max-width: 100%; height: auto; }
 ol:not(#footnotes), ul { padding-inline-start: clamp(1.5em, 3vw, 2.25em) !important; }
@@ -781,10 +790,16 @@ ol:not(#footnotes) > li::marker { font-variant-numeric: tabular-nums; }
 @media print { html { print-color-adjust: exact; -webkit-print-color-adjust: exact; } body { box-sizing: border-box; } img, pre, table, blockquote { break-inside: avoid; } }
 "#;
 
-const PDF_FONT_CSS: &str = r#"
-body,pre,code,blockquote::before,blockquote::after { font-family: 'Markdown Editor Mono','LXGW WenKai Lite',monospace !important; }
-strong,b { font-family: 'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',monospace !important; font-weight: 700 !important; }
-"#;
+/// PDF 走 printpdf 的字族映射，回退栈只在 PDF 被当作 HTML 解析时有意义；
+/// 仍然与 HTML 导出共用同一份字族名与回退，避免两条路径分叉。
+fn pdf_font_css() -> String {
+    format!(
+        "
+body,pre,code,blockquote::before,blockquote::after {{ font-family: 'Markdown Editor Mono','LXGW WenKai Lite',{FONT_FALLBACK_STACK} !important; }}
+strong,b {{ font-family: 'Markdown Editor Mono Bold','LXGW WenKai Lite Medium','Markdown Editor Mono','LXGW WenKai Lite',{FONT_FALLBACK_STACK} !important; font-weight: 700 !important; }}
+"
+    )
+}
 
 const MERMAID_BOOTSTRAP: &str = r#"
 (async () => {
