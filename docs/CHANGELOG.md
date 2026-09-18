@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.1.40] - 2026-09-18
+
+### Changed
+
+- 空工作区改为垂直居中的紧凑分组：标题 24px，按钮行按 240×32 显式分配宽度并居中，拖放提示改用等宽档 11px。此前用 `horizontal_centered`（justified 布局）会占满面板剩余高度，把按钮行推到面板底部、与标题拉开一整屏距离。
+
+### Fixed
+
+- 「设为 Markdown 默认应用…」打开的是文件资源管理器而不是「设置」：该命令交给 `explorer.exe` 执行，而 Explorer 把命令行参数按文件系统路径解析，`ms-settings:` 解析不出路径时退化成打开一个文件夹窗口（「文档」）。改用 `ShellExecuteW("open", …)` 走 Shell 的协议处理器，URI 里的应用名转义改为由 `REGISTERED_APP_NAME` 派生，并补上返回值 ≤ 32 的失败判定与状态栏提示。
+
 ## [0.1.39] - 2026-09-17
 
 ### Changed
