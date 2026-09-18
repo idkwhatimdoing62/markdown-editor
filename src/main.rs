@@ -2493,13 +2493,22 @@ impl MdEditorApp {
         }
     }
 
+    /// 空工作区：一个垂直居中的紧凑分组（标题 / 说明 / 按钮行 / 拖放提示）。
+    ///
+    /// 不用 `horizontal_centered`：那是 justified 布局，会占满面板剩余高度，
+    /// 把按钮行推到面板底部、与标题拉开一整屏距离。按钮行改为显式分配宽度
+    /// 并居中，整组按 4px 网格与字阶（正文 16 / 次要 14 / 等宽 11）排布。
     fn empty_workspace(&mut self, ui: &mut egui::Ui) {
-        let top_space = (ui.available_height() * 0.28).clamp(72.0, 220.0);
+        const GROUP_HEIGHT: f32 = 152.0;
+        const BUTTON_ROW: egui::Vec2 = egui::vec2(240.0, 32.0);
+        const BUTTON_SIZE: [f32; 2] = [116.0, 32.0];
+
+        let top_space = ((ui.available_height() - GROUP_HEIGHT) / 2.0).max(48.0);
         ui.add_space(top_space);
         ui.vertical_centered(|ui| {
             ui.label(
                 egui::RichText::new("开始写作")
-                    .size(26.0)
+                    .size(24.0)
                     .strong()
                     .color(ui.visuals().strong_text_color()),
             );
@@ -2512,25 +2521,29 @@ impl MdEditorApp {
             ui.add_space(24.0);
             let mut create = false;
             let mut open = false;
-            ui.horizontal_centered(|ui| {
-                create = ui
-                    .add_sized([116.0, 34.0], egui::Button::new("新建文档"))
-                    .clicked();
-                ui.add_space(8.0);
-                let accent = ui.visuals().selection.bg_fill;
-                let accent_text = ui.visuals().selection.stroke.color;
-                open = ui
-                    .add_sized(
-                        [116.0, 34.0],
-                        egui::Button::new(egui::RichText::new("打开文件…").color(accent_text))
-                            .fill(accent),
-                    )
-                    .clicked();
-            });
-            ui.add_space(20.0);
+            ui.allocate_ui_with_layout(
+                BUTTON_ROW,
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let accent = ui.visuals().selection.bg_fill;
+                    let accent_text = ui.visuals().selection.stroke.color;
+                    create = ui
+                        .add_sized(BUTTON_SIZE, egui::Button::new("新建文档"))
+                        .clicked();
+                    open = ui
+                        .add_sized(
+                            BUTTON_SIZE,
+                            egui::Button::new(egui::RichText::new("打开文件…").color(accent_text))
+                                .fill(accent),
+                        )
+                        .clicked();
+                },
+            );
+            ui.add_space(24.0);
             ui.label(
                 egui::RichText::new("也可以将 .md、.markdown 或 .txt 文件拖到这里")
-                    .size(12.0)
+                    .size(crate::theme::MONO_LABEL_SIZE)
                     .weak(),
             );
             if create {
