@@ -1,8 +1,6 @@
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
 use std::{env, ptr};
 
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
@@ -10,11 +8,13 @@ use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegSetValueExW,
 };
-use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+use windows_sys::Win32::UI::Shell::{
+    SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify, ShellExecuteW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 const PROG_ID: &str = "MarkdownEditor.Markdown";
 const REGISTERED_APP_NAME: &str = "Markdown Editor";
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn register_and_open_default_apps() -> Result<(), String> {
     let executable = env::current_exe().map_err(|error| error.to_string())?;
@@ -33,12 +33,43 @@ pub fn register_and_open_default_apps() -> Result<(), String> {
         );
     }
 
-    Command::new("explorer.exe")
-        .arg("ms-settings:defaultapps?registeredAppUser=Markdown%20Editor")
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+    open_default_apps_settings()
+}
+
+/// 打开“默认应用”设置页。
+///
+/// 不能交给 explorer.exe：Explorer 把自己的命令行参数按文件系统路径解析，
+/// `ms-settings:…` 解析不出路径时会退化成打开一个文件夹窗口（“文档”），
+/// 而不是设置页。ShellExecuteW 走 Shell 的协议处理器，才会唤起“设置”。
+fn open_default_apps_settings() -> Result<(), String> {
+    let operation = wide("open");
+    let target = wide(&default_apps_settings_uri());
+    // SAFETY: 两个宽字符缓冲区都以 NUL 结尾，且在本函数返回前一直有效；
+    // 父窗口与工作目录传空指针是 API 允许的取值。
+    let result = unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW 返回值小于等于 32 表示失败，见官方文档的返回值表。
+    if result as isize <= 32 {
+        return Err(format!(
+            "打开默认应用设置失败（ShellExecuteW 返回 {}）",
+            result as isize
+        ));
+    }
+    Ok(())
+}
+
+fn default_apps_settings_uri() -> String {
+    // 查询参数中的空格必须转义，否则“设置”定位不到已注册的应用。
+    let registered_app = REGISTERED_APP_NAME.replace(' ', "%20");
+    format!("ms-settings:defaultapps?registeredAppUser={registered_app}")
 }
 
 fn register(executable: &Path) -> Result<(), String> {
@@ -160,6 +191,14 @@ fn open_command(executable: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 默认应用设置地址转义注册名中的空格() {
+        assert_eq!(
+            default_apps_settings_uri(),
+            "ms-settings:defaultapps?registeredAppUser=Markdown%20Editor"
+        );
+    }
 
     #[test]
     fn 注册命令正确引用应用和文件路径() {
